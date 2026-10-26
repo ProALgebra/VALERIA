@@ -1,0 +1,1 @@
+import{a as n}from"./chunk-MYX6244T.js";var t="search";function a(e,r){return{name:e,id:t,type:n.Input,value:r||null,cleanable:!0,removable:!1,disabled:!1}}function o(e){return typeof e=="string"?e:""}export{t as a,a as b,o as c};

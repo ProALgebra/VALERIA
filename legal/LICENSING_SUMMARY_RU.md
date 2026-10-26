@@ -118,8 +118,9 @@ Community License не переподчиняет себе сторонний к
 
 - `mcp/opencode-dcp-local/` — отдельный компонент, заявленный как
   AGPL-3.0-or-later;
-- `markdown-it` — MIT notice находится в
-  `src/opencode_web/static/vendor/markdown-it.LICENSE.txt`.
+- сторонние пакеты в сборке веб-интерфейса (Angular, Koobiq, marked, Luxon и
+  другие) — их лицензионные уведомления собраны в
+  `src/opencode_web/static/3rdpartylicenses.txt`.
 
 Их условия действуют самостоятельно. Перед публикацией контейнеров, бинарных
 сборок или комплектов зависимостей нужен полный SBOM/инвентарь лицензий. Особенно

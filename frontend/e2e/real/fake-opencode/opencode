@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Minimal fake OpenCode server for local VALERIA smoke tests (stdlib only).
+
+Usage: opencode serve --hostname 127.0.0.1 --port 4100
+
+Behaviour per session:
+- first prompt: asks one question ("Уточнение" / "Для какой платы?", options
+  "Плата A" / "Плата B"); after POST /question/{id}/reply it writes an
+  assistant answer "Ответ для: <answer>" and goes idle;
+- a prompt containing "#direct", and every later prompt, is answered at once.
+
+Env: OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD enable basic auth
+(as in real OpenCode). FAKE_OPENCODE_LOG=<file> appends a request log.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import itertools
+import json
+import os
+import queue
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+DELAY = float(os.environ.get("FAKE_OPENCODE_DELAY", "0.3"))
+DIRECTORY = os.path.realpath(os.getcwd())
+USERNAME = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
+LOG_PATH = os.environ.get("FAKE_OPENCODE_LOG", "")
+
+PROVIDERS = {
+    "all": [
+        {
+            "id": "fake",
+            "name": "Fake Provider",
+            "models": {
+                "fake-model": {"id": "fake-model", "name": "Fake Model"},
+            },
+        }
+    ],
+    "connected": ["fake"],
+    "default": {"fake": "fake-model"},
+}
+ALLOW_ALL = [{"permission": "*", "pattern": "*", "action": "allow"}]
+AGENTS = [
+    {"name": "build", "mode": "primary", "permission": ALLOW_ALL},
+    {"name": "plan", "mode": "primary", "permission": ALLOW_ALL},
+]
+QUESTION = {
+    "header": "Уточнение",
+    "question": "Для какой платы?",
+    "multiple": False,
+    "options": [
+        {"label": "Плата A", "description": "Первая плата"},
+        {"label": "Плата B", "description": "Вторая плата"},
+    ],
+}
+
+lock = threading.RLock()
+counter = itertools.count(1)
+sessions: dict[str, dict] = {}
+messages: dict[str, list[dict]] = {}
+busy: set[str] = set()
+prompted: set[str] = set()
+questions: dict[str, dict] = {}
+question_context: dict[str, dict] = {}
+subscribers: list[queue.Queue] = []
+
+
+def log(text: str) -> None:
+    if LOG_PATH:
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] {text}\n")
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_fake{now_ms():013d}{next(counter):06d}"
+
+
+def emit(event_type: str, properties: dict) -> None:
+    envelope = {"directory": DIRECTORY, "payload": {"type": event_type, "properties": properties}}
+    with lock:
+        targets = list(subscribers)
+    for target in targets:
+        target.put(envelope)
+
+
+def set_status(session_id: str, running: bool) -> None:
+    with lock:
+        (busy.add if running else busy.discard)(session_id)
+    status = {"type": "busy" if running else "idle"}
+    emit("session.status", {"sessionID": session_id, "status": status})
+    if not running:
+        emit("session.idle", {"sessionID": session_id})
+
+
+def add_message(session_id: str, message: dict) -> None:
+    with lock:
+        messages.setdefault(session_id, []).append(message)
+    emit("message.updated", {"info": message["info"]})
+
+
+def assistant_info(session_id: str, parent_id: str, agent: str, model: dict) -> dict:
+    return {
+        "id": new_id("msg"),
+        "sessionID": session_id,
+        "role": "assistant",
+        "parentID": parent_id,
+        "agent": agent,
+        "mode": agent,
+        "providerID": model.get("providerID", "fake"),
+        "modelID": model.get("modelID", "fake-model"),
+        "path": {"cwd": DIRECTORY, "root": DIRECTORY},
+        "cost": 0,
+        "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        "time": {"created": now_ms()},
+    }
+
+
+def answer(session_id: str, parent_id: str, agent: str, model: dict, text: str) -> None:
+    info = assistant_info(session_id, parent_id, agent, model)
+    info["finish"] = "stop"
+    info["time"]["completed"] = now_ms()
+    add_message(session_id, {
+        "info": info,
+        "parts": [{
+            "id": new_id("prt"), "sessionID": session_id, "messageID": info["id"],
+            "type": "text", "text": text,
+        }],
+    })
+    set_status(session_id, False)
+
+
+def run_prompt(session_id: str, body: dict) -> None:
+    message_id = body.get("messageID") or new_id("msg")
+    agent = body.get("agent") or "build"
+    model = body.get("model") or {}
+    text = "\n".join(
+        part.get("text", "") for part in body.get("parts", []) if part.get("type") == "text"
+    )
+    add_message(session_id, {
+        "info": {
+            "id": message_id, "sessionID": session_id, "role": "user",
+            "agent": agent, "model": model, "time": {"created": now_ms()},
+        },
+        "parts": [{
+            "id": new_id("prt"), "sessionID": session_id, "messageID": message_id,
+            "type": "text", "text": text,
+        }],
+    })
+    with lock:
+        first = session_id not in prompted
+        prompted.add(session_id)
+    time.sleep(DELAY)
+    with lock:
+        if session_id not in busy:  # aborted meanwhile
+            return
+    if "#direct" in text or not first:
+        answer(session_id, message_id, agent, model, f"Прямой ответ на: {text.strip()}")
+        return
+    info = assistant_info(session_id, message_id, agent, model)
+    call_id = new_id("call")
+    tool_part = {
+        "id": new_id("prt"), "sessionID": session_id, "messageID": info["id"],
+        "type": "tool", "tool": "question", "callID": call_id,
+        "state": {"status": "running", "input": {"questions": [QUESTION]},
+                  "time": {"start": now_ms()}},
+    }
+    add_message(session_id, {"info": info, "parts": [tool_part]})
+    request = {
+        "id": new_id("que"),
+        "sessionID": session_id,
+        "questions": [QUESTION],
+        "tool": {"messageID": info["id"], "callID": call_id},
+    }
+    with lock:
+        questions[request["id"]] = request
+        question_context[request["id"]] = {
+            "parent": message_id, "agent": agent, "model": model,
+            "info": info, "tool": tool_part,
+        }
+    emit("question.asked", request)
+
+
+def finish_question(request_id: str, answers: list) -> None:
+    with lock:
+        context = question_context.pop(request_id)
+    session_id = context["info"]["sessionID"]
+    time.sleep(DELAY)
+    chosen = ", ".join(", ".join(str(item) for item in group) for group in answers)
+    with lock:
+        context["tool"]["state"] = {
+            "status": "completed", "input": {"questions": [QUESTION]},
+            "output": chosen, "metadata": {"answers": answers},
+            "time": {"start": context["tool"]["state"]["time"]["start"], "end": now_ms()},
+        }
+        context["info"]["finish"] = "tool-calls"
+        context["info"]["time"]["completed"] = now_ms()
+    emit("message.updated", {"info": context["info"]})
+    answer(session_id, context["parent"], context["agent"], context["model"],
+           f"Ответ для: {chosen}")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "fake-opencode/0.1"
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: D401 - silence stderr
+        log(fmt % args)
+
+    def _authorized(self) -> bool:
+        if not PASSWORD:
+            return True
+        expected = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+        return self.headers.get("Authorization", "") == f"Basic {expected}"
+
+    def _json(self, status: int, payload) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _empty(self) -> None:
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if not length:
+            return {}
+        try:
+            value = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _dispatch(self, method: str) -> None:
+        if not self._authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="opencode"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        parts = path.strip("/").split("/")
+        body = self._body() if method in {"POST", "PATCH", "PUT"} else {}
+        log(f"{method} {path} {json.dumps(body, ensure_ascii=False)[:300]}")
+
+        if method == "GET" and path == "/global/health":
+            return self._json(200, {"healthy": True, "version": "0.0.0-fake"})
+        if method == "GET" and path == "/global/event":
+            return self._events()
+        if method == "GET" and path == "/path":
+            return self._json(200, {
+                "home": os.path.expanduser("~"), "state": DIRECTORY, "config": DIRECTORY,
+                "worktree": DIRECTORY, "directory": DIRECTORY,
+            })
+        if method == "GET" and path == "/provider":
+            return self._json(200, PROVIDERS)
+        if method == "GET" and path == "/agent":
+            return self._json(200, AGENTS)
+        if method == "GET" and path == "/mcp":
+            return self._json(200, {})
+        if method == "GET" and path == "/permission":
+            return self._json(200, [])
+        if method == "GET" and path == "/question":
+            with lock:
+                return self._json(200, list(questions.values()))
+        if parts[0] == "question" and len(parts) == 3 and method == "POST":
+            return self._question(parts[1], parts[2], body)
+        if method == "GET" and path == "/session/status":
+            with lock:
+                return self._json(200, {sid: {"type": "busy"} for sid in busy})
+        if path == "/session" and method == "GET":
+            with lock:
+                return self._json(200, list(sessions.values()))
+        if path == "/session" and method == "POST":
+            return self._create_session(body)
+        if parts[0] == "session" and len(parts) >= 2:
+            return self._session(method, parts[1], parts[2:], body)
+        return self._json(404, {"name": "NotFound", "data": {"message": f"No route {path}"}})
+
+    def _create_session(self, body: dict) -> None:
+        session_id = new_id("ses")
+        stamp = now_ms()
+        session = {
+            "id": session_id, "projectID": "fake-project", "directory": DIRECTORY,
+            "title": body.get("title") or f"New session - {time.strftime('%Y-%m-%dT%H:%M:%S')}",
+            "version": "0.0.0-fake", "time": {"created": stamp, "updated": stamp},
+            "permission": list(body.get("permission") or []),
+        }
+        if body.get("parentID"):
+            session["parentID"] = body["parentID"]
+        with lock:
+            sessions[session_id] = session
+            messages[session_id] = []
+        emit("session.created", {"info": session})
+        return self._json(200, session)
+
+    def _session(self, method: str, session_id: str, rest: list[str], body: dict) -> None:
+        with lock:
+            session = sessions.get(session_id)
+        if session is None:
+            return self._json(404, {"name": "NotFound", "data": {"message": "Session not found"}})
+        if not rest:
+            if method == "GET":
+                return self._json(200, session)
+            if method == "DELETE":
+                with lock:
+                    sessions.pop(session_id, None)
+                    messages.pop(session_id, None)
+                    busy.discard(session_id)
+                return self._json(200, True)
+            if method == "PATCH":
+                with lock:
+                    if "title" in body:
+                        session["title"] = body["title"]
+                    if isinstance(body.get("permission"), list):
+                        session["permission"] = session["permission"] + body["permission"]
+                    session["time"]["updated"] = now_ms()
+                emit("session.updated", {"info": session})
+                return self._json(200, session)
+        elif rest == ["message"] and method == "GET":
+            with lock:
+                return self._json(200, json.loads(json.dumps(messages.get(session_id, []))))
+        elif rest == ["prompt_async"] and method == "POST":
+            set_status(session_id, True)
+            threading.Thread(target=run_prompt, args=(session_id, body), daemon=True).start()
+            return self._empty()
+        elif rest == ["abort"] and method == "POST":
+            with lock:
+                for request_id in [k for k, v in questions.items() if v["sessionID"] == session_id]:
+                    questions.pop(request_id, None)
+                    question_context.pop(request_id, None)
+            set_status(session_id, False)
+            return self._json(200, True)
+        elif len(rest) == 2 and rest[0] == "permissions" and method == "POST":
+            return self._json(200, True)
+        return self._json(404, {"name": "NotFound", "data": {"message": "No such route"}})
+
+    def _question(self, request_id: str, action: str, body: dict) -> None:
+        with lock:
+            request = questions.pop(request_id, None)
+        if request is None:
+            return self._json(404, {"name": "NotFound", "data": {"message": "Question not found"}})
+        if action == "reply":
+            answers = body.get("answers")
+            if not isinstance(answers, list):
+                with lock:
+                    questions[request_id] = request
+                return self._json(400, {"name": "BadRequest", "data": {"message": "answers"}})
+            emit("question.replied", {"sessionID": request["sessionID"], "requestID": request_id})
+            reply = (request_id, answers)
+            threading.Thread(target=finish_question, args=reply, daemon=True).start()
+            return self._json(200, True)
+        if action == "reject":
+            with lock:
+                question_context.pop(request_id, None)
+            emit("question.rejected", {"sessionID": request["sessionID"], "requestID": request_id})
+            set_status(request["sessionID"], False)
+            return self._json(200, True)
+        with lock:
+            questions[request_id] = request
+        return self._json(404, {"name": "NotFound", "data": {"message": "No such route"}})
+
+    def _events(self) -> None:
+        channel: queue.Queue = queue.Queue()
+        with lock:
+            subscribers.append(channel)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        channel.put({"payload": {"type": "server.connected", "properties": {}}})
+        try:
+            while True:
+                try:
+                    event = channel.get(timeout=10)
+                except queue.Empty:
+                    event = {"payload": {"type": "server.heartbeat", "properties": {}}}
+                line = f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                self.wfile.write(line.encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with lock:
+                if channel in subscribers:
+                    subscribers.remove(channel)
+
+    def do_GET(self) -> None:
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:
+        self._dispatch("POST")
+
+    def do_PATCH(self) -> None:
+        self._dispatch("PATCH")
+
+    def do_DELETE(self) -> None:
+        self._dispatch("DELETE")
+
+    def do_PUT(self) -> None:
+        self._dispatch("PUT")
+
+
+def watch_parent(original: int) -> None:
+    # The backend kills our process group; this also covers a hard-killed backend.
+    while True:
+        time.sleep(1)
+        if os.getppid() != original:
+            log("parent exited; stopping")
+            os._exit(0)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="opencode")
+    sub = parser.add_subparsers(dest="command", required=True)
+    serve = sub.add_parser("serve")
+    serve.add_argument("--hostname", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=4096)
+    args, _unknown = parser.parse_known_args()
+    if args.command != "serve":
+        sys.exit(2)
+    server = ThreadingHTTPServer((args.hostname, args.port), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=watch_parent, args=(os.getppid(),), daemon=True).start()
+    log(f"listening on {args.hostname}:{args.port} in {DIRECTORY}")
+    with contextlib.suppress(KeyboardInterrupt):
+        server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

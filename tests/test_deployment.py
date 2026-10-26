@@ -51,16 +51,3 @@ def test_docker_shell_scripts_have_valid_syntax() -> None:
             check=True,
         )
 
-
-def test_chat_ui_has_scroll_to_bottom_control_and_no_local_title_input() -> None:
-    app_js = (PROJECT_ROOT / "src" / "opencode_web" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'id="scroll-to-bottom"' in app_js
-    assert "scrollMessagesToBottom" in app_js
-    assert 'name="title" value="Новый диалог"' not in app_js
-    assert 'api("/api/chats")' in app_js
-    assert '"/api/chats/title-sync"' in app_js
-    assert "patchChatTitles" in app_js
-    assert 'data-chat-title="${esc(chat.id)}"' in app_js

@@ -6,7 +6,7 @@ from typing import Annotated, Any
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .database import Database
+from .database import ChatDeleted, Database
 from .opencode_client import OpenCodeError
 from .questions import public_questions, session_questions, validate_answers
 from .submissions import submission
@@ -140,6 +140,7 @@ def register_consultations(
         if not admin and (
             chat["owner_user_id"] != principal["user"]["id"]
             or chat["workspace_snapshot"] != principal["user"]["workspace_path"]
+            or chat.get("deleted_at")
         ):
             raise HTTPException(404, "Диалог не найден")
         return chat
@@ -204,6 +205,8 @@ def register_consultations(
                 max_queued=settings.max_queued_messages,
                 queue_id=db.consultation_queue_id(),
             )
+        except ChatDeleted as exc:
+            raise HTTPException(404, "Диалог не найден") from exc
         except ValueError as exc:
             raise HTTPException(429, "Очередь заполнена") from exc
         return job
@@ -415,7 +418,7 @@ def register_consultations(
     ):
         return [
             summary(db, c, admin=True)
-            for c in db.list_chats(owner_id, consultation=True)
+            for c in db.list_chats(owner_id, consultation=True, include_deleted=True)
             if q.casefold() in f"{c['title']} {c['owner_login']}".casefold()
         ]
 

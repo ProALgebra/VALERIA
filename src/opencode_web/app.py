@@ -5,25 +5,45 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
+from starlette.convertors import Convertor, register_url_convertor
 
 from .config import ConfigError, Settings
 from .consultations import public_job as public_consultation_job
 from .consultations import register_consultations
 from .database import (
     DEFAULT_QUEUE_ID,
+    ChatDeleted,
     Database,
     normalize_mattermost_user_id,
     normalize_mattermost_username,
 )
 from .dispatcher import QueueDispatcher
 from .events import EventBroker
+from .filters import matches_search, search_tokens, time_range
+from .items import (
+    CHAT_EVENT_TYPES,
+    ITEM_KINDS,
+    allowed_item_kinds,
+    chat_event_for_user,
+    item_kind,
+    job_kind,
+    job_status,
+    public_admin_request,
+    public_error_code,
+    public_item,
+    public_queue_job,
+    publish_chat_deleted,
+    publish_chat_updated,
+    task_phase,
+    task_run_display_title,
+)
 from .notifications import (
     MattermostNotificationError,
     NotificationDispatcher,
@@ -31,7 +51,8 @@ from .notifications import (
 )
 from .opencode_client import OpenCodeError, OpenCodeManager
 from .questions import question_event, session_questions, validate_answers
-from .security import new_token, verify_password
+from .security import new_token, normalize_login, verify_password
+from .security_headers import ContentSecurityPolicyMiddleware
 from .submissions import submission
 from .task_results import task_final_answer
 
@@ -61,11 +82,21 @@ class UserUpdateBody(BaseModel):
     tasks_only: bool | None = None
     max_active_jobs: int | None = Field(default=None, ge=1)
     mattermost_username: str | None = Field(default=None, max_length=23)
+    # The `updated_at` the edit started from; a newer stored value is a conflict (409).
+    updated_at: AwareDatetime | None = None
 
 
 class UserProfileUpdateBody(BaseModel):
     model_config = {"extra": "forbid"}
     mattermost_username: str | None = Field(default=None, max_length=23)
+
+
+TERMINAL_OUTCOMES = frozenset({"completed", "failed", "cancelled"})
+
+
+class UserBatchBody(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=500)
+    status: Literal["active", "blocked"]
 
 
 class PasswordResetBody(BaseModel):
@@ -103,6 +134,7 @@ class TaskBody(BaseModel):
     model_variant: str | None = Field(default=None, max_length=100)
     is_published: bool = False
     plan_first: bool = False
+    input_hint: str | None = Field(default=None, max_length=500)
     visibility: str = "all"
     user_ids: list[str] | None = None
     next_task_ids: list[str] = Field(default_factory=list)
@@ -118,10 +150,13 @@ class TaskPatchBody(BaseModel):
     model_variant: str | None = Field(default=None, max_length=100)
     is_published: bool | None = None
     plan_first: bool | None = None
+    input_hint: str | None = Field(default=None, max_length=500)
     visibility: str | None = None
     user_ids: list[str] | None = None
     next_task_ids: list[str] = Field(default_factory=list)
     queue_id: str | None = None
+    # The `updated_at` the edit started from; a newer stored value is a conflict (409).
+    updated_at: AwareDatetime | None = None
 
 
 class TaskAudienceBody(BaseModel):
@@ -155,8 +190,18 @@ class WorkQueueBody(BaseModel):
     max_workers: int = Field(ge=1)
 
 
+class WorkQueuePatchBody(WorkQueueBody):
+    # The `updated_at` the edit started from; a newer stored value is a conflict (409).
+    updated_at: AwareDatetime | None = None
+
+
 class QueueRoutingBody(BaseModel):
     queue_id: str = Field(min_length=1, max_length=100)
+
+
+class SnoozeBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    until: AwareDatetime
 
 
 class PermissionBody(BaseModel):
@@ -216,36 +261,26 @@ async def mattermost_identity(
     return canonical_username, user_id
 
 
-def task_run_display_title(job: dict[str, Any]) -> str:
-    template_title = job["task_title"]
-    title = job.get("chat_title") or template_title
-    if title == template_title or title.startswith(f"{template_title}: "):
-        return title
-    return f"{template_title}: {title}"
-
-
 def public_task_run(job: dict[str, Any]) -> dict[str, Any]:
-    state = job["status"]
     return {
         "id": job["id"],
         "task_id": job["task_id"],
         "plan_first": bool(job.get("plan_first")),
-        "phase": ("build" if job.get("phase2_message_id") else "plan")
-        if job.get("plan_first") else "build",
+        "phase": task_phase(job),
         "title": task_run_display_title(job),
-        "status": (
-            state if state in {
-                "queued", "dispatching", "completed", "failed", "cancelled", "cancelling"
-            }
-            else "running"
-        ),
+        "status": job_status(job["status"]),
+        "user_input": job.get("user_input") or None,
+        "error_code": public_error_code(job.get("error_code")),
         "created_at": job["created_at"],
+        "started_at": job.get("started_at"),
         "finished_at": job["finished_at"],
     }
 
 
 def public_task(task: dict[str, Any]) -> dict[str, Any]:
-    return {key: task.get(key) for key in ("id", "title", "description", "plan_first")}
+    return {
+        key: task.get(key) for key in ("id", "title", "description", "plan_first", "input_hint")
+    }
 
 
 def admin_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -272,6 +307,32 @@ def checked_user_ids(db: Database, user_ids: list[str] | None) -> list[str]:
             raise HTTPException(422, f"Unknown user: {user_id}")
         result.append(user_id)
     return result
+
+
+def edit_error(state: dict[str, Any] | None) -> HTTPException:
+    """404 when the object is gone, otherwise 409 naming who changed it last."""
+    if not state or state["deleted"]:
+        deleted_by = state["updated_by"] if state else None
+        return HTTPException(404, {"code": "deleted", "deleted_by": deleted_by})
+    return HTTPException(
+        409,
+        {"code": "conflict", "updated_by": state["updated_by"], "updated_at": state["updated_at"]},
+    )
+
+
+def edit_base(
+    db: Database, table: str, object_id: str, sent: datetime | None
+) -> str | None:
+    """Stored `updated_at` to compare-and-set against, or None when the client sent
+    none (last write wins). Raises the 404/409 from `edit_error`."""
+    state = db.edit_state(table, object_id)
+    if (
+        not state
+        or state["deleted"]
+        or (sent is not None and datetime.fromisoformat(state["updated_at"]) != sent)
+    ):
+        raise edit_error(state)
+    return state["updated_at"] if sent is not None else None
 
 
 def admin_task_payload(db: Database, task: dict[str, Any]) -> dict[str, Any]:
@@ -355,6 +416,18 @@ def safe_opencode_event(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def session_title_update(envelope: Any) -> tuple[str, str] | None:
+    """(session id, title) from an OpenCode `session.updated` event."""
+    payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else None
+    if not isinstance(payload, dict) or payload.get("type") != "session.updated":
+        return None
+    info = (payload.get("properties") or {}).get("info") or {}
+    session_id, title = info.get("id"), info.get("title")
+    if isinstance(session_id, str) and isinstance(title, str) and title.strip():
+        return session_id, title
+    return None
+
+
 def safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return messages
 
@@ -367,6 +440,19 @@ def safe_mcp_statuses(payload: dict[str, Any]) -> list[dict[str, str]]:
         )
         result.append({"name": str(name), "status": str(status_value or "unknown")})
     return sorted(result, key=lambda item: item["name"].lower())
+
+
+CHAT_ACTIONS = frozenset({"archive", "unarchive", "snooze", "unsnooze"})
+
+
+def is_chat_action(method: str, path: str) -> bool:
+    """Chat menu routes that every role may call, including tasks_only accounts."""
+    parts = path.split("/")
+    if len(parts) < 4 or parts[:3] != ["", "api", "chats"] or not parts[3]:
+        return False
+    if len(parts) == 4:
+        return method == "DELETE"
+    return len(parts) == 5 and method == "POST" and parts[4] in CHAT_ACTIONS
 
 
 def can_receive_event(database: Database, user: dict[str, Any], event: dict[str, Any]) -> bool:
@@ -396,9 +482,13 @@ def can_receive_event(database: Database, user: dict[str, Any], event: dict[str,
 def event_for_user(
     database: Database, user: dict[str, Any], event: dict[str, Any]
 ) -> dict[str, Any] | None:
+    if event.get("type") in CHAT_EVENT_TYPES:
+        return chat_event_for_user(user, event)
     job = event.get("job") or {}
     if event.get("type") == "job.updated" and job.get("chat_id"):
         chat = database.get_chat(job["chat_id"])
+        if chat and chat.get("deleted_at") and user["role"] != "admin":
+            return None
         if chat and chat.get("consultation"):
             if user["role"] != "admin" and (
                 chat["owner_user_id"] != user["id"]
@@ -432,6 +522,23 @@ def bootstrap_admin(database: Database, settings: Settings) -> None:
     database.audit(admin["id"], "admin.bootstrap", object_type="user", object_id=admin["id"])
 
 
+class SpaPathConvertor(Convertor[str]):
+    """Any path outside /api and /static, so unknown API routes stay JSON 404s.
+    A last segment with a dot names a file (/favicon.ico, /main.js): a plain 404.
+    A trailing slash does not hide that dot, or the slash redirect would serve it."""
+
+    regex = r"(?!(?:api|static)(?:/|$))(?:(?:[^/]*/)*[^/.]+/?)?"
+
+    def convert(self, value: str) -> str:
+        return value
+
+    def to_string(self, value: str) -> str:
+        return value
+
+
+register_url_convertor("spa_path", SpaPathConvertor())
+
+
 def create_app(settings: Settings | None = None, *, start_dispatcher: bool = True) -> FastAPI:
     settings = settings or Settings.from_env()
     question_reply_lock = asyncio.Lock()
@@ -444,11 +551,26 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         bootstrap_admin(database, settings)
         events = EventBroker()
 
+        async def publish_live_title(event: dict[str, Any]) -> None:
+            update = session_title_update(event.get("event"))
+            if not update:
+                return
+            try:
+                chat = database.chat_for_session(event.get("workspace"), update[0])
+                if not chat or update[1].strip() == chat["title"]:
+                    return
+                database.set_chat_title(chat["id"], update[1])
+                await publish_chat_updated(database, events, chat["id"], title_changed=True)
+            except Exception:
+                # Title sync is cosmetic; it must never break the event relay.
+                logger.exception("Live chat title update failed")
+
         async def publish_opencode(event: dict[str, Any]) -> None:
             if event.get("type") == "opencode.disconnected":
                 await events.publish(event)
             else:
                 await events.publish(safe_opencode_event(event))
+                await publish_live_title(event)
 
         manager = OpenCodeManager(settings, publish_opencode)
         dispatcher = QueueDispatcher(
@@ -483,8 +605,22 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                     finally:
                         database.close()
 
-    app = FastAPI(title="OpenCode Web", version="0.1.0", lifespan=lifespan)
+    docs = settings.enable_docs
+    app = FastAPI(
+        title="OpenCode Web",
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
+    )
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
+    app.add_middleware(
+        ContentSecurityPolicyMiddleware,
+        exempt_paths=(
+            frozenset({"/docs", "/docs/oauth2-redirect", "/redoc"}) if docs else frozenset()
+        ),
+    )
 
     def database(request: Request) -> Database:
         return request.app.state.database
@@ -506,11 +642,12 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             request.url.path.startswith("/api/auth/")
             or request.url.path in {
                 "/api/config/public", "/api/events", "/api/profile", "/api/tasks",
-                "/api/consultations",
+                "/api/consultations", "/api/me/items", "/api/queue/me",
             }
             or request.url.path.startswith((
                 "/api/tasks/", "/api/task-runs", "/api/consultations/",
             ))
+            or is_chat_action(request.method, request.url.path)
         ):
             raise HTTPException(403, "This account can only use tasks and consultations")
         return {"user": user, "csrf": csrf, "token": token}
@@ -544,9 +681,42 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         if principal["user"]["role"] != "admin" and (
             chat["owner_user_id"] != principal["user"]["id"]
             or chat["workspace_snapshot"] != principal["user"]["workspace_path"]
+            or chat.get("deleted_at")
         ):
             raise HTTPException(404, "Chat not found")
         return chat
+
+    def visible_item(db: Database, user: dict[str, Any], chat_id: str) -> dict[str, Any]:
+        """The caller's own chat of any kind, exactly as /api/me/items lists it."""
+        rows = db.list_items(
+            owner_id=user["id"],
+            workspace=user.get("workspace_path"),
+            kinds=allowed_item_kinds(user),
+            chat_id=chat_id,
+        )
+        if not rows:
+            raise HTTPException(404, "Chat not found")
+        return rows[0]
+
+    async def stop_job_audited(
+        request: Request, db: Database, actor_id: str, job: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        db.audit(
+            actor_id, "job.stop.request", effective_user_id=job["effective_user_id"],
+            object_type="job", object_id=job["id"],
+            metadata={
+                "previous_status": job["status"], "task_id": job.get("task_id"),
+                **(metadata or {}),
+            },
+        )
+        result = await request.app.state.dispatcher.stop_job(job["id"])
+        if result and result["status"] == "cancelled" and job["status"] == "queued":
+            db.audit(
+                actor_id, "job.stop.completed", effective_user_id=job["effective_user_id"],
+                object_type="job", object_id=job["id"],
+            )
+        return result
 
     def apply_opencode_title(
         db: Database, chat: dict[str, Any], session: dict[str, Any] | None
@@ -566,7 +736,12 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             session = await client.session(chat["opencode_session_id"])
         except OpenCodeError:
             return chat
-        return apply_opencode_title(db, chat, session)
+        updated = apply_opencode_title(db, chat, session)
+        if updated["title"] != chat["title"]:
+            await publish_chat_updated(
+                db, request.app.state.events, chat["id"], title_changed=True
+            )
+        return updated
 
     async def sync_chat_titles(
         request: Request, db: Database, chats: list[dict[str, Any]]
@@ -604,7 +779,12 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         groups = await asyncio.gather(
             *(refresh_workspace(workspace, items) for workspace, items in by_workspace.items())
         )
-        return [change for group in groups for change in group]
+        changes = [change for group in groups for change in group]
+        for change in changes:
+            await publish_chat_updated(
+                db, request.app.state.events, change["id"], title_changed=True
+            )
+        return changes
 
     async def sync_task_titles(
         request: Request, db: Database, jobs: list[dict[str, Any]]
@@ -679,6 +859,8 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         content = body.message.strip() if body.message else ""
         if not content:
             return None
+        if chat.get("deleted_at"):
+            raise HTTPException(404, "Chat not found")
         if db.queued_count() >= config.max_queued_messages:
             raise HTTPException(429, "Queue is full")
         pinned_model = None
@@ -692,16 +874,19 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         model_variant = body.model_variant
         if not model_variant and requested_model == pinned_model:
             model_variant = chat.get("preferred_model_variant")
-        job = db.create_job(
-            chat=chat,
-            effective_user_id=chat["owner_user_id"],
-            actor_user_id=actor_id,
-            content=content,
-            agent=agent,
-            provider_id=provider_id,
-            model_id=model_id,
-            model_variant=model_variant,
-        )
+        try:
+            job = db.create_job(
+                chat=chat,
+                effective_user_id=chat["owner_user_id"],
+                actor_user_id=actor_id,
+                content=content,
+                agent=agent,
+                provider_id=provider_id,
+                model_id=model_id,
+                model_variant=model_variant,
+            )
+        except ChatDeleted as exc:
+            raise HTTPException(404, "Chat not found") from exc
         app.state.dispatcher.wake()
         return job
 
@@ -773,6 +958,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 principal["user"]["id"],
                 mattermost_username=username,
                 mattermost_user_id=user_id,
+                actor_id=principal["user"]["id"],
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "Mattermost user is already assigned") from exc
@@ -931,7 +1117,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
         job = db.get_task_run(run_id)
-        if not job or job["effective_user_id"] != principal["user"]["id"]:
+        if (
+            not job or job["effective_user_id"] != principal["user"]["id"]
+            or job.get("chat_deleted_at")
+        ):
             raise HTTPException(404, "Task run not found")
         return public_task_run(job)
 
@@ -944,7 +1133,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> dict[str, Any]:
         job = db.get_task_run(run_id)
         user = principal["user"]
-        if not job or (job["effective_user_id"] != user["id"] and user["role"] != "admin"):
+        if not job or (
+            user["role"] != "admin"
+            and (job["effective_user_id"] != user["id"] or job.get("chat_deleted_at"))
+        ):
             raise HTTPException(404, "Task run not found")
         if job["status"] != "completed":
             return {"run_id": run_id, "status": "not_completed", "text": None}
@@ -984,21 +1176,11 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> dict[str, Any]:
         job = db.get_task_run(run_id)
         user_id = principal["user"]["id"]
-        if not job or job["effective_user_id"] != user_id:
+        if not job or job["effective_user_id"] != user_id or job.get("chat_deleted_at"):
             raise HTTPException(404, "Task run not found")
-        db.audit(
-            user_id, "job.stop.request", effective_user_id=user_id,
-            object_type="job", object_id=run_id,
-            metadata={"previous_status": job["status"], "task_id": job["task_id"]},
-        )
-        result = await request.app.state.dispatcher.stop_job(run_id)
+        result = await stop_job_audited(request, db, user_id, job)
         if result is None:
             raise HTTPException(404, "Task run not found")
-        if result["status"] == "cancelled" and job["status"] == "queued":
-            db.audit(
-                user_id, "job.stop.completed", effective_user_id=user_id,
-                object_type="job", object_id=run_id,
-            )
         return public_task_run(result)
 
     @app.get("/api/admin/tasks")
@@ -1022,12 +1204,12 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 principal["user"]["id"], body.title, body.description, body.content,
                 agent, provider_id, model_id, body.model_variant, body.is_published,
                 next_task_ids=body.next_task_ids, plan_first=body.plan_first,
-                queue_id=body.queue_id,
+                queue_id=body.queue_id, input_hint=body.input_hint,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         if visibility != "all" or user_ids:
-            db.set_task_audience(task["id"], visibility, user_ids)
+            db.set_task_audience(task["id"], visibility, user_ids, principal["user"]["id"])
         db.audit(
             principal["user"]["id"], "task.create", object_type="task", object_id=task["id"]
         )
@@ -1040,10 +1222,11 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         principal: Annotated[dict[str, Any], Depends(admin_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
+        expected = edit_base(db, "tasks", task_id, body.updated_at)
         task = db.get_task(task_id)
         if not task:
-            raise HTTPException(404, "Task not found")
-        fields = body.model_dump(exclude_unset=True)
+            raise edit_error(db.edit_state("tasks", task_id))
+        fields = body.model_dump(exclude_unset=True, exclude={"updated_at"})
         for key in (
             "title", "content", "agent", "model", "is_published", "plan_first", "queue_id"
         ):
@@ -1061,18 +1244,14 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         )
         fields.update(agent=agent, provider_id=provider_id, model_id=model_id)
         try:
-            updated = db.update_task(task_id, fields)
+            updated = db.update_task(
+                task_id, fields, actor_id=principal["user"]["id"], expected_updated_at=expected,
+                visibility=visibility, user_ids=user_ids,
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         if not updated:
-            raise HTTPException(404, "Task not found")
-        if visibility is not None or user_ids is not None:
-            target_visibility = visibility or updated["visibility"]
-            target_user_ids = (
-                user_ids if user_ids is not None else db.list_task_audience(task_id)
-            )
-            db.set_task_audience(task_id, target_visibility, target_user_ids)
-            updated = db.get_task(task_id)
+            raise edit_error(db.edit_state("tasks", task_id))
         db.audit(
             principal["user"]["id"], "task.update", object_type="task", object_id=task_id
         )
@@ -1089,7 +1268,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             raise HTTPException(404, "Task not found")
         visibility = checked_visibility(body.visibility)
         user_ids = checked_user_ids(db, body.user_ids)
-        updated = db.set_task_audience(task_id, visibility, user_ids)
+        updated = db.set_task_audience(task_id, visibility, user_ids, principal["user"]["id"])
         db.audit(
             principal["user"]["id"],
             "task.audience.update",
@@ -1105,7 +1284,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         principal: Annotated[dict[str, Any], Depends(admin_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> None:
-        if not db.delete_task(task_id):
+        if not db.delete_task(task_id, principal["user"]["id"]):
             raise HTTPException(404, "Task not found")
         db.audit(
             principal["user"]["id"], "task.delete", object_type="task", object_id=task_id
@@ -1118,7 +1297,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> list[dict[str, Any]]:
         return [
             {**public_task_run(job), "owner_login": job["effective_login"]}
-            for job in db.list_task_runs()
+            for job in db.list_task_runs(include_deleted=True)
         ]
 
     @app.post("/api/admin/task-runs/title-sync")
@@ -1127,7 +1306,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         principal: Annotated[dict[str, Any], Depends(admin_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> list[dict[str, Any]]:
-        return await sync_task_titles(request, db, db.list_task_runs())
+        return await sync_task_titles(request, db, db.list_task_runs(include_deleted=True))
 
     @app.get("/api/admin/task-runs/{run_id}/messages")
     async def admin_task_run_messages(
@@ -1366,8 +1545,18 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         principal: Annotated[dict[str, Any], Depends(current_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> list[dict[str, Any]]:
-        return [job for job in db.list_jobs(principal["user"]["id"])
-                if not job.get("task_id") and not job.get("consultation")]
+        user = principal["user"]
+        kinds = allowed_item_kinds(user)
+        workspace = user.get("workspace_path")
+        positions = db.queue_positions()
+        return [
+            public_queue_job(job, positions.get(job["id"]))
+            for job in db.list_jobs(user["id"])
+            if not job.get("chat_deleted_at") and job_kind(job) in kinds
+            # Like /api/me/items: folder chats and questions belong to one workspace,
+            # task runs follow the user.
+            and (job_kind(job) == "task" or job["workspace_snapshot"] == workspace)
+        ]
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(
@@ -1378,7 +1567,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         job = db.get_job(job_id)
         if not job or (
             principal["user"]["role"] != "admin"
-            and (job["effective_user_id"] != principal["user"]["id"] or job.get("task_id"))
+            and (
+                job["effective_user_id"] != principal["user"]["id"] or job.get("task_id")
+                or job.get("chat_deleted_at")
+            )
         ):
             raise HTTPException(404, "Job not found")
         if job.get("consultation") and principal["user"]["role"] != "admin":
@@ -1416,6 +1608,162 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             raise HTTPException(409, "Chat is not running")
         job = await request.app.state.dispatcher.stop_job(active["id"])
         return {"aborted": bool(job and job["status"] == "cancelled")}
+
+    @app.get("/api/me/items")
+    async def my_items(
+        principal: Annotated[dict[str, Any], Depends(current_principal)],
+        db: Annotated[Database, Depends(database)],
+    ) -> list[dict[str, Any]]:
+        user = principal["user"]
+        rows = db.list_items(
+            owner_id=user["id"],
+            workspace=user.get("workspace_path"),
+            kinds=allowed_item_kinds(user),
+        )
+        return [public_item(row) for row in rows]
+
+    @app.get("/api/admin/requests")
+    async def admin_requests(
+        principal: Annotated[dict[str, Any], Depends(admin_read_principal)],
+        db: Annotated[Database, Depends(database)],
+        user: str = "",
+        start: Annotated[str | None, Query(alias="from")] = None,
+        end: Annotated[str | None, Query(alias="to")] = None,
+        kind: Annotated[str, Query(alias="type")] = "",
+        task: str | None = None,
+        q: str = "",
+        timezone: str = "UTC",
+    ) -> list[dict[str, Any]]:
+        kinds = list(dict.fromkeys(part.strip() for part in kind.split(",") if part.strip()))
+        if unknown := [value for value in kinds if value not in ITEM_KINDS]:
+            raise HTTPException(422, f"Unknown type: {', '.join(unknown)}")
+        try:
+            created_from, created_to = time_range(start, end, timezone)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        logins = [normalize_login(part) for part in user.split(",") if part.strip()]
+        rows = db.list_items(
+            owner_logins=logins or None,
+            kinds=kinds or None,
+            task_id=task or None,
+            created_from=created_from,
+            created_to=created_to,
+            include_deleted=True,
+        )
+        tokens = search_tokens(q)
+        result = []
+        for row in rows:
+            request_row = public_admin_request(row)
+            if matches_search(
+                tokens, request_row["title"], request_row["user"]["login"],
+                request_row["task_title"],
+            ):
+                result.append(request_row)
+        return result
+
+    def chat_action_audit(
+        db: Database, user: dict[str, Any], action: str, item: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        db.audit(
+            user["id"], action, effective_user_id=user["id"], object_type="chat",
+            object_id=item["chat_id"],
+            metadata={"kind": public_item(item)["kind"], **(metadata or {})},
+        )
+
+    @app.post("/api/chats/{chat_id}/archive")
+    async def archive_chat(
+        chat_id: str,
+        request: Request,
+        principal: Annotated[dict[str, Any], Depends(csrf_principal)],
+        db: Annotated[Database, Depends(database)],
+    ) -> dict[str, Any]:
+        user = principal["user"]
+        item = visible_item(db, user, chat_id)
+        # Archiving never stops work; it only moves the chat out of the main lists.
+        if db.archive_chat(chat_id):
+            chat_action_audit(
+                db, user, "chat.archive", item,
+                {"snoozed_until": item["snoozed_until"]} if item["snoozed_until"] else None,
+            )
+            await publish_chat_updated(db, request.app.state.events, chat_id)
+            item = visible_item(db, user, chat_id)
+        return public_item(item)
+
+    @app.post("/api/chats/{chat_id}/unarchive")
+    async def unarchive_chat(
+        chat_id: str,
+        request: Request,
+        principal: Annotated[dict[str, Any], Depends(csrf_principal)],
+        db: Annotated[Database, Depends(database)],
+    ) -> dict[str, Any]:
+        user = principal["user"]
+        item = visible_item(db, user, chat_id)
+        if (
+            item["archived_at"] and item_kind(item) != "task"
+            and db.get_chat(chat_id).get("archived_reason")
+        ):
+            raise HTTPException(409, "Chat was archived after a workspace change")
+        if db.unarchive_chat(chat_id):
+            chat_action_audit(db, user, "chat.unarchive", item)
+            await publish_chat_updated(db, request.app.state.events, chat_id)
+            item = visible_item(db, user, chat_id)
+        return public_item(item)
+
+    @app.post("/api/chats/{chat_id}/snooze")
+    async def snooze_chat(
+        chat_id: str,
+        body: SnoozeBody,
+        request: Request,
+        principal: Annotated[dict[str, Any], Depends(csrf_principal)],
+        db: Annotated[Database, Depends(database)],
+    ) -> dict[str, Any]:
+        user = principal["user"]
+        item = visible_item(db, user, chat_id)
+        if body.until <= datetime.now(UTC):
+            raise HTTPException(422, "Snooze time must be in the future")
+        if item["archived_at"]:
+            raise HTTPException(409, "Archived chat cannot be snoozed")
+        until = body.until.astimezone(UTC).isoformat()
+        if not db.snooze_chat(chat_id, until):
+            raise HTTPException(409, "Archived chat cannot be snoozed")
+        chat_action_audit(db, user, "chat.snooze", item, {"until": until})
+        await publish_chat_updated(db, request.app.state.events, chat_id)
+        return public_item(visible_item(db, user, chat_id))
+
+    @app.post("/api/chats/{chat_id}/unsnooze")
+    async def unsnooze_chat(
+        chat_id: str,
+        request: Request,
+        principal: Annotated[dict[str, Any], Depends(csrf_principal)],
+        db: Annotated[Database, Depends(database)],
+    ) -> dict[str, Any]:
+        user = principal["user"]
+        item = visible_item(db, user, chat_id)
+        if db.unsnooze_chat(chat_id):
+            chat_action_audit(db, user, "chat.unsnooze", item)
+            await publish_chat_updated(db, request.app.state.events, chat_id)
+            item = visible_item(db, user, chat_id)
+        return public_item(item)
+
+    @app.delete("/api/chats/{chat_id}", status_code=204)
+    async def delete_chat(
+        chat_id: str,
+        request: Request,
+        principal: Annotated[dict[str, Any], Depends(csrf_principal)],
+        db: Annotated[Database, Depends(database)],
+    ) -> Response:
+        user = principal["user"]
+        item = visible_item(db, user, chat_id)
+        stopped: list[str] = []
+        # Unfinished work goes through the regular stop path before the chat disappears.
+        for job in db.unfinished_chat_jobs(chat_id):
+            await stop_job_audited(request, db, user["id"], job, {"reason": "chat.delete"})
+            stopped.append(job["id"])
+        if db.delete_chat(chat_id):
+            chat_action_audit(db, user, "chat.delete", item, {"stopped_job_ids": stopped})
+            await publish_chat_deleted(db, request.app.state.events, chat_id)
+        return Response(status_code=204)
 
     @app.post("/api/chats/{chat_id}/permissions/{permission_id}")
     async def respond_permission(
@@ -1479,6 +1827,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 tasks_only=body.tasks_only,
                 mattermost_username=mattermost_username,
                 mattermost_user_id=mattermost_user_id,
+                actor_id=principal["user"]["id"],
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "Login or Mattermost user already exists") from exc
@@ -1491,13 +1840,15 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     async def admin_update_user(
         user_id: str,
         body: UserUpdateBody,
+        request: Request,
         principal: Annotated[dict[str, Any], Depends(admin_principal)],
         db: Annotated[Database, Depends(database)],
         config: Annotated[Settings, Depends(settings_dep)],
     ) -> dict[str, Any]:
+        expected = edit_base(db, "users", user_id, body.updated_at)
         current = db.get_user(user_id)
         if not current:
-            raise HTTPException(404, "User not found")
+            raise edit_error(None)
         role = body.role or current["role"]
         path_candidate = (
             body.workspace_path if body.workspace_path is not None else current["workspace_path"]
@@ -1534,16 +1885,69 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         try:
             updated = db.update_user(
                 user_id, role=role, workspace_path=workspace, status=body.status,
-                tasks_only=body.tasks_only, **updates,
+                tasks_only=body.tasks_only, actor_id=principal["user"]["id"],
+                expected_updated_at=expected, **updates,
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "Mattermost user is already assigned") from exc
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        if workspace_changed and workspace:
-            db.archive_chats_outside_workspace(user_id, workspace)
+        if not updated:
+            raise edit_error(db.edit_state("users", user_id))
+        changed_chat_ids = (
+            db.apply_workspace_change(user_id, workspace)
+            if workspace_changed and workspace else []
+        )
         db.audit(principal["user"]["id"], "user.update", object_type="user", object_id=user_id)
+        for chat_id in changed_chat_ids:
+            await publish_chat_updated(db, request.app.state.events, chat_id)
         return public_user(updated)  # type: ignore[arg-type]
+
+    @app.post("/api/admin/users/batch")
+    async def admin_batch_users(
+        body: UserBatchBody,
+        principal: Annotated[dict[str, Any], Depends(admin_principal)],
+        db: Annotated[Database, Depends(database)],
+        config: Annotated[Settings, Depends(settings_dep)],
+    ) -> dict[str, Any]:
+        """Block or unblock several users; each one succeeds or fails on its own."""
+        admin_id = principal["user"]["id"]
+        target = "disabled" if body.status == "blocked" else "active"
+        results: list[dict[str, Any]] = []
+        for user_id in dict.fromkeys(body.ids):
+            user = db.get_user(user_id)
+            result = {
+                "id": user_id, "login": user["login"] if user else None,
+                "ok": False, "skipped": False, "reason": None,
+            }
+            results.append(result)
+            if not user:
+                result["reason"] = "not_found"
+            elif user_id == admin_id:
+                result.update(skipped=True, reason="self")
+            elif user["status"] == target:
+                result.update(ok=True, skipped=True, reason="already")
+            elif (
+                target == "active"
+                and user.get("workspace_path")
+                and not config.allow_shared_workspaces
+                and db.workspace_in_use(user["workspace_path"], exclude_user_id=user_id)
+            ):
+                # Same exclusivity rule as the single PATCH (checked_workspace):
+                # an active user may not share a workspace with another active user.
+                result["reason"] = "workspace_in_use"
+            else:
+                try:
+                    db.update_user(user_id, status=target, actor_id=admin_id)
+                except ValueError:
+                    result["reason"] = "invalid"
+                    continue
+                db.audit(
+                    admin_id, "user.update", object_type="user", object_id=user_id,
+                    metadata={"status": target, "batch": True},
+                )
+                result["ok"] = True
+        return {"results": results}
 
     @app.post("/api/admin/users/{user_id}/reset-password", status_code=204)
     async def admin_reset_password(
@@ -1555,7 +1959,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         if not db.get_user(user_id):
             raise HTTPException(404, "User not found")
         try:
-            db.reset_password(user_id, body.password)
+            db.reset_password(user_id, body.password, principal["user"]["id"])
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         db.audit(
@@ -1575,7 +1979,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             object_type="user",
             object_id=user_id,
         )
-        return db.list_chats(user_id)
+        return db.list_chats(user_id, include_deleted=True)
 
     @app.post("/api/admin/users/{user_id}/chats/title-sync")
     async def admin_sync_chat_titles_from_opencode(
@@ -1586,7 +1990,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> list[dict[str, Any]]:
         if not db.get_user(user_id):
             raise HTTPException(404, "User not found")
-        return await sync_chat_titles(request, db, db.list_chats(user_id))
+        return await sync_chat_titles(request, db, db.list_chats(user_id, include_deleted=True))
 
     @app.get("/api/admin/users/{user_id}/task-runs")
     async def admin_user_task_runs(
@@ -1605,7 +2009,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         )
         return [
             {**public_task_run(job), "owner_login": job["effective_login"]}
-            for job in db.list_task_runs(user_id)
+            for job in db.list_task_runs(user_id, include_deleted=True)
         ]
 
     @app.post("/api/admin/users/{user_id}/task-runs/title-sync")
@@ -1617,7 +2021,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> list[dict[str, Any]]:
         if not db.get_user(user_id):
             raise HTTPException(404, "User not found")
-        return await sync_task_titles(request, db, db.list_task_runs(user_id))
+        return await sync_task_titles(request, db, db.list_task_runs(user_id, include_deleted=True))
 
     @app.get("/api/admin/users/{user_id}/tasks")
     async def admin_user_tasks(
@@ -1728,6 +2132,44 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             **db.task_statistics(start.isoformat(), end.isoformat()),
         }
 
+    @app.get("/api/admin/statistics/runs")
+    async def admin_statistics_runs(
+        principal: Annotated[dict[str, Any], Depends(admin_read_principal)],
+        db: Annotated[Database, Depends(database)],
+        start: Annotated[str | None, Query(alias="from")] = None,
+        end: Annotated[str | None, Query(alias="to")] = None,
+        kind: Annotated[str, Query(alias="type")] = "",
+        timezone: str = "UTC",
+    ) -> dict[str, Any]:
+        try:
+            created_from, created_to = time_range(start, end, timezone)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        kind = kind.strip()
+        rows = db.list_statistics_runs(
+            kind=kind if kind in {"question", "task"} else None,
+            task_id=kind if kind not in {"", "question", "task"} else None,
+            created_from=created_from,
+            created_to=created_to,
+        )
+        return {
+            "items": [
+                {
+                    "id": row["id"],
+                    "kind": "task" if row["task_id"] else "question",
+                    "task_id": row["task_id"],
+                    "task_title": row["task_title"],
+                    "login": row["login"],
+                    "created_at": row["created_at"],
+                    "started_at": row["started_at"],
+                    "finished_at": row["finished_at"],
+                    "outcome": row["status"] if row["status"] in TERMINAL_OUTCOMES else None,
+                }
+                for row in rows
+            ],
+            "generated_at": datetime.now(UTC).isoformat(),
+        }
+
     @app.get("/api/admin/queue")
     async def admin_queue(
         request: Request,
@@ -1766,7 +2208,9 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         if body.max_workers > settings.max_active_sessions_hard_limit:
             raise HTTPException(422, "Value exceeds MAX_ACTIVE_SESSIONS_HARD_LIMIT")
         try:
-            queue = db.create_work_queue(body.name, body.priority, body.max_workers)
+            queue = db.create_work_queue(
+                body.name, body.priority, body.max_workers, principal["user"]["id"]
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         db.audit(
@@ -1779,22 +2223,24 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     @app.patch("/api/admin/queues/{queue_id}")
     async def update_queue(
         queue_id: str,
-        body: WorkQueueBody,
+        body: WorkQueuePatchBody,
         request: Request,
         principal: Annotated[dict[str, Any], Depends(admin_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
         if body.max_workers > settings.max_active_sessions_hard_limit:
             raise HTTPException(422, "Value exceeds MAX_ACTIVE_SESSIONS_HARD_LIMIT")
+        expected = edit_base(db, "work_queues", queue_id, body.updated_at)
         try:
             queue = db.update_work_queue(
                 queue_id, name=body.name, priority=body.priority,
-                max_workers=body.max_workers,
+                max_workers=body.max_workers, actor_id=principal["user"]["id"],
+                expected_updated_at=expected,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         if not queue:
-            raise HTTPException(404, "Queue not found")
+            raise edit_error(db.edit_state("work_queues", queue_id))
         db.audit(
             principal["user"]["id"], "queue.update", object_type="queue",
             object_id=queue_id,
@@ -1810,7 +2256,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> None:
         try:
-            archived = db.archive_work_queue(queue_id)
+            archived = db.archive_work_queue(queue_id, principal["user"]["id"])
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         if not archived:
@@ -1946,8 +2392,45 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     async def admin_audit(
         principal: Annotated[dict[str, Any], Depends(admin_read_principal)],
         db: Annotated[Database, Depends(database)],
-    ) -> list[dict[str, Any]]:
-        return db.list_audit()
+        start: Annotated[str | None, Query(alias="from")] = None,
+        end: Annotated[str | None, Query(alias="to")] = None,
+        user: str = "",
+        action: str = "",
+        q: str = "",
+        cursor: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        timezone: str = "UTC",
+    ) -> dict[str, Any]:
+        try:
+            created_from, created_to = time_range(start, end, timezone)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        before_id = None
+        if cursor:
+            try:
+                before_id = int(cursor)
+            except ValueError:
+                raise HTTPException(422, "Invalid cursor") from None
+        rows = db.iter_audit(
+            logins=[normalize_login(part) for part in user.split(",") if part.strip()],
+            actions=[part.strip() for part in action.split(",") if part.strip()],
+            created_from=created_from,
+            created_to=created_to,
+            before_id=before_id,
+        )
+        tokens = search_tokens(q)
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            if matches_search(
+                tokens, row["action"], row["object_type"], row["object_id"],
+                row["actor_login"], row["effective_login"], row["metadata_json"],
+            ):
+                items.append(row)
+                if len(items) > limit:
+                    break
+        more = len(items) > limit
+        items = items[:limit]
+        return {"items": items, "next_cursor": str(items[-1]["id"]) if more else None}
 
     @app.get("/api/events")
     async def events(
@@ -1974,4 +2457,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         app, settings, database, current_principal, csrf_principal,
         admin_read_principal, admin_principal, validate_agent_model,
     )
+
+    # Registered last: the client-side router owns every other page URL.
+    @app.get("/{path:spa_path}", include_in_schema=False)
+    async def spa_fallback(path: str) -> FileResponse:
+        return FileResponse(PACKAGE_DIR / "static" / "index.html")
+
     return app

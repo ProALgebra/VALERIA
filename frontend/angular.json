@@ -1,0 +1,130 @@
+{
+  "$schema": "./node_modules/@angular/cli/lib/config/schema.json",
+  "version": 1,
+  "cli": {
+    "packageManager": "bun",
+    "analytics": false
+  },
+  "newProjectRoot": "projects",
+  "projects": {
+    "valeria": {
+      "projectType": "application",
+      "schematics": {
+        "@schematics/angular:component": {
+          "style": "scss",
+          "changeDetection": "OnPush"
+        }
+      },
+      "root": "",
+      "sourceRoot": "src",
+      "prefix": "v",
+      "architect": {
+        "build": {
+          "builder": "@angular/build:application",
+          "options": {
+            "browser": "src/main.ts",
+            "polyfills": [
+              "zone.js"
+            ],
+            "tsConfig": "tsconfig.app.json",
+            "inlineStyleLanguage": "scss",
+            "assets": [
+              {
+                "glob": "**/*",
+                "input": "public"
+              }
+            ],
+            "styles": [
+              "node_modules/@fontsource/inter/400.css",
+              "node_modules/@fontsource/inter/500.css",
+              "node_modules/@fontsource/inter/600.css",
+              "node_modules/@fontsource/inter/700.css",
+              "node_modules/@fontsource/jetbrains-mono/400.css",
+              "node_modules/@fontsource/jetbrains-mono/500.css",
+              "node_modules/@koobiq/icons/fonts/kbq-icons.css",
+              "node_modules/@koobiq/design-tokens/web/css-tokens.css",
+              "node_modules/@koobiq/design-tokens/web/css-tokens-light.css",
+              "node_modules/@koobiq/design-tokens/web/css-tokens-dark.css",
+              "node_modules/@koobiq/components/prebuilt-themes/theme.css",
+              {
+                "input": "src/app/features/admin/shared/admin-grid.scss",
+                "bundleName": "admin-grid",
+                "inject": false
+              },
+              "src/styles.scss"
+            ],
+            "allowedCommonJsDependencies": [
+              "@messageformat/core"
+            ]
+          },
+          "configurations": {
+            "production": {
+              "outputPath": {
+                "base": "../src/opencode_web/static",
+                "browser": ""
+              },
+              "deployUrl": "/static/",
+              "baseHref": "/",
+              "budgets": [
+                {
+                  "type": "initial",
+                  "maximumWarning": "2MB",
+                  "maximumError": "4MB"
+                },
+                {
+                  "type": "anyComponentStyle",
+                  "maximumWarning": "8kB",
+                  "maximumError": "16kB"
+                }
+              ],
+              "outputHashing": "all",
+              "optimization": {
+                "scripts": true,
+                "styles": {
+                  "minify": true,
+                  "inlineCritical": false
+                },
+                "fonts": false
+              }
+            },
+            "development": {
+              "optimization": false,
+              "extractLicenses": false,
+              "sourceMap": true
+            }
+          },
+          "defaultConfiguration": "production"
+        },
+        "serve": {
+          "builder": "@angular/build:dev-server",
+          "options": {
+            "port": 4201,
+            "proxyConfig": "proxy.conf.mjs"
+          },
+          "configurations": {
+            "production": {
+              "buildTarget": "valeria:build:production"
+            },
+            "development": {
+              "buildTarget": "valeria:build:development"
+            }
+          },
+          "defaultConfiguration": "development"
+        },
+        "test": {
+          "builder": "@angular/build:unit-test",
+          "options": {
+            "tsConfig": "tsconfig.spec.json",
+            "buildTarget": "valeria:build:development",
+            "runner": "vitest",
+            "watch": false,
+            "setupFiles": [
+              "src/test-setup.ts"
+            ],
+            "providersFile": "src/test-providers.ts"
+          }
+        }
+      }
+    }
+  }
+}

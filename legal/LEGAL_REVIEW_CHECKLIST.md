@@ -85,8 +85,8 @@ reviewed supporting evidence, not merely that text exists.
   derivative or combined work subject to AGPL obligations.
 - [ ] Preserve the complete AGPL text and all upstream attribution for that
   directory; identify local modifications and dates if required.
-- [ ] Verify the bundled `markdown-it` version and preserve its MIT copyright and
-  license notice in source and distributed artifacts.
+- [ ] Verify the packages bundled into the web interface build and preserve their
+  notices (`src/opencode_web/static/3rdpartylicenses.txt`) in distributed artifacts.
 - [ ] Review licenses and notices for OpenCode and all MCP servers, SDKs, models,
   tokenizers, fonts, icons, JavaScript assets, and container contents.
 - [ ] Distinguish API integration from bundling, binary redistribution, source

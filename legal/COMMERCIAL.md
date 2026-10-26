@@ -141,7 +141,8 @@ not narrow an existing Community grant.
 
 Third-party components do not become subject to V.A.L.E.R.I.A.'s custom license.
 In particular, this repository currently includes a separately licensed AGPL
-component under `mcp/opencode-dcp-local/` and an MIT notice for `markdown-it`.
+component under `mcp/opencode-dcp-local/` and a web interface bundle with the
+notices of its third-party packages (`src/opencode_web/static/3rdpartylicenses.txt`).
 See `NOTICE.md`. A distributor must complete a dependency and license review for
 the exact artifact it ships.
 

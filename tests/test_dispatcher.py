@@ -127,9 +127,13 @@ async def test_chat_question_keeps_idle_job_active_and_recovery_does_not_resend(
 
         async def questions(self):
             self.polls += 1
+            status = database.get_job(job["id"])["status"]
             if self.polls <= 5:
-                assert database.get_job(job["id"])["status"] == "running"
+                # Recovery and the first monitor poll find it running, then it waits.
+                assert status == ("running" if self.polls <= 2 else "waiting_question")
                 return [{"id": "que-1", "sessionID": job["session_id"], "questions": []}]
+            if self.polls == 7:
+                assert status == "running"  # answered; the agent carries on
             return []
 
     client = QuestionClient()

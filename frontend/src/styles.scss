@@ -1,0 +1,31 @@
+// Global styles. Colours come only from Koobiq tokens (`--kbq-*`); fonts are self-hosted (angular.json).
+
+// Koobiq's own optgroup label styles. The prebuilt theme does not carry them: they come with the KbqOptgroup
+// component and only load once a kbq-select with groups renders. Dropdown captions reuse the same
+// `<label class="kbq-optgroup-label">` markup (kbq-optgroup does not work inside kbq-dropdown), so the stock
+// stylesheet is loaded here for every screen.
+@use '@koobiq/components/core/option/optgroup';
+
+html,
+body {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    font-family: var(--kbq-typography-text-normal-font-family);
+    color: var(--kbq-foreground-contrast);
+}
+
+v-root {
+    display: block;
+    height: 100%;
+}
+
+// The routed screen fills the content area as a flex column: header on top, body below.
+.v-shell__main > :not(router-outlet) {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+}

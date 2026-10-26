@@ -13,6 +13,7 @@ from weakref import WeakValueDictionary
 from .consultations import CONSULTATION_PERMISSIONS, CONSULTATION_SYSTEM, final_answer
 from .database import Database
 from .events import EventBroker
+from .items import publish_chat_updated
 from .opencode_client import OpenCodeError, OpenCodeManager, OpenCodeReadTimeout
 from .questions import question_event, session_questions
 from .task_results import task_final_answer
@@ -22,6 +23,7 @@ STOP_RETRY_SECONDS = 5
 POLL_READ_RETRY_INITIAL_SECONDS = 1
 POLL_READ_RETRY_MAX_SECONDS = 30
 CONTINUE_PROMPT = "План принят. Продолжай: реализуй предложенный план."
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 class TaskExecutionError(RuntimeError):
@@ -81,14 +83,15 @@ class QueueDispatcher:
         job = self.database.get_job(job_id)
         if not job:
             return None
-        if job["status"] in {"completed", "failed", "cancelled"}:
+        if job["status"] in TERMINAL_STATUSES:
             return job
+        before = job["status"]
         if not self.database.cancel_queued_job(job_id):
             self.database.set_job_status(job_id, "cancelling")
         job = self.database.get_job(job_id)
         if job["status"] == "cancelling":
             self._start_cancellation(job_id)
-        await self._publish_job_update(job_id)
+        await self._publish_job_update(job_id, finished_from=before)
         self.wake()
         return job
 
@@ -139,7 +142,7 @@ class QueueDispatcher:
                         None, "job.stop.completed", effective_user_id=job["effective_user_id"],
                         object_type="job", object_id=job_id,
                     )
-                    await self._publish_job_update(job_id)
+                    await self._publish_job_update(job_id, finished_from="cancelling")
                     self.wake()
                     return
             await asyncio.sleep(STOP_RETRY_SECONDS)
@@ -198,6 +201,8 @@ class QueueDispatcher:
             if job["status"] == "cancelling":
                 self._start_cancellation(job["id"])
                 continue
+            # Set to None once a worker takes the job over and reports its end itself.
+            before: str | None = job["status"]
             try:
                 if job.get("session_pending"):
                     self.database.requeue_interrupted_job(job["id"])
@@ -219,8 +224,10 @@ class QueueDispatcher:
                         ),
                     )
                     if pending:
-                        self.database.set_job_status(job["id"], "waiting_question")
+                        cleared = self.database.set_job_status(job["id"], "waiting_question")
                         await self._publish_job_update(job["id"])
+                        if cleared:
+                            await self._publish_chat_update(job["chat_id"])
                         continue
                     if job["status"] == "waiting_question":
                         # The reply may have reached OpenCode just before a gateway
@@ -260,6 +267,7 @@ class QueueDispatcher:
                     )
                 if busy or task_pending:
                     self.database.set_job_status(job["id"], "running")
+                    before = None
                     self._spawn(self._execute(job, client), f"recovered-job-{job['id']}")
                 else:
                     messages = await client.messages(job["session_id"])
@@ -278,6 +286,7 @@ class QueueDispatcher:
                     elif (result == "completed" and job.get("plan_first")
                           and not job.get("phase2_message_id")):
                         self.database.set_job_status(job["id"], "running")
+                        before = None
                         self._spawn(self._execute(job, client), f"recovered-job-{job['id']}")
                     elif job["status"] == "dispatching" and not user_found:
                         self.database.requeue_interrupted_job(job["id"])
@@ -305,14 +314,28 @@ class QueueDispatcher:
             except OpenCodeError:
                 logger.exception("OpenCode recovery failed", extra={"job_id": job["id"]})
                 self.database.set_job_status(job["id"], "failed", "recovery_unavailable")
-            await self._publish_job_update(job["id"])
+            await self._publish_job_update(job["id"], finished_from=before)
 
-    async def _publish_job_update(self, job_id: str) -> None:
+    async def _publish_chat_update(self, chat_id: str) -> None:
+        await publish_chat_updated(self.database, self.events, chat_id)
+
+    async def _publish_job_update(
+        self, job_id: str, *, finished_from: str | None = None
+    ) -> None:
+        """Publish job.updated. Pass the status seen before a transition this caller
+        made: when the job has just ended, a folder chat also gets chat.updated."""
         job = self.database.get_job(job_id)
         await self.events.publish({"type": "job.updated", "job": job})
         if job and job["status"] == "completed" and job.get("pipeline_json"):
             for child in self.database.pipeline_children(job_id):
                 await self.events.publish({"type": "job.updated", "job": child})
+        if (
+            job and finished_from is not None and finished_from not in TERMINAL_STATUSES
+            and job["status"] in TERMINAL_STATUSES
+            and not job.get("task_id") and not job.get("consultation")
+        ):
+            # The side menu reads a folder chat's state from chat.updated.
+            await self._publish_chat_update(job["chat_id"])
 
     @staticmethod
     def _message_result(
@@ -448,11 +471,14 @@ class QueueDispatcher:
 
     async def _execute(self, job: dict[str, Any], client: Any = None) -> None:
         job_id = job["id"]
+        before: str | None = None
         try:
             # A pending session has nothing to abort yet. Allow cancellation to
             # finish while cold startup is still waiting for readiness.
             prepared_client = None
             current = self.database.get_job(job_id)
+            if current:
+                before = current["status"]
             if (client is None and current and current.get("session_pending")
                     and current["status"] == "dispatching"):
                 prepared_client = await self.manager.ensure(job["workspace_snapshot"])
@@ -560,7 +586,9 @@ class QueueDispatcher:
                 # Release a hidden interaction or generation after a terminal failure.
                 with suppress(OpenCodeError):
                     await client.abort(job["session_id"])
-            await self._publish_job_update(job_id)
+            # Only a stop cancels a job, and the stop reports that end itself.
+            ended_here = current and current["status"] != "cancelled"
+            await self._publish_job_update(job_id, finished_from=before if ended_here else None)
             self.wake()
 
     async def _start_build_phase(self, job: dict[str, Any], client: Any) -> dict[str, Any] | None:
@@ -615,6 +643,8 @@ class QueueDispatcher:
             )
             busy = self._busy(statuses.get(job["session_id"]))
             pending_question = False
+            next_status: str | None = None
+            chat_changed = False
             if is_task:
                 async with self._job_lock(job_id):
                     pending_question = await self._answer_task_questions(
@@ -629,8 +659,10 @@ class QueueDispatcher:
                     ),
                 )
                 if pending:
-                    self.database.set_job_status(job_id, "waiting_question")
+                    cleared = self.database.set_job_status(job_id, "waiting_question")
                     await self._publish_job_update(job_id)
+                    if cleared:
+                        await self._publish_chat_update(job["chat_id"])
                     return
             else:
                 pending = await self._poll_opencode(
@@ -647,6 +679,14 @@ class QueueDispatcher:
                     await self.events.publish(
                         question_event(job["workspace_snapshot"], job["session_id"])
                     )
+                    # Every new question needs the user, so a snooze ends here too.
+                    if question_ids and self.database.clear_chat_snooze(job["chat_id"]):
+                        chat_changed = True
+                if pending_question:
+                    next_status = "waiting_question"
+                elif live_status == "waiting_question" and not busy:
+                    # Answered; the agent finishes or goes idle on the next polls.
+                    next_status = "running"
             idle_polls = 0 if busy or pending_question else idle_polls + 1
             if busy or is_task or is_consultation:
                 permissions = await self._poll_opencode(
@@ -657,7 +697,8 @@ class QueueDispatcher:
                 )
                 if (is_task or is_consultation) and waiting:
                     raise TaskExecutionError("permission_required")
-                next_status = "waiting_permission" if waiting else "running"
+                next_status = next_status or ("waiting_permission" if waiting else "running")
+            if next_status:
                 current = self.database.get_job(job_id)
                 if not current or current["status"] in {
                     "completed",
@@ -668,10 +709,15 @@ class QueueDispatcher:
                     return
                 if next_status != live_status or current["status"] != next_status:
                     live_status = next_status
-                    self.database.set_job_status(job_id, next_status)
+                    cleared = self.database.set_job_status(job_id, next_status)
                     await self.events.publish(
                         {"type": "job.updated", "job": self.database.get_job(job_id)}
                     )
+                    # The side menu reads a folder chat's waiting state from chat.updated.
+                    folder = not is_task and not is_consultation
+                    chat_changed = chat_changed or cleared or folder
+            if chat_changed:
+                await self._publish_chat_update(job["chat_id"])
             # prompt_async can return before its busy transition is visible.
             # Consecutive idle polls also cover very fast completed prompts.
             if idle_polls >= 3:

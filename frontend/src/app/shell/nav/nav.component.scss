@@ -1,0 +1,170 @@
+// Side menu. Encapsulation is off because the rules reach into the Koobiq navbar; every selector is scoped by
+// `.v-nav`. Rows, brand, divider and menus are stock Koobiq. Unlike the prototype (whole menu scrolls), only the
+// chat list scrolls; the brand block and the bottom block (folds, «Система», user) are pinned (product decision).
+
+.v-nav-host {
+    display: flex;
+    flex: none;
+    height: 100%;
+}
+
+.v-nav.kbq-vertical-navbar {
+    height: 100%;
+
+    // Three containers: the top (brand, search, «Новый запрос») and the bottom (folds, «Система», user) stay pinned,
+    // only the list between them scrolls. Koobiq's vertical navbar sets the column direction but no display.
+    .kbq-navbar-container.v-nav__top,
+    .kbq-navbar-container.v-nav__list,
+    .kbq-navbar-container.v-nav__bottom {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .kbq-navbar-container.v-nav__top {
+        flex: none;
+    }
+
+    // Koobiq pads every container after the first (24px above, 8px below) as if it were a separate group; here the
+    // three containers are one column, so the list starts right under «Новый запрос» and the folds right under it.
+    .kbq-navbar-container.v-nav__list {
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+
+    .kbq-navbar-container.v-nav__bottom {
+        padding-top: 0;
+    }
+
+    // «Отложенные» / «Архив» are pinned here above «Система» and the user. Open, they take up to half of the menu;
+    // past that their own rows scroll and the rest of the block stays put.
+    .kbq-navbar-container.v-nav__bottom {
+        flex: 0 1 auto;
+        min-height: 0;
+        max-height: 50%;
+    }
+
+    .v-nav__folds {
+        display: flex;
+        flex: 0 1 auto;
+        flex-direction: column;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+    }
+
+    // Zero basis: the list takes whatever the pinned blocks leave and scrolls inside it.
+    .kbq-navbar-container.v-nav__list {
+        flex: 1 1 0;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+    }
+
+    // Rows keep their stock height while the list scrolls instead of shrinking to fit.
+    .kbq-navbar-container > .kbq-navbar-item,
+    .kbq-navbar-container > .kbq-navbar-divider,
+    .v-nav__folds > .kbq-navbar-item,
+    .v-nav__folds > .kbq-navbar-divider {
+        flex: none;
+    }
+
+    // Rows are <a>/<button>: drop the UA button font.
+    button.kbq-navbar-item {
+        font: inherit;
+    }
+
+    // Our own logo mark inside the stock `kbq-navbar-logo` slot.
+    .v-nav__logo {
+        width: var(--kbq-size-xxl);
+        height: var(--kbq-size-xxl);
+        border-radius: var(--kbq-size-xs);
+        background: var(--kbq-background-theme);
+        flex: none;
+    }
+
+    .v-nav__newreq.kbq-button,
+    .v-nav__search.kbq-button {
+        width: 100%;
+    }
+
+    // Search looks like a search field (prototype `.v-search`): an outline button on the field background with
+    // secondary text, icon and title from the left, the shortcut badge (button suffix) on the right
+    .v-nav__search.kbq-button {
+        --kbq-button-outline-contrast-fade-on-background: var(--kbq-background-bg);
+        --kbq-button-outline-contrast-fade-on-foreground: var(--kbq-foreground-contrast-secondary);
+        --kbq-button-outline-contrast-fade-on-states-hover-foreground: var(--kbq-foreground-contrast-secondary);
+    }
+
+    .v-nav__search .kbq-button-wrapper {
+        flex: 1;
+    }
+
+    .v-nav__search .kbq-button-text {
+        flex: 1;
+        text-align: left;
+    }
+
+    .v-nav__section {
+        flex: none;
+        padding: var(--kbq-size-m) var(--kbq-size-xl) var(--kbq-size-xxs);
+        color: var(--kbq-foreground-contrast-secondary);
+    }
+
+    // Chat rows: status (or return time) on the right; «…» replaces it on hover, focus and while the menu is open
+    .v-nav__st {
+        display: inline-flex;
+        flex: none;
+        align-items: center;
+    }
+
+    .v-nav__when {
+        color: var(--kbq-foreground-contrast-tertiary);
+    }
+
+    .v-nav__chat .v-nav__more {
+        display: none;
+        // Above the item's ::after state layer, which would otherwise take the click (and navigate)
+        position: relative;
+        z-index: 1;
+    }
+
+    .v-nav__chat:is(:hover, :focus-visible, .cdk-keyboard-focused, .v-nav__chat_menu) {
+        .v-nav__more {
+            display: inline-flex;
+        }
+
+        .v-nav__st {
+            display: none;
+        }
+    }
+
+    .v-nav__count {
+        flex: none;
+        color: var(--kbq-foreground-contrast-tertiary);
+    }
+
+    // User block: initials avatar (no Koobiq avatar component) and the login.
+    .v-nav__avatar {
+        display: inline-flex;
+        flex: none;
+        align-items: center;
+        justify-content: center;
+        width: var(--kbq-size-xxl);
+        height: var(--kbq-size-xxl);
+        border-radius: 50%;
+        background: var(--kbq-background-theme-fade);
+        color: var(--kbq-foreground-theme);
+        font-family: var(--kbq-typography-text-compact-strong-font-family);
+        font-size: var(--kbq-typography-text-compact-strong-font-size);
+        font-weight: var(--kbq-typography-text-compact-strong-font-weight);
+        line-height: var(--kbq-typography-text-compact-strong-line-height);
+        letter-spacing: var(--kbq-typography-text-compact-strong-letter-spacing);
+    }
+
+    .v-nav__user-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+}

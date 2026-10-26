@@ -1,0 +1,92 @@
+// The admin grids (`v-admin-grid`, admin-grid.ts): ag-grid community with the official Koobiq theme.
+// Global, because the theme is far over the component style budget; only layout and `--kbq-*` tokens on top of it.
+@use '@koobiq/ag-grid-angular-theme';
+
+.v-admin-grid {
+    // Every content cell keeps the text line height and centres its first line where a single-line row has it:
+    // (row height - cell borders - line height) / 2 above and below. Taller (wrapped) rows grow downwards.
+    .v-admin-grid__td {
+        line-height: var(--kbq-typography-text-normal-line-height);
+        padding-top: calc((var(--ag-row-height) - 2px - var(--kbq-typography-text-normal-line-height)) / 2);
+        padding-bottom: calc((var(--ag-row-height) - 2px - var(--kbq-typography-text-normal-line-height)) / 2);
+    }
+
+    .v-admin-grid__td_nowrap,
+    .v-admin-grid__td_num {
+        white-space: nowrap;
+    }
+
+    // Form fields: a single-line row centres the field; a hint or an error under it grows the row downwards.
+    .v-admin-grid__td.v-admin-grid__td_control {
+        padding-top: calc((var(--ag-row-height) - 2px - var(--kbq-form-field-size-height)) / 2);
+        padding-bottom: calc((var(--ag-row-height) - 2px - var(--kbq-form-field-size-height)) / 2);
+    }
+
+    // Inline content (badges): centred on the first text line.
+    .v-admin-grid__td_line .v-admin-grid__cell {
+        display: flex;
+        align-items: center;
+        min-height: var(--kbq-typography-text-normal-line-height);
+    }
+
+    // Buttons stay where they were in the tables: centred in the row, at the right edge.
+    .v-admin-grid__td.v-admin-grid__td_action {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+
+    .v-admin-grid__td_action .v-admin-grid__cell {
+        display: flex;
+        gap: var(--kbq-size-s);
+    }
+
+    .v-admin-grid__th_sr .ag-header-cell-text {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+    }
+
+    &.v-admin-grid_openable .ag-row {
+        cursor: pointer;
+    }
+
+    // The row whose details are open (panel, card).
+    .ag-row.v-admin-grid__tr_current {
+        --ag-theme-koobiq-row-background-color: var(--kbq-background-theme-less);
+
+        &.ag-row-hover {
+            --ag-theme-koobiq-row-background-color: var(--kbq-states-background-theme-less-hover);
+        }
+    }
+
+    .v-admin-grid__empty {
+        color: var(--kbq-foreground-contrast-secondary);
+    }
+
+    // Cell helpers shared by the screens' column templates.
+    .v-sub {
+        display: block;
+        font-size: var(--kbq-typography-text-compact-font-size);
+        line-height: var(--kbq-typography-text-compact-line-height);
+        letter-spacing: var(--kbq-typography-text-compact-letter-spacing);
+        color: var(--kbq-foreground-contrast-secondary);
+    }
+
+    .v-secondary {
+        color: var(--kbq-foreground-contrast-secondary);
+    }
+
+    .v-tertiary {
+        color: var(--kbq-foreground-contrast-tertiary);
+    }
+
+    .v-warning {
+        color: var(--kbq-foreground-warning);
+    }
+}

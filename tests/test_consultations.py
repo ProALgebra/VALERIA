@@ -139,7 +139,13 @@ def test_consultation_is_private_and_legacy_endpoints_cannot_override_it(consult
     assert t.manager.client.session_count == 0
     assert job["session_pending"] == 1
     assert t.client.get("/api/chats").json() == []
-    assert t.client.get("/api/queue/me").json() == []
+    [queued] = t.client.get("/api/queue/me").json()
+    assert queued == {
+        "id": job["id"], "chat_id": chat["id"], "kind": "question", "status": "queued",
+        "title": chat["title"], "task_id": None, "queue_id": job["queue_id"],
+        "queue_name": job["queue_name"], "created_at": job["created_at"], "started_at": None,
+        "finished_at": None, "error_code": None, "position": 1,
+    }
     for suffix in ("", "/messages", "/questions", "/permissions", "/mcp"):
         assert t.client.get(f"/api/chats/{chat['id']}{suffix}").status_code == 404
     assert t.client.get(f"/api/options?chat_id={chat['id']}").status_code == 404

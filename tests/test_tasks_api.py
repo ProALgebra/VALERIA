@@ -155,7 +155,9 @@ async def test_task_queue_and_work_status_in_api_and_events(task_app, username):
         ("queued", "queued"),
         ("dispatching", "dispatching"),
         ("running", "running"),
-        ("waiting_permission", "running"),
+        ("waiting_permission", "waiting_permission"),
+        ("waiting_question", "waiting_question"),
+        ("running", "running"),
         ("completed", "completed"),
     ]:
         t.db.set_job_status(run["id"], internal)
@@ -188,15 +190,18 @@ async def test_task_launch_privacy_and_fixed_configuration(task_app, username):
             "title": task["title"],
             "description": task["description"],
             "plan_first": 0,
+            "input_hint": None,
         }
     ]
     response = await t.client.post(f"/api/tasks/{task['id']}/runs", json={"user_input": "my input"})
     assert response.status_code == 202, response.text
     run = response.json()
     assert set(run) == {
-        "id", "task_id", "title", "status", "created_at", "finished_at", "plan_first", "phase"
+        "id", "task_id", "title", "status", "created_at", "started_at", "finished_at",
+        "plan_first", "phase", "user_input", "error_code",
     }
     assert run["status"] == "queued"
+    assert (run["user_input"], run["error_code"], run["started_at"]) == ("my input", None, None)
     job = t.db.get_job(run["id"])
     assert job["content"] == "SECRET ADMIN INSTRUCTIONS\n\nmy input"
     assert (job["agent"], job["provider_id"], job["model_id"], job["model_variant"]) == (
@@ -217,17 +222,28 @@ async def test_task_launch_privacy_and_fixed_configuration(task_app, username):
         assert (await t.client.post(path, json={"message": "again"})).status_code in {403, 404}
     assert (await t.client.get(f"/api/jobs/{job['id']}")).status_code in {403, 404}
     assert (await t.client.delete(f"/api/jobs/{job['id']}")).status_code in {403, 404}
+    queue = await t.client.get("/api/queue/me")
+    assert queue.status_code == 200
+    assert "SECRET" not in queue.text and job["session_id"] not in queue.text
+    assert queue.json() == [{
+        "id": run["id"], "chat_id": job["chat_id"], "kind": "task", "status": "queued",
+        "title": run["title"], "task_id": task["id"], "queue_id": job["queue_id"],
+        "queue_name": job["queue_name"], "created_at": run["created_at"], "started_at": None,
+        "finished_at": None, "error_code": None, "position": 1,
+    }]
     if username == "worker":
         assert (await t.client.get("/api/chats")).json() == []
-        assert (await t.client.get("/api/queue/me")).json() == []
     else:
-        for path in ("/api/chats", "/api/options", "/api/templates", "/api/queue/me"):
+        for path in ("/api/chats", "/api/options", "/api/templates"):
             assert (await t.client.get(path)).status_code == 403
         assert (await t.client.post("/api/chats", json={"message": "chat"})).status_code == 403
     t.db.set_job_status(job["id"], "failed", "secret error detail")
     failed = await t.client.get(f"/api/task-runs/{run['id']}")
     assert failed.json()["status"] == "failed"
+    # Free-form failure text never leaves the server; machine codes do.
+    assert failed.json()["error_code"] == "internal_error"
     assert "secret error" not in failed.text
+    assert "secret error" not in (await t.client.get("/api/queue/me")).text
     # A late completion cannot turn a failed branch into a successful pipeline.
     t.db.set_job_status(job["id"], "completed")
     assert (await t.client.get(f"/api/task-runs/{run['id']}")).json()["status"] == "failed"

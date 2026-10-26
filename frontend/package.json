@@ -1,0 +1,67 @@
+{
+  "name": "valeria-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve",
+    "build": "ng build",
+    "watch": "ng build --watch --configuration development",
+    "test": "ng test --watch=false",
+    "mock": "bun mock/server.ts --port 4301",
+    "e2e": "playwright test -c e2e/playwright.config.ts",
+    "e2e:real": "playwright test -c e2e/playwright.real.config.ts",
+    "e2e:screens": "playwright test -c e2e/playwright.screens.config.ts"
+  },
+  "prettier": {
+    "printWidth": 120,
+    "singleQuote": true,
+    "tabWidth": 4,
+    "overrides": [
+      {
+        "files": "*.html",
+        "options": {
+          "parser": "angular"
+        }
+      }
+    ]
+  },
+  "dependencies": {
+    "@angular/animations": "^20.3.0",
+    "@angular/cdk": "^20.2.14",
+    "@angular/common": "^20.3.0",
+    "@angular/compiler": "^20.3.0",
+    "@angular/core": "^20.3.0",
+    "@angular/forms": "^20.3.0",
+    "@angular/platform-browser": "^20.3.0",
+    "@angular/router": "^20.3.0",
+    "@fontsource/inter": "^5",
+    "@fontsource/jetbrains-mono": "^5",
+    "@koobiq/ag-grid-angular-theme": "^34.6.0",
+    "@koobiq/angular-luxon-adapter": "20.4.2",
+    "@koobiq/components": "20.4.2",
+    "@koobiq/date-adapter": "^3.5.1",
+    "@koobiq/date-formatter": "^3.5.1",
+    "@koobiq/design-tokens": "^3.19.0",
+    "@koobiq/icons": "^12.2.0",
+    "ag-grid-angular": "~34.3.1",
+    "ag-grid-community": "~34.3.1",
+    "highlight.js": "^11",
+    "luxon": "^3.7.2",
+    "marked": "^17.0.3",
+    "overlayscrollbars": "2.7.3",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.3.0",
+    "zone.js": "~0.15.0"
+  },
+  "devDependencies": {
+    "@angular/build": "^20.3.41",
+    "@angular/cli": "^20.3.41",
+    "@angular/compiler-cli": "^20.3.0",
+    "@playwright/test": "^1.64.1",
+    "@types/luxon": "^3.7.1",
+    "jsdom": "^27.0.0",
+    "typescript": "~5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,196 @@
+<div class="v-home__narrow">
+    @if (noFolder()) {
+        <kbq-alert class="v-home__nofolder" alertColor="warning" alertStyle="colored" [compact]="true">
+            <i kbq-icon="kbq-triangle-exclamation_16"></i>
+            <div kbq-alert-title>{{ noFolderText }}</div>
+            Без неё нельзя задать вопрос, запустить задачу или работать в папке. Напишите администратору.
+        </kbq-alert>
+    }
+
+    <h1 class="kbq-title v-home__head">Что нужно сделать?</h1>
+
+    @if (taskId() !== undefined) {
+        @if (preset(); as task) {
+            <div class="v-home__presetbar">
+                <kbq-tag class="v-home__tag" color="theme" [removable]="true" (removed)="clearPreset()">
+                    <i kbq-icon="kbq-bolt_16"></i>
+                    {{ task.title }}
+                    <i
+                        kbq-icon="kbq-xmark-s_16"
+                        kbqTagRemove
+                        kbqTooltip="Убрать задачу"
+                        aria-label="Убрать задачу"
+                    ></i>
+                </kbq-tag>
+                @if (isPlanFirst(task)) {
+                    <kbq-badge [compact]="true" [badgeColor]="badgeColors.FadeContrast">Сначала план</kbq-badge>
+                }
+            </div>
+            @if (task.description) {
+                <div class="v-home__desc">{{ task.description }}</div>
+            }
+            <v-composer-box class="v-home__inputbox v-home__inputbox_preset">
+                <kbq-form-field class="v-composer-box__field" noBorders>
+                    <textarea
+                        #field
+                        kbqTextarea
+                        rows="3"
+                        [canGrow]="false"
+                        [placeholder]="task.input_hint || ''"
+                        aria-label="Дополнение к задаче"
+                        [ngModel]="addition()"
+                        (ngModelChange)="setAddition($event)"
+                        (keydown)="onKeydown($event, 'launch')"
+                    ></textarea>
+                </kbq-form-field>
+                <v-send-button
+                    label="Запустить"
+                    icon="kbq-play_16"
+                    [disabled]="!!launchReason()"
+                    [reason]="launchReason()"
+                    [sending]="launching()"
+                    (pressed)="launch()"
+                    >Запустить</v-send-button
+                >
+            </v-composer-box>
+            @if (duplicate()) {
+                <kbq-alert class="v-home__duplicate" alertColor="warning" alertStyle="colored" [compact]="true">
+                    <i kbq-icon="kbq-triangle-exclamation_16"></i>
+                    <div kbq-alert-title>Такой запуск уже идёт</div>
+                    Эта задача с той же ссылкой выполняется с {{ duplicateTime() }}. Новый запуск не создан.
+                    <button kbq-alert-control kbq-button [color]="colors.ContrastFade" (click)="openDuplicate()">
+                        Открыть запуск
+                    </button>
+                </kbq-alert>
+            }
+            <div class="v-home__notify">
+                <i kbq-icon="kbq-bell_16" [color]="colors.ContrastFade" aria-hidden="true"></i>
+                <span>{{ notifyText }} <b>&#64;{{ login() }}</b></span>
+            </div>
+        }
+    } @else {
+        <div class="v-home__presets">
+            @for (task of topTasks(); track task.id) {
+                <button kbq-button class="v-home__chip" [color]="colors.ContrastFade" (click)="openTask(task)">
+                    <i kbq-icon="kbq-bolt_16"></i>
+                    {{ task.title }}
+                </button>
+            }
+            @if (variantsCount()) {
+                <button
+                    kbq-button
+                    class="v-home__chip"
+                    kbqStyle="transparent"
+                    [color]="colors.Contrast"
+                    [kbqDropdownTriggerFor]="variants"
+                >
+                    Все варианты · {{ variantsCount() }}
+                    <i kbq-icon="kbq-chevron-down-s_16"></i>
+                </button>
+            }
+            <kbq-dropdown #variants="kbqDropdown" [panelMaxWidth]="480">
+                <label class="kbq-optgroup-label">Задачи</label>
+                @for (task of tasks(); track task.id) {
+                    <button kbq-dropdown-item (click)="openTask(task)">
+                        <b>{{ task.title }}</b>
+                        @if (task.description) {
+                            <div class="kbq-dropdown-item__caption">{{ task.description }}</div>
+                        }
+                    </button>
+                }
+                @if (templates().length) {
+                    <kbq-divider />
+                    <label class="kbq-optgroup-label">Шаблоны для «Сделать»</label>
+                    @for (template of templates(); track template.id) {
+                        <button kbq-dropdown-item (click)="useTemplate(template)">
+                            <b>{{ template.title }}</b>
+                            <div class="kbq-dropdown-item__caption">{{ templateExcerpt(template) }}</div>
+                        </button>
+                    }
+                }
+            </kbq-dropdown>
+        </div>
+
+        <v-composer-box class="v-home__inputbox">
+            <kbq-form-field class="v-composer-box__field" noBorders>
+                <textarea
+                    #field
+                    kbqTextarea
+                    rows="3"
+                    [canGrow]="false"
+                    [placeholder]="placeholder()"
+                    aria-label="Что нужно сделать?"
+                    [ngModel]="text()"
+                    (ngModelChange)="setText($event)"
+                    (keydown)="onKeydown($event, 'send')"
+                ></textarea>
+            </kbq-form-field>
+            <v-send-button
+                [label]="sendLabel()"
+                [disabled]="!!sendReason()"
+                [reason]="sendReason()"
+                [sending]="sending()"
+                (pressed)="send()"
+                >{{ sendLabel() }}</v-send-button
+            >
+            <div class="v-home__bar">
+                @if (tasksOnly()) {
+                    <kbq-tag class="v-home__tag">
+                        <i kbq-icon="kbq-eye_16"></i>
+                        Только вопросы
+                    </kbq-tag>
+                } @else {
+                    <kbq-button-toggle-group
+                        aria-label="Режим"
+                        [value]="mode()"
+                        (change)="setMode($event.value)"
+                    >
+                        <kbq-button-toggle value="ask">
+                            <i kbq-icon="kbq-message_16"></i>
+                            Я только спросить
+                        </kbq-button-toggle>
+                        <kbq-button-toggle value="do">
+                            <i kbq-icon="kbq-wrench-badge-play_16"></i>
+                            Сделать
+                        </kbq-button-toggle>
+                    </kbq-button-toggle-group>
+                    @if (mode() === 'do') {
+                        @if (options(); as opts) {
+                            @if (agentOrder().length > 1) {
+                                <kbq-button-toggle-group
+                                    aria-label="Агент"
+                                    [value]="agent()"
+                                    (change)="agent.set($event.value)"
+                                >
+                                    @for (a of agentOrder(); track a) {
+                                        <kbq-button-toggle [value]="a">{{ agentLabels[a] || a }}</kbq-button-toggle>
+                                    }
+                                </kbq-button-toggle-group>
+                            }
+                            @if (opts.models.length) {
+                                <kbq-form-field class="v-home__model">
+                                    <kbq-select
+                                        aria-label="Модель"
+                                        [value]="model()"
+                                        (selectionChange)="model.set($event.value)"
+                                    >
+                                        <kbq-optgroup label="Модель">
+                                            @for (m of opts.models; track m.id) {
+                                                <kbq-option [value]="m.id" [viewValue]="m.id">
+                                                    {{ m.id }}
+                                                    @if (isDefaultModel(m.id)) {
+                                                        <span class="v-home__hint-inline">по умолчанию</span>
+                                                    }
+                                                </kbq-option>
+                                            }
+                                        </kbq-optgroup>
+                                    </kbq-select>
+                                </kbq-form-field>
+                            }
+                        }
+                    }
+                }
+            </div>
+        </v-composer-box>
+    }
+</div>

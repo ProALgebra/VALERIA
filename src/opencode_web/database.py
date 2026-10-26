@@ -14,12 +14,74 @@ from typing import Any
 from .security import hash_password, normalize_login, token_digest
 
 
+def clean_input_hint(value: str | None) -> str | None:
+    """The run-form placeholder; blank means none."""
+    hint = (value or "").strip()
+    return hint or None
+
+
 def utcnow() -> str:
     return datetime.now(UTC).isoformat()
 
 
 UNSET = object()
 DEFAULT_QUEUE_ID = "default"
+ACTIVE_JOB_STATUSES = (
+    "dispatching", "running", "waiting_permission", "waiting_question", "cancelling",
+)
+UNFINISHED_JOB_STATUSES = ("queued", *ACTIVE_JOB_STATUSES)
+# One row per chat for every sidebar kind. The representative job is the active one,
+# then the next queued one, then the latest; a task chat has exactly one job.
+ITEM_QUERY = """SELECT c.id AS chat_id, c.kind AS chat_kind, c.consultation,
+       c.title AS chat_title, c.workspace_snapshot, c.owner_user_id,
+       u.login AS owner_login, c.created_at, c.updated_at, c.archived_at,
+       c.archived_reason, c.snoozed_until, c.deleted_at, j.id AS job_id, j.status AS job_status,
+       j.task_id, j.task_title, j.plan_first, j.phase2_message_id
+FROM chats c
+JOIN users u ON u.id = c.owner_user_id
+LEFT JOIN queue_jobs j ON j.id = (
+    SELECT q.id FROM queue_jobs q WHERE q.chat_id = c.id
+    ORDER BY CASE
+        WHEN q.status IN ('dispatching', 'running', 'waiting_permission',
+                          'waiting_question', 'cancelling') THEN 0
+        WHEN q.status = 'queued' THEN 1 ELSE 2 END,
+        q.sequence DESC
+    LIMIT 1
+)"""
+# Who last changed an admin-editable object, and whether it is gone. Deleting a task or
+# archiving a queue is its last change, so `updated_by` then names who removed it.
+EDIT_STATE_QUERIES = {
+    "users": """SELECT o.updated_at, editor.login AS updated_by, 0 AS deleted
+                FROM users o LEFT JOIN users editor ON editor.id = o.updated_by
+                WHERE o.id = ?""",
+    "tasks": """SELECT o.updated_at, editor.login AS updated_by,
+                       o.deleted_at IS NOT NULL AS deleted
+                FROM tasks o LEFT JOIN users editor ON editor.id = o.updated_by
+                WHERE o.id = ?""",
+    "work_queues": """SELECT o.updated_at, editor.login AS updated_by,
+                             o.status = 'archived' AS deleted
+                      FROM work_queues o LEFT JOIN users editor ON editor.id = o.updated_by
+                      WHERE o.id = ?""",
+}
+
+
+class StaleWrite(Exception):
+    """The row changed or disappeared after the caller read it."""
+
+
+class ChatDeleted(LookupError):
+    """The chat was deleted before the message could be queued."""
+
+
+AUDIT_QUERY = """SELECT a.*, actor.login AS actor_login, effective.login AS effective_login
+FROM audit_log a
+LEFT JOIN users actor ON actor.id = a.actor_user_id
+LEFT JOIN users effective ON effective.id = a.effective_user_id"""
+ITEM_KIND_CONDITIONS = {
+    "question": "(c.kind = 'chat' AND c.consultation = 1)",
+    "folder": "(c.kind = 'chat' AND c.consultation = 0)",
+    "task": "c.kind = 'task'",
+}
 MATTERMOST_USER_ID_RE = re.compile(r"^[a-z0-9]{26}$")
 MATTERMOST_USERNAME_RE = re.compile(r"^[a-z][a-z0-9._-]{2,21}$")
 
@@ -294,6 +356,8 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE tasks ADD COLUMN plan_first INTEGER NOT NULL DEFAULT 0"
                 )
+            if "input_hint" not in task_columns:
+                self._connection.execute("ALTER TABLE tasks ADD COLUMN input_hint TEXT")
             if "queue_id" not in task_columns:
                 self._connection.execute(
                     "ALTER TABLE tasks ADD COLUMN queue_id TEXT REFERENCES work_queues(id)"
@@ -301,6 +365,13 @@ class Database:
                 self._connection.execute(
                     "UPDATE tasks SET queue_id = ? WHERE queue_id IS NULL", (DEFAULT_QUEUE_ID,)
                 )
+            for table in ("users", "tasks", "work_queues"):
+                columns = {
+                    row[1]
+                    for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if "updated_by" not in columns:
+                    self._connection.execute(f"ALTER TABLE {table} ADD COLUMN updated_by TEXT")
             chat_columns = {
                 row[1] for row in self._connection.execute("PRAGMA table_info(chats)").fetchall()
             }
@@ -326,6 +397,14 @@ class Database:
             ):
                 if column not in chat_columns:
                     self._connection.execute(f"ALTER TABLE chats ADD COLUMN {column} TEXT")
+            for column in ("archived_at", "snoozed_until", "deleted_at"):
+                if column not in chat_columns:
+                    self._connection.execute(f"ALTER TABLE chats ADD COLUMN {column} TEXT")
+            # Chats archived automatically before archived_at existed stay archived.
+            self._connection.execute(
+                """UPDATE chats SET archived_at = updated_at
+                   WHERE archived_reason IS NOT NULL AND archived_at IS NULL"""
+            )
             job_columns = {
                 row[1]
                 for row in self._connection.execute("PRAGMA table_info(queue_jobs)").fetchall()
@@ -374,6 +453,9 @@ class Database:
             )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_queue_task ON queue_jobs(task_id, sequence)"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_queue_chat ON queue_jobs(chat_id, sequence)"
             )
             self._connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_child "
@@ -526,6 +608,7 @@ class Database:
         tasks_only: bool = False,
         mattermost_username: str | None = None,
         mattermost_user_id: str | None = None,
+        actor_id: str | None = None,
     ) -> dict[str, Any]:
         user_id = str(uuid.uuid4())
         now = utcnow()
@@ -546,8 +629,9 @@ class Database:
             connection.execute(
                 """INSERT INTO users
                    (id, login, password_hash, role, workspace_path, tasks_only,
-                    mattermost_username, mattermost_user_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    mattermost_username, mattermost_user_id, created_at, updated_at,
+                    updated_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     user_id,
                     normalized,
@@ -559,6 +643,7 @@ class Database:
                     mattermost_user_id,
                     now,
                     now,
+                    actor_id,
                 ),
             )
         return self.get_user(user_id)  # type: ignore[return-value]
@@ -596,7 +681,10 @@ class Database:
         max_active_jobs: Any = UNSET,
         mattermost_username: Any = UNSET,
         mattermost_user_id: Any = UNSET,
+        actor_id: str | None = None,
+        expected_updated_at: str | None = None,
     ) -> dict[str, Any] | None:
+        """None when the user is missing or no longer at `expected_updated_at`."""
         current = self.get_user(user_id)
         if not current:
             return None
@@ -632,12 +720,12 @@ class Database:
         if new_role not in {"user", "admin"} or new_status not in {"active", "disabled"}:
             raise ValueError("Invalid user fields")
         with self.transaction() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """UPDATE users SET role = ?, workspace_path = ?, status = ?, tasks_only = ?,
                    max_active_jobs = ?, mattermost_username = ?, mattermost_user_id = ?,
-                   updated_at = ?,
+                   updated_at = ?, updated_by = ?,
                    auth_version = auth_version + CASE WHEN status != ? THEN 1 ELSE 0 END
-                   WHERE id = ?""",
+                   WHERE id = ? AND (? IS NULL OR updated_at = ?)""",
                 (
                     new_role,
                     new_workspace,
@@ -647,18 +735,23 @@ class Database:
                     new_mattermost_username,
                     new_mattermost_user_id,
                     utcnow(),
+                    actor_id,
                     new_status,
                     user_id,
+                    expected_updated_at,
+                    expected_updated_at,
                 ),
             )
-        return self.get_user(user_id)
+        return self.get_user(user_id) if cursor.rowcount else None
 
-    def reset_password(self, user_id: str, password: str) -> None:
+    def reset_password(
+        self, user_id: str, password: str, actor_id: str | None = None
+    ) -> None:
         with self.transaction() as connection:
             connection.execute(
                 """UPDATE users SET password_hash = ?, auth_version = auth_version + 1,
-                   updated_at = ? WHERE id = ?""",
-                (hash_password(password), utcnow(), user_id),
+                   updated_at = ?, updated_by = ? WHERE id = ?""",
+                (hash_password(password), utcnow(), actor_id, user_id),
             )
             connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
 
@@ -681,9 +774,9 @@ class Database:
                     now.isoformat(),
                 ),
             )
+            # Not an edit: leave updated_at alone so open admin forms do not conflict.
             connection.execute(
-                "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?",
-                (now.isoformat(), now.isoformat(), user["id"]),
+                "UPDATE users SET last_login_at = ? WHERE id = ?", (now.isoformat(), user["id"])
             )
 
     def get_user_for_token(self, token: str) -> tuple[dict[str, Any], str] | None:
@@ -792,7 +885,7 @@ class Database:
         )
 
     def create_work_queue(
-        self, name: str, priority: int, max_workers: int
+        self, name: str, priority: int, max_workers: int, actor_id: str | None = None
     ) -> dict[str, Any]:
         normalized = name.strip()
         if not normalized or len(normalized) > 120:
@@ -804,19 +897,22 @@ class Database:
             with self.transaction() as connection:
                 connection.execute(
                     """INSERT INTO work_queues
-                       (id, name, priority, max_workers, status, is_system, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, 'active', 0, ?, ?)""",
-                    (queue_id, normalized, int(priority), int(max_workers), now, now),
+                       (id, name, priority, max_workers, status, is_system, created_at, updated_at,
+                        updated_by)
+                       VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?)""",
+                    (queue_id, normalized, int(priority), int(max_workers), now, now, actor_id),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("Queue name already exists") from exc
         return self.get_work_queue(queue_id)  # type: ignore[return-value]
 
     def update_work_queue(
-        self, queue_id: str, *, name: str, priority: int, max_workers: int
+        self, queue_id: str, *, name: str, priority: int, max_workers: int,
+        actor_id: str | None = None, expected_updated_at: str | None = None,
     ) -> dict[str, Any] | None:
+        """None when the queue is missing, archived or no longer at `expected_updated_at`."""
         current = self.get_work_queue(queue_id)
-        if not current:
+        if not current or current["status"] != "active":
             return None
         normalized = name.strip()
         if not normalized or len(normalized) > 120:
@@ -825,16 +921,18 @@ class Database:
             raise ValueError("Queue worker limit must be positive")
         try:
             with self.transaction() as connection:
-                connection.execute(
+                cursor = connection.execute(
                     """UPDATE work_queues SET name = ?, priority = ?, max_workers = ?,
-                       updated_at = ? WHERE id = ?""",
-                    (normalized, int(priority), int(max_workers), utcnow(), queue_id),
+                       updated_at = ?, updated_by = ?
+                       WHERE id = ? AND status = 'active' AND (? IS NULL OR updated_at = ?)""",
+                    (normalized, int(priority), int(max_workers), utcnow(), actor_id, queue_id,
+                     expected_updated_at, expected_updated_at),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("Queue name already exists") from exc
-        return self.get_work_queue(queue_id)
+        return self.get_work_queue(queue_id) if cursor.rowcount else None
 
-    def archive_work_queue(self, queue_id: str) -> bool:
+    def archive_work_queue(self, queue_id: str, actor_id: str | None = None) -> bool:
         queue = self.get_work_queue(queue_id)
         if not queue:
             return False
@@ -855,8 +953,10 @@ class Database:
             raise ValueError("Queue is still assigned or contains unfinished jobs")
         with self.transaction() as connection:
             connection.execute(
-                "UPDATE work_queues SET status = 'archived', updated_at = ? WHERE id = ?",
-                (utcnow(), queue_id),
+                # Archiving twice keeps the first archiver as `updated_by`.
+                "UPDATE work_queues SET status = 'archived', updated_at = ?, updated_by = ? "
+                "WHERE id = ? AND status = 'active'",
+                (utcnow(), actor_id, queue_id),
             )
         return True
 
@@ -880,7 +980,9 @@ class Database:
         next_task_ids: list[str] | None = None,
         plan_first: bool = False,
         queue_id: str = DEFAULT_QUEUE_ID,
+        input_hint: str | None = None,
     ) -> dict[str, Any]:
+        """`admin_id` creates the task and is its first `updated_by`."""
         if not title.strip() or not content.strip() or not agent.strip():
             raise ValueError("Title, content and agent are required")
         if bool(provider_id) != bool(model_id):
@@ -895,8 +997,8 @@ class Database:
                 """INSERT INTO tasks
                    (id, title, description, content, agent, provider_id, model_id,
                     model_variant, queue_id, is_published, created_by_admin_id,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, updated_at, input_hint, updated_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_id,
                     title.strip(),
@@ -911,6 +1013,8 @@ class Database:
                     admin_id,
                     now,
                     now,
+                    clean_input_hint(input_hint),
+                    admin_id,
                 ),
             )
             connection.execute(
@@ -968,6 +1072,11 @@ class Database:
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         return self._one("SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL", (task_id,))
 
+    def edit_state(self, table: str, object_id: str) -> dict[str, Any] | None:
+        """`updated_at`, editor login and a `deleted` flag for a users, tasks or
+        work_queues row; None when the row never existed."""
+        return self._one(EDIT_STATE_QUERIES[table], (object_id,))
+
     def list_tasks(self, *, published_only: bool) -> list[dict[str, Any]]:
         where = "deleted_at IS NULL"
         if published_only:
@@ -1015,27 +1124,36 @@ class Database:
         ]
 
     def set_task_audience(
-        self, task_id: str, visibility: str, user_ids: list[str] | None
+        self, task_id: str, visibility: str, user_ids: list[str] | None,
+        actor_id: str | None = None,
     ) -> dict[str, Any] | None:
         if visibility not in ("all", "selected"):
             raise ValueError("Unknown visibility")
         if not self.get_task(task_id):
             return None
-        now = utcnow()
         with self.transaction() as connection:
-            connection.execute(
-                "UPDATE tasks SET visibility = ?, updated_at = ? WHERE id = ?",
-                (visibility, now, task_id),
+            self._write_task_audience(
+                connection, task_id, visibility, user_ids, actor_id, utcnow()
             )
-            connection.execute("DELETE FROM task_audience WHERE task_id = ?", (task_id,))
-            if visibility == "selected":
-                for user_id in dict.fromkeys(user_ids or []):
-                    connection.execute(
-                        """INSERT OR IGNORE INTO task_audience (task_id, user_id, created_at)
-                           VALUES (?, ?, ?)""",
-                        (task_id, user_id, now),
-                    )
         return self.get_task(task_id)
+
+    @staticmethod
+    def _write_task_audience(
+        connection: sqlite3.Connection, task_id: str, visibility: str,
+        user_ids: list[str] | None, actor_id: str | None, now: str,
+    ) -> None:
+        connection.execute(
+            "UPDATE tasks SET visibility = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+            (visibility, now, actor_id, task_id),
+        )
+        connection.execute("DELETE FROM task_audience WHERE task_id = ?", (task_id,))
+        if visibility == "selected":
+            for user_id in dict.fromkeys(user_ids or []):
+                connection.execute(
+                    """INSERT OR IGNORE INTO task_audience (task_id, user_id, created_at)
+                       VALUES (?, ?, ?)""",
+                    (task_id, user_id, now),
+                )
 
     def list_user_task_access(self, user_id: str) -> list[dict[str, Any]]:
         return self._all(
@@ -1072,7 +1190,16 @@ class Database:
                     )
         return self.list_user_task_access(user_id)
 
-    def update_task(self, task_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    def update_task(
+        self, task_id: str, fields: dict[str, Any], *, actor_id: str | None = None,
+        expected_updated_at: str | None = None, visibility: str | None = None,
+        user_ids: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """None when the task is missing, deleted or no longer at `expected_updated_at`.
+        `visibility` and `user_ids` replace the audience in the same write; the one left
+        out keeps its stored value."""
+        if visibility not in (None, "all", "selected"):
+            raise ValueError("Unknown visibility")
         current = self.get_task(task_id)
         if not current:
             return None
@@ -1085,32 +1212,55 @@ class Database:
         if bool(updated["provider_id"]) != bool(updated["model_id"]):
             raise ValueError("Provider and model must be specified together")
         self._active_queue(updated.get("queue_id") or DEFAULT_QUEUE_ID)
-        with self.transaction() as connection:
-            if "next_task_ids" in fields:
-                self._set_task_successors(connection, task_id, fields["next_task_ids"])
-            connection.execute(
-                """UPDATE tasks SET title = ?, description = ?, content = ?, agent = ?,
-                   provider_id = ?, model_id = ?, model_variant = ?, queue_id = ?,
-                   is_published = ?, plan_first = ?, updated_at = ?
-                   WHERE id = ? AND deleted_at IS NULL""",
-                (
-                    updated["title"].strip(),
-                    updated["description"],
-                    updated["content"],
-                    updated["agent"].strip(),
-                    updated["provider_id"],
-                    updated["model_id"],
-                    updated["model_variant"],
-                    updated.get("queue_id") or DEFAULT_QUEUE_ID,
-                    int(updated["is_published"]),
-                    int(updated["plan_first"]),
-                    utcnow(),
-                    task_id,
-                ),
-            )
+        now = utcnow()
+        try:
+            with self.transaction() as connection:
+                if "next_task_ids" in fields:
+                    self._set_task_successors(connection, task_id, fields["next_task_ids"])
+                cursor = connection.execute(
+                    """UPDATE tasks SET title = ?, description = ?, content = ?, agent = ?,
+                       provider_id = ?, model_id = ?, model_variant = ?, queue_id = ?,
+                       is_published = ?, plan_first = ?, input_hint = ?, updated_at = ?,
+                       updated_by = ?
+                       WHERE id = ? AND deleted_at IS NULL AND (? IS NULL OR updated_at = ?)""",
+                    (
+                        updated["title"].strip(),
+                        updated["description"],
+                        updated["content"],
+                        updated["agent"].strip(),
+                        updated["provider_id"],
+                        updated["model_id"],
+                        updated["model_variant"],
+                        updated.get("queue_id") or DEFAULT_QUEUE_ID,
+                        int(updated["is_published"]),
+                        int(updated["plan_first"]),
+                        clean_input_hint(updated.get("input_hint")),
+                        now,
+                        actor_id,
+                        task_id,
+                        expected_updated_at,
+                        expected_updated_at,
+                    ),
+                )
+                if not cursor.rowcount:
+                    raise StaleWrite(task_id)  # roll back the successor changes too
+                if visibility is not None or user_ids is not None:
+                    stored = connection.execute(
+                        "SELECT visibility FROM tasks WHERE id = ?", (task_id,)
+                    ).fetchone()["visibility"]
+                    if user_ids is None:
+                        user_ids = [row["user_id"] for row in connection.execute(
+                            """SELECT user_id FROM task_audience WHERE task_id = ?
+                               ORDER BY created_at""", (task_id,),
+                        )]
+                    self._write_task_audience(
+                        connection, task_id, visibility or stored, user_ids, actor_id, now
+                    )
+        except StaleWrite:
+            return None
         return self.get_task(task_id)
 
-    def delete_task(self, task_id: str) -> bool:
+    def delete_task(self, task_id: str, actor_id: str | None = None) -> bool:
         now = utcnow()
         with self.transaction() as connection:
             connection.execute(
@@ -1118,9 +1268,9 @@ class Database:
                 (task_id, task_id),
             )
             cursor = connection.execute(
-                """UPDATE tasks SET deleted_at = ?, updated_at = ?, is_published = 0
+                """UPDATE tasks SET deleted_at = ?, updated_at = ?, updated_by = ?, is_published = 0
                    WHERE id = ? AND deleted_at IS NULL""",
-                (now, now, task_id),
+                (now, now, actor_id, task_id),
             )
         return cursor.rowcount > 0
 
@@ -1197,7 +1347,7 @@ class Database:
             self._one(
                 """SELECT 1 FROM chats WHERE owner_user_id = ? AND workspace_snapshot = ?
                    AND opencode_session_id = ? AND kind = 'chat'
-                   AND consultation = 0 LIMIT 1""",
+                   AND consultation = 0 AND deleted_at IS NULL LIMIT 1""",
                 (user_id, workspace, session_id),
             )
             is not None
@@ -1205,12 +1355,14 @@ class Database:
 
     def list_chats(
         self, owner_id: str | None = None, *, workspace: str | None = None,
-        consultation: bool = False,
+        consultation: bool = False, include_deleted: bool = False,
     ) -> list[dict[str, Any]]:
         query = """SELECT c.*, u.login AS owner_login FROM chats c
                    JOIN users u ON u.id = c.owner_user_id"""
         conditions: list[str] = ["c.kind = 'chat'", "c.consultation = ?"]
         params: list[Any] = [int(consultation)]
+        if not include_deleted:
+            conditions.append("c.deleted_at IS NULL")
         if owner_id:
             conditions.append("c.owner_user_id = ?")
             params.append(owner_id)
@@ -1222,14 +1374,164 @@ class Database:
         query += " ORDER BY c.updated_at DESC"
         return self._all(query, tuple(params))
 
-    def archive_chats_outside_workspace(self, owner_id: str, workspace: str) -> None:
+    def apply_workspace_change(self, owner_id: str, workspace: str) -> list[str]:
+        """Archive the owner's folder chats and questions from other workspaces and
+        bring back the ones archived earlier for leaving `workspace`. Task runs follow
+        the user across workspaces and stay as they are. Chats the user archived by hand
+        stay archived either way. Returns the changed chat ids."""
+        now = utcnow()
+        outside = """owner_user_id = ? AND workspace_snapshot != ? AND kind != 'task'
+                     AND archived_at IS NULL AND archived_reason IS NULL"""
+        back = """owner_user_id = ? AND workspace_snapshot = ?
+                  AND archived_reason = 'workspace_changed'"""
         with self.transaction() as connection:
+            chat_ids = [
+                row["id"] for row in connection.execute(
+                    f"SELECT id FROM chats WHERE ({outside}) OR ({back})",
+                    (owner_id, workspace, owner_id, workspace),
+                )
+            ]
             connection.execute(
-                """UPDATE chats SET archived_reason = 'workspace_changed', updated_at = ?
-                   WHERE owner_user_id = ? AND workspace_snapshot != ?
-                     AND archived_reason IS NULL""",
-                (utcnow(), owner_id, workspace),
+                f"""UPDATE chats SET archived_reason = 'workspace_changed', updated_at = ?,
+                           archived_at = ?, snoozed_until = NULL
+                    WHERE {outside}""",
+                (now, now, owner_id, workspace),
             )
+            connection.execute(
+                f"""UPDATE chats SET archived_reason = NULL, archived_at = NULL, updated_at = ?
+                    WHERE {back}""",
+                (now, owner_id, workspace),
+            )
+        return chat_ids
+
+    def clear_chat_snooze(self, chat_id: str) -> bool:
+        with self.transaction() as connection:
+            return connection.execute(
+                "UPDATE chats SET snoozed_until = NULL WHERE id = ? AND snoozed_until IS NOT NULL",
+                (chat_id,),
+            ).rowcount > 0
+
+    def chat_for_session(self, workspace: str | None, session_id: str) -> dict[str, Any] | None:
+        """The folder or task chat behind an OpenCode session (consultations keep their title)."""
+        return self._one(
+            """SELECT * FROM chats WHERE workspace_snapshot = ? AND opencode_session_id = ?
+               AND consultation = 0 LIMIT 1""",
+            (workspace, session_id),
+        )
+
+    def list_items(
+        self,
+        *,
+        owner_id: str | None = None,
+        owner_logins: list[str] | None = None,
+        workspace: str | None = None,
+        kinds: tuple[str, ...] | list[str] | None = None,
+        task_id: str | None = None,
+        chat_id: str | None = None,
+        created_from: str | None = None,
+        created_to: str | None = None,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Sidebar rows for every chat kind; `workspace` scopes non-task chats."""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if not include_deleted:
+            conditions.append("c.deleted_at IS NULL")
+        if owner_id:
+            conditions.append("c.owner_user_id = ?")
+            params.append(owner_id)
+        if owner_logins:
+            conditions.append(f"u.login IN ({', '.join('?' for _ in owner_logins)})")
+            params.extend(owner_logins)
+        if workspace:
+            conditions.append("(c.kind = 'task' OR c.workspace_snapshot = ?)")
+            params.append(workspace)
+        if kinds is not None:
+            selected = [ITEM_KIND_CONDITIONS[kind] for kind in kinds]
+            conditions.append(f"({' OR '.join(selected)})" if selected else "0")
+        if task_id:
+            conditions.append("j.task_id = ?")
+            params.append(task_id)
+        if chat_id:
+            conditions.append("c.id = ?")
+            params.append(chat_id)
+        if created_from:
+            conditions.append("julianday(c.created_at) >= julianday(?)")
+            params.append(created_from)
+        if created_to:
+            conditions.append("julianday(c.created_at) < julianday(?)")
+            params.append(created_to)
+        query = ITEM_QUERY
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        return self._all(query + " ORDER BY c.updated_at DESC, c.id", tuple(params))
+
+    def archive_chat(self, chat_id: str) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE chats SET archived_at = ?, snoozed_until = NULL
+                   WHERE id = ? AND archived_at IS NULL AND deleted_at IS NULL""",
+                (utcnow(), chat_id),
+            )
+        return cursor.rowcount > 0
+
+    def unarchive_chat(self, chat_id: str) -> bool:
+        # Task runs were once auto-archived on a workspace change by mistake; let them out.
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE chats SET archived_at = NULL,
+                          archived_reason = CASE WHEN kind = 'task' THEN NULL
+                                                 ELSE archived_reason END
+                   WHERE id = ? AND archived_at IS NOT NULL
+                     AND (archived_reason IS NULL OR kind = 'task') AND deleted_at IS NULL""",
+                (chat_id,),
+            )
+        return cursor.rowcount > 0
+
+    def snooze_chat(self, chat_id: str, until: str) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE chats SET snoozed_until = ?
+                   WHERE id = ? AND archived_at IS NULL AND deleted_at IS NULL""",
+                (until, chat_id),
+            )
+        return cursor.rowcount > 0
+
+    def unsnooze_chat(self, chat_id: str) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE chats SET snoozed_until = NULL
+                   WHERE id = ? AND snoozed_until IS NOT NULL AND deleted_at IS NULL""",
+                (chat_id,),
+            )
+        return cursor.rowcount > 0
+
+    def delete_chat(self, chat_id: str) -> bool:
+        """Soft delete: user lists hide the chat, admin views and job history keep it."""
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE chats SET deleted_at = ?, snoozed_until = NULL
+                   WHERE id = ? AND deleted_at IS NULL""",
+                (utcnow(), chat_id),
+            )
+            if cursor.rowcount:
+                # Nobody is pinged about a chat that is gone; sent ones stay as history.
+                connection.execute(
+                    """DELETE FROM notification_outbox
+                       WHERE status IN ('pending', 'sending')
+                         AND (object_id = ?
+                              OR object_id IN (SELECT id FROM queue_jobs WHERE chat_id = ?))""",
+                    (chat_id, chat_id),
+                )
+        return cursor.rowcount > 0
+
+    def unfinished_chat_jobs(self, chat_id: str) -> list[dict[str, Any]]:
+        placeholders = ", ".join("?" for _ in UNFINISHED_JOB_STATUSES)
+        return self._all(
+            f"""SELECT * FROM queue_jobs WHERE chat_id = ? AND status IN ({placeholders})
+                ORDER BY sequence""",
+            (chat_id, *UNFINISHED_JOB_STATUSES),
+        )
 
     def has_pending_jobs(self, effective_user_id: str) -> bool:
         return (
@@ -1274,8 +1576,11 @@ class Database:
         queue_id = queue_id or self.default_chat_queue_id()
         self._active_queue(queue_id)
         with self.transaction() as connection:
-            # The caller's chat may predate session attachment by the dispatcher.
+            # The caller's chat may predate session attachment by the dispatcher,
+            # or a delete that raced this message.
             chat = self.get_chat(chat["id"])
+            if not chat or chat["deleted_at"]:
+                raise ChatDeleted
             if max_queued is not None and connection.execute(
                 "SELECT COUNT(*) FROM queue_jobs WHERE status = 'queued'"
             ).fetchone()[0] >= max_queued:
@@ -1458,6 +1763,7 @@ class Database:
         return self._one(
             """SELECT q.*, owner.login AS effective_login, actor.login AS actor_login,
                       c.title AS chat_title, c.consultation AS consultation,
+                      c.deleted_at AS chat_deleted_at,
                       w.name AS queue_name, w.priority AS queue_priority
                FROM queue_jobs q
                JOIN users owner ON owner.id = q.effective_user_id
@@ -1470,6 +1776,7 @@ class Database:
     def list_jobs(self, effective_user_id: str | None = None) -> list[dict[str, Any]]:
         query = """SELECT q.*, owner.login AS effective_login, actor.login AS actor_login,
                           c.title AS chat_title, c.consultation AS consultation,
+                          c.deleted_at AS chat_deleted_at,
                           w.name AS queue_name, w.priority AS queue_priority
                    FROM queue_jobs q
                    JOIN users owner ON owner.id = q.effective_user_id
@@ -1482,6 +1789,15 @@ class Database:
             params = (effective_user_id,)
         query += " ORDER BY q.sequence DESC LIMIT 500"
         return self._all(query, params)
+
+    def queue_positions(self) -> dict[str, int]:
+        """1-based place of every queued job, in the order `claim_next_job` prefers."""
+        rows = self._all(
+            """SELECT q.id FROM queue_jobs q JOIN work_queues w ON w.id = q.queue_id
+               WHERE q.status = 'queued'
+               ORDER BY (q.resume_content IS NOT NULL) DESC, w.priority DESC, q.sequence"""
+        )
+        return {row["id"]: position for position, row in enumerate(rows, start=1)}
 
     def list_queue_overview_jobs(self) -> list[dict[str, Any]]:
         """Return the bounded projection used by the global queue screen."""
@@ -1506,9 +1822,12 @@ class Database:
                ORDER BY q.sequence DESC LIMIT 500"""
         )
 
-    def list_task_runs(self, owner_id: str | None = None) -> list[dict[str, Any]]:
+    def list_task_runs(
+        self, owner_id: str | None = None, *, include_deleted: bool = False
+    ) -> list[dict[str, Any]]:
         query = """SELECT q.*, owner.login AS effective_login, actor.login AS actor_login,
                           c.title AS chat_title, c.consultation AS consultation,
+                          c.deleted_at AS chat_deleted_at,
                           w.name AS queue_name, w.priority AS queue_priority
                    FROM queue_jobs q
                    JOIN users owner ON owner.id = q.effective_user_id
@@ -1517,6 +1836,8 @@ class Database:
                    JOIN work_queues w ON w.id = q.queue_id
                    WHERE q.task_id IS NOT NULL"""
         params: tuple[Any, ...] = ()
+        if not include_deleted:
+            query += " AND c.deleted_at IS NULL"
         if owner_id:
             query += " AND q.effective_user_id = ?"
             params = (owner_id,)
@@ -1545,6 +1866,43 @@ class Database:
             FROM samples""",
             (start, end),
         ) or {}
+
+    def list_statistics_runs(
+        self,
+        *,
+        kind: str | None = None,
+        task_id: str | None = None,
+        created_from: str | None = None,
+        created_to: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Every question and task run, deleted chats included; deduplicated launches
+        that never ran are left out."""
+        conditions = [
+            "(q.task_id IS NOT NULL OR (c.kind = 'chat' AND c.consultation = 1))",
+            "COALESCE(q.error_code, '') != 'duplicate_task'",
+        ]
+        params: list[Any] = []
+        if kind == "question":
+            conditions.append("q.task_id IS NULL")
+        elif kind == "task":
+            conditions.append("q.task_id IS NOT NULL")
+        if task_id:
+            conditions.append("q.task_id = ?")
+            params.append(task_id)
+        if created_from:
+            conditions.append("julianday(q.created_at) >= julianday(?)")
+            params.append(created_from)
+        if created_to:
+            conditions.append("julianday(q.created_at) < julianday(?)")
+            params.append(created_to)
+        return self._all(
+            f"""SELECT q.id, q.task_id, q.task_title, q.status, q.created_at, q.started_at,
+                       q.finished_at, u.login
+                FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+                LEFT JOIN users u ON u.id = c.owner_user_id
+                WHERE {' AND '.join(conditions)} ORDER BY q.sequence""",
+            tuple(params),
+        )
 
     def get_task_run(self, run_id: str) -> dict[str, Any] | None:
         job = self.get_job(run_id)
@@ -1594,6 +1952,12 @@ class Database:
         self, limit: int, per_user_default: int | None = None
     ) -> dict[str, Any] | None:
         with self.transaction() as connection:
+            # A message can slip in while its chat is being deleted; never run it.
+            for orphan in connection.execute(
+                """SELECT q.id FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+                   WHERE q.status = 'queued' AND c.deleted_at IS NOT NULL"""
+            ).fetchall():
+                self.cancel_queued_job(orphan["id"])
             active = connection.execute(
                 """SELECT COUNT(DISTINCT session_id) FROM queue_jobs WHERE status IN
                    ('dispatching', 'running', 'waiting_permission', 'cancelling')"""
@@ -1755,10 +2119,16 @@ class Database:
         dedupe_key: str,
         kind: str,
         object_id: str,
+        chat_id: str,
         user_id: str,
         title: str,
         link_path: str,
     ) -> None:
+        deleted = connection.execute(
+            "SELECT 1 FROM chats WHERE id = ? AND deleted_at IS NOT NULL", (chat_id,)
+        ).fetchone()
+        if deleted:
+            return
         user = connection.execute(
             "SELECT mattermost_user_id FROM users WHERE id = ?", (user_id,)
         ).fetchone()
@@ -1787,9 +2157,10 @@ class Database:
             dedupe_key=f"task-chain:{root['id']}",
             kind="task_completed",
             object_id=root["id"],
+            chat_id=root["chat_id"],
             user_id=root["effective_user_id"],
             title=root["task_title"] or "Таска",
-            link_path=f"/#/tasks/runs/{root['id']}",
+            link_path=f"/tasks/runs/{root['id']}",
         )
 
     def complete_consultation_run(self, job_id: str, content: str) -> bool:
@@ -1819,9 +2190,10 @@ class Database:
                 dedupe_key=f"consultation-answer:{job_id}",
                 kind="consultation_answer_ready",
                 object_id=row["chat_id"],
+                chat_id=row["chat_id"],
                 user_id=row["effective_user_id"],
                 title=row["chat_title"] or "Консультация",
-                link_path=f"/#/consultations/{row['chat_id']}",
+                link_path=f"/questions/{row['chat_id']}",
             )
             return True
 
@@ -1880,20 +2252,22 @@ class Database:
     def list_notifications(self) -> list[dict[str, Any]]:
         return self._all("SELECT * FROM notification_outbox ORDER BY created_at")
 
-    def set_job_status(self, job_id: str, status: str, error_code: str | None = None) -> None:
+    def set_job_status(self, job_id: str, status: str, error_code: str | None = None) -> bool:
+        """Persist a job status; True when it also cleared the chat's snooze."""
         terminal = status in {"completed", "failed", "cancelled"}
+        snooze_cleared = False
         with self.transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM queue_jobs WHERE id = ?", (job_id,)
             ).fetchone()
             if not row:
-                return
+                return False
             # Completion and fan-out are one durable operation. A repeated terminal
             # event must neither restart a branch nor turn a cancellation into success.
             if row["status"] in {"completed", "failed", "cancelled"}:
-                return
+                return False
             if row["status"] == "cancelling" and status not in {"cancelling", "cancelled"}:
-                return
+                return False
             connection.execute(
                 """UPDATE queue_jobs SET status = ?, error_code = ?,
                    finished_at = CASE WHEN ? THEN ? ELSE finished_at END WHERE id = ?""",
@@ -1915,8 +2289,16 @@ class Database:
                 "UPDATE chats SET status = ?, updated_at = ? WHERE id = ?",
                 (next_status, utcnow(), row["chat_id"]),
             )
+            if status in {"waiting_question", "waiting_permission"}:
+                # A snoozed chat that needs the user comes back immediately.
+                snooze_cleared = connection.execute(
+                    """UPDATE chats SET snoozed_until = NULL
+                       WHERE id = ? AND snoozed_until IS NOT NULL""",
+                    (row["chat_id"],),
+                ).rowcount > 0
             if status == "completed" and row["pipeline_json"]:
                 self._enqueue_pipeline_children(connection, dict(row))
+        return snooze_cleared
 
     def _enqueue_pipeline_children(
         self, connection: sqlite3.Connection, parent: dict[str, Any]
@@ -2213,10 +2595,43 @@ class Database:
             )
 
     def list_audit(self) -> list[dict[str, Any]]:
-        return self._all(
-            """SELECT a.*, actor.login AS actor_login, effective.login AS effective_login
-               FROM audit_log a
-               LEFT JOIN users actor ON actor.id = a.actor_user_id
-               LEFT JOIN users effective ON effective.id = a.effective_user_id
-               ORDER BY a.id DESC LIMIT 500"""
-        )
+        return self._all(AUDIT_QUERY + " ORDER BY a.id DESC LIMIT 500")
+
+    def iter_audit(
+        self,
+        *,
+        logins: list[str] | None = None,
+        actions: list[str] | None = None,
+        created_from: str | None = None,
+        created_to: str | None = None,
+        before_id: int | None = None,
+        batch: int = 500,
+    ) -> Iterator[dict[str, Any]]:
+        """Newest first, fetched lazily so callers can filter further in Python."""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if logins:
+            marks = ", ".join("?" for _ in logins)
+            conditions.append(f"(actor.login IN ({marks}) OR effective.login IN ({marks}))")
+            params.extend([*logins, *logins])
+        if actions:
+            conditions.append(f"a.action IN ({', '.join('?' for _ in actions)})")
+            params.extend(actions)
+        if created_from:
+            conditions.append("julianday(a.created_at) >= julianday(?)")
+            params.append(created_from)
+        if created_to:
+            conditions.append("julianday(a.created_at) < julianday(?)")
+            params.append(created_to)
+        while True:
+            where = [*conditions, "a.id < ?"] if before_id is not None else conditions
+            rows = self._all(
+                AUDIT_QUERY
+                + (" WHERE " + " AND ".join(where) if where else "")
+                + " ORDER BY a.id DESC LIMIT ?",
+                (*params, *([before_id] if before_id is not None else []), batch),
+            )
+            yield from rows
+            if len(rows) < batch:
+                return
+            before_id = rows[-1]["id"]

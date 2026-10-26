@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 
 from opencode_web.app import create_app
 from opencode_web.database import Database
+from opencode_web.events import EventBroker
 
 
 class TitleClient:
@@ -57,6 +58,7 @@ async def test_cached_chat_list_does_not_wait_for_title_sync(settings, workspace
     app = create_app(settings, start_dispatcher=False)
     manager = TitleManager(TitleClient("session-1", "OpenCode title"))
     app.state.manager = manager
+    app.state.events = EventBroker()
 
     principal = {"user": user}
     list_chats = endpoint(app, "/api/chats", "GET")
@@ -119,6 +121,7 @@ async def test_admin_title_sync_only_reads_live_workspaces(settings, workspace, 
         manager._instances[str(instance.workspace)] = instance
         app = create_app(settings, start_dispatcher=False)
         app.state.manager = manager
+        app.state.events = EventBroker()
         request = Request({"type": "http", "app": app, "headers": []})
         sync = endpoint(app, "/api/admin/task-runs/title-sync", "POST")
 

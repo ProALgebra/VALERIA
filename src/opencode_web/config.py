@@ -87,6 +87,8 @@ class Settings:
     mattermost_ca_bundle: Path | None = None
     mattermost_timeout_seconds: float = 30.0
     mattermost_notification_max_attempts: int = 8
+    # Interactive API docs (/docs, /redoc, /openapi.json); off in production.
+    enable_docs: bool = False
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -181,6 +183,7 @@ class Settings:
             mattermost_notification_max_attempts=_int(
                 "MATTERMOST_NOTIFICATION_MAX_ATTEMPTS", 8
             ),
+            enable_docs=_bool("APP_ENABLE_DOCS", False),
         )
 
     def resolve_workspace_path(self, raw_path: str | Path) -> Path:

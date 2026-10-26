@@ -1,0 +1,160 @@
+@if (notFound()) {
+    <v-not-found />
+} @else {
+    <v-screen-header [title]="run()?.title ?? ''" [chat]="item()" [asideToggle]="!!run()">
+        @if (run()) {
+            <kbq-badge vHeaderAfterTitle [badgeColor]="statusColor()">{{ statusText() }}</kbq-badge>
+        }
+        <ng-container vHeaderActions>
+            @if (cancellable()) {
+                <button
+                    kbq-button
+                    [color]="colors.ContrastFade"
+                    [disabled]="stopping()"
+                    [class.kbq-progress]="stopping()"
+                    (click)="confirmCancel()"
+                >
+                    <i kbq-icon="kbq-circle-xmark_16"></i>
+                    Отменить
+                </button>
+            }
+            @if (view() === 'failed') {
+                <button kbq-button [color]="colors.Contrast" (click)="rerun()">
+                    <i kbq-icon="kbq-arrow-rotate-right_16"></i>
+                    Запустить ещё раз
+                </button>
+            }
+        </ng-container>
+    </v-screen-header>
+
+    <div class="v-task-run__body">
+        <v-page-state class="v-task-run__content" [loading]="loading()" [error]="error()" (retry)="load(id())">
+            @if (run(); as r) {
+                <div class="v-task-run__scroll">
+                    <ol class="v-stages" aria-label="Этапы">
+                        @for (stage of stages(); track stage.name) {
+                            <li [class]="'v-stages__item v-stages__item_' + stage.state">
+                                <span class="v-stages__dot" aria-hidden="true">
+                                    @if (stage.state === 'done') {
+                                        <i kbq-icon="kbq-check-s_16"></i>
+                                    } @else if (stage.state === 'error') {
+                                        <i kbq-icon="kbq-xmark-s_16"></i>
+                                    }
+                                </span>
+                                <span class="v-stages__name">{{ stage.name }}</span>
+                                <span class="kbq-text-compact v-stages__time">{{ stage.time }}</span>
+                            </li>
+                        }
+                    </ol>
+
+                    @switch (view()) {
+                        @case ('queued') {
+                            <div class="v-runcard">
+                                <div class="v-runcard__status">
+                                    <i kbq-icon="kbq-clock_24" class="v-runcard__icon" [color]="colors.ContrastFade" aria-hidden="true"></i>
+                                    <div>
+                                        <div class="kbq-text-big-strong">
+                                            {{ status() === 'dispatching' ? statusText() : aheadText() }}
+                                        </div>
+                                        <div class="v-runcard__sub">Обычно 3–5 минут. {{ notifyText }}.</div>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                        @case ('running') {
+                            <div class="v-runcard">
+                                <div class="v-runcard__status">
+                                    <kbq-progress-spinner class="v-runcard__spinner" mode="indeterminate" size="big" />
+                                    <div>
+                                        <div class="kbq-text-big-strong">{{ workingText() }}</div>
+                                        <div class="v-runcard__sub">
+                                            Здесь будет итоговый отчёт. Ход работы задачи не показывается.
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                        @case ('done') {
+                            <div class="v-runcard">
+                                <div class="v-runcard__head">
+                                    <i kbq-icon="kbq-circle-check_16" [color]="colors.Success" aria-hidden="true"></i>
+                                    <span class="kbq-subheading">Итог</span>
+                                    <span class="v-runcard__spacer"></span>
+                                    @if (result()?.text) {
+                                        <button
+                                            kbq-button
+                                            kbqStyle="transparent"
+                                            [color]="colors.Contrast"
+                                            (click)="copyResult()"
+                                        >
+                                            <i kbq-icon="kbq-square-multiple-o_16"></i>
+                                            Копировать итог
+                                        </button>
+                                    }
+                                </div>
+                                @if (result(); as res) {
+                                    @if (res.text) {
+                                        <v-markdown-view [text]="res.text" />
+                                    } @else {
+                                        <div class="v-runcard__sub">Итог недоступен.</div>
+                                    }
+                                }
+                                <div class="kbq-text-compact v-runcard__time">{{ finishedAt() }}</div>
+                            </div>
+                        }
+                        @case ('failed') {
+                            <kbq-alert alertColor="error" alertStyle="colored" [compact]="true">
+                                <i kbq-icon="kbq-circle-exclamation_16"></i>
+                                <div kbq-alert-title>Задача завершилась с ошибкой</div>
+                                {{ errorText().text }} {{ failedHint }}
+                                @if (errorText().code) {
+                                    <div class="v-task-run__code">{{ errorText().code }}</div>
+                                }
+                            </kbq-alert>
+                        }
+                        @case ('cancelled') {
+                            <kbq-alert [compact]="true">
+                                <i kbq-icon="kbq-circle-info_16" [color]="colors.ContrastFade"></i>
+                                <div kbq-alert-title>Запуск отменён в {{ finishedAt() }}</div>
+                                Итога нет. Чтобы начать заново, запустите задачу ещё раз.
+                                <button kbq-alert-control kbq-button [color]="colors.ContrastFade" (click)="rerun()">
+                                    Запустить ещё раз
+                                </button>
+                            </kbq-alert>
+                        }
+                    }
+                </div>
+            }
+        </v-page-state>
+
+        @if (run(); as r) {
+            <v-chat-aside>
+                <kbq-dl [vertical]="true">
+                    <kbq-dt>Задача</kbq-dt>
+                    <kbq-dd>{{ taskTitle() }}</kbq-dd>
+                    <kbq-dt>Ваше дополнение</kbq-dt>
+                    <kbq-dd class="v-task-run__input">{{ r.user_input || '—' }}</kbq-dd>
+                    <kbq-dt>Запущена</kbq-dt>
+                    <kbq-dd>{{ startedText() }}</kbq-dd>
+                    @if (duration()) {
+                        <kbq-dt>Длительность</kbq-dt>
+                        <kbq-dd>{{ duration() }}</kbq-dd>
+                    }
+                </kbq-dl>
+            </v-chat-aside>
+        }
+    </div>
+}
+
+<ng-template #cancelFooter>
+    <button
+        kbq-button
+        [color]="colors.ContrastFade"
+        [disabled]="stopping()"
+        [class.kbq-progress]="stopping()"
+        (click)="confirmStop()"
+    >
+        Отменить запуск
+    </button>
+    <button kbq-button class="v-task-run__keep" [color]="colors.ContrastFade" (click)="closeCancel()">Не отменять</button>
+</ng-template>

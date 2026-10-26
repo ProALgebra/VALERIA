@@ -1,0 +1,122 @@
+<v-home [underlay]="true" />
+
+<!-- Rendered as the content of a kbq-modal without a header (see `openModal`), like Koobiq's confirmation
+     modal: the search field with its close button on top, the results below. Only the results scroll. -->
+<ng-template #body>
+    <div class="v-palette">
+        <div class="v-palette__head">
+            <kbq-form-field class="v-palette__field">
+                <i kbqPrefix kbq-icon="kbq-magnifying-glass_16" [color]="colors.ContrastFade" aria-hidden="true"></i>
+                <input
+                    kbqInput
+                    id="v-palette-input"
+                    name="q"
+                    #input
+                    type="text"
+                    placeholder="Найти чат или выбрать команду"
+                    aria-label="Найти чат или выбрать команду"
+                    role="combobox"
+                    aria-controls="v-palette-list"
+                    aria-expanded="true"
+                    autocomplete="off"
+                    [attr.aria-activedescendant]="activeKey() ? rowId(activeKey()!) : null"
+                    [value]="query()"
+                    (input)="onInput($any($event.target).value)"
+                    (keydown)="onKeydown($event)"
+                />
+            </kbq-form-field>
+            <button
+                kbq-button
+                kbqStyle="transparent"
+                [color]="colors.Contrast"
+                kbqTooltip="Закрыть"
+                [kbqPlacement]="placements.Bottom"
+                aria-label="Закрыть"
+                (click)="close()"
+            >
+                <i kbq-icon="kbq-xmark_16"></i>
+            </button>
+        </div>
+        <div class="v-palette__results kbq-scrollbar">
+            @if (result().nothing) {
+                <kbq-empty-state size="compact">
+                    <i kbq-empty-state-icon kbq-icon="kbq-magnifying-glass_24" [color]="colors.ContrastFade" aria-hidden="true"></i>
+                    <div kbq-empty-state-title>Ничего не нашлось</div>
+                    <div kbq-empty-state-text>
+                        Поиск идёт по названиям вопросов, задач и работ в папке, в том числе в архиве. Можно
+                        <a kbq-link href="" (click)="$event.preventDefault(); askValeria()">спросить об этом Valeria</a>.
+                    </div>
+                </kbq-empty-state>
+            } @else {
+                <kbq-list-selection id="v-palette-list" aria-label="Результаты" [tabIndex]="-1">
+                    @if (result().commands.length) {
+                        <div class="v-palette__sec" role="group" aria-labelledby="v-palette-cap-cmds">
+                            <div class="kbq-caps-compact v-palette__cap" id="v-palette-cap-cmds">Создать</div>
+                            @for (cmd of result().commands; track cmd.id) {
+                                @let key = 'cmd:' + cmd.id;
+                                <kbq-list-option
+                                    [id]="rowId(key)"
+                                    [value]="key"
+                                    [selected]="activeKey() === key"
+                                    (mousemove)="active.set(indexOf(key))"
+                                    (click)="activate({ type: 'cmd', key, cmd })"
+                                >
+                                    <i [kbq-icon]="cmd.icon" [color]="colors.ContrastFade" aria-hidden="true"></i>
+                                    <div class="v-palette__title">{{ cmd.title }}</div>
+                                </kbq-list-option>
+                            }
+                        </div>
+                    }
+                    @if (result().tasks.length) {
+                        <div class="v-palette__sec" role="group" aria-labelledby="v-palette-cap-tasks">
+                            <div class="kbq-caps-compact v-palette__cap" id="v-palette-cap-tasks">Запустить задачу</div>
+                            @for (task of result().tasks; track task.id) {
+                                @let key = 'task:' + task.id;
+                                <kbq-list-option
+                                    [id]="rowId(key)"
+                                    [value]="key"
+                                    [selected]="activeKey() === key"
+                                    (mousemove)="active.set(indexOf(key))"
+                                    (click)="activate({ type: 'task', key, task })"
+                                >
+                                    <i kbq-icon="kbq-bolt_16" [color]="colors.ContrastFade" aria-hidden="true"></i>
+                                    <div class="v-palette__title">{{ task.title }}</div>
+                                </kbq-list-option>
+                            }
+                        </div>
+                    }
+                    @if (result().chats.length) {
+                        <div class="v-palette__sec" role="group" aria-labelledby="v-palette-cap-chats">
+                            <div class="kbq-caps-compact v-palette__cap" id="v-palette-cap-chats">{{ result().chatsCaption }}</div>
+                            @for (item of result().chats; track item.kind + ':' + item.id) {
+                                @let key = item.kind + ':' + item.id;
+                                <kbq-list-option
+                                    [id]="rowId(key)"
+                                    [value]="key"
+                                    [selected]="activeKey() === key"
+                                    (mousemove)="active.set(indexOf(key))"
+                                    (click)="activate({ type: 'chat', key, item })"
+                                >
+                                    <i [kbq-icon]="kindIcon[item.kind]" [color]="colors.ContrastFade" aria-hidden="true"></i>
+                                    <div class="v-palette__row">
+                                        <div class="v-palette__main">
+                                            <div class="v-palette__title">{{ item.title }}</div>
+                                            <div kbq-list-option-caption>{{ kindLabel[item.kind] }} · {{ time(item) }}</div>
+                                        </div>
+                                        @if (item.archived_at) {
+                                            <kbq-badge [compact]="true" [badgeColor]="badgeColors.FadeContrast">В архиве</kbq-badge>
+                                        } @else {
+                                            <kbq-badge [badgeColor]="statusBadgeColor(item.status, item.kind)">
+                                                {{ statusLabel(item.status, item.kind) }}
+                                            </kbq-badge>
+                                        }
+                                    </div>
+                                </kbq-list-option>
+                            }
+                        </div>
+                    }
+                </kbq-list-selection>
+            }
+        </div>
+    </div>
+</ng-template>

@@ -269,7 +269,7 @@ def test_auth_admin_templates_queue_and_impersonation(settings: Settings, worksp
             "status": "connected",
         }
 
-        audit = client.get("/api/admin/audit").json()
+        audit = client.get("/api/admin/audit").json()["items"]
         assert any(item["action"] == "message.impersonated" for item in audit)
 
         deleted = client.delete(f"/api/admin/templates/{template_id}", headers=admin_headers)

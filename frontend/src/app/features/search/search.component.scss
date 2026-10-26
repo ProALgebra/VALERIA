@@ -1,0 +1,57 @@
+:host {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+// Rendered inside the kbq-modal overlay; the nodes still carry this component's style scope.
+// The field stays on top and only the results scroll. Koobiq caps the modal body at `100vh - 260px`; the results
+// take that minus the field row, the gap below it and the bottom padding, so the body itself never scrolls.
+// The body's own bottom padding (8px) is sized for a footer; 16px more makes it match the 24px on top.
+.v-palette {
+    display: flex;
+    flex-direction: column;
+    gap: var(--kbq-size-l);
+    padding-bottom: var(--kbq-size-l);
+}
+
+.v-palette__head {
+    display: flex;
+    align-items: center;
+    gap: var(--kbq-size-s);
+}
+
+.v-palette__results {
+    max-height: calc(100vh - 260px - var(--kbq-size-3xl) - 2 * var(--kbq-size-l));
+    overflow-y: auto;
+}
+
+.v-palette__field {
+    flex: 1;
+    min-width: 0;
+}
+
+.v-palette__sec + .v-palette__sec {
+    margin-top: var(--kbq-size-s);
+}
+
+.v-palette__cap {
+    padding: var(--kbq-size-xs) var(--kbq-size-m);
+    color: var(--kbq-foreground-contrast-secondary);
+}
+
+.v-palette__row {
+    display: flex;
+    align-items: center;
+    gap: var(--kbq-size-m);
+}
+
+.v-palette__main {
+    flex: 1;
+    min-width: 0;
+}
+
+.v-palette__title {
+    white-space: normal;
+}

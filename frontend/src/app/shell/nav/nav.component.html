@@ -1,0 +1,237 @@
+<kbq-vertical-navbar class="v-nav" [expanded]="true" aria-label="Главное меню">
+    <kbq-navbar-container class="v-nav__top">
+        <kbq-navbar-brand class="v-nav__brand" [disabled]="true" aria-hidden="true">
+            <kbq-navbar-logo><span class="v-nav__logo"></span></kbq-navbar-logo>
+            <kbq-navbar-title>VALERIA</kbq-navbar-title>
+        </kbq-navbar-brand>
+
+        <!-- Same 32px button in the same item wrapper as «Новый запрос», so both rows share height and width -->
+        <div kbq-navbar-item class="v-nav__button-item">
+            <a
+                kbq-button
+                kbqStyle="outline"
+                [color]="colors.ContrastFade"
+                class="v-nav__search"
+                routerLink="/search"
+                [attr.aria-keyshortcuts]="searchShortcutAria"
+            >
+                <i kbq-icon="kbq-magnifying-glass_16" [color]="colors.ContrastFade"></i>
+                Поиск и команды
+                <kbq-badge
+                    kbqButtonSuffix
+                    class="v-nav__shortcut"
+                    [compact]="true"
+                    [badgeColor]="badgeColors.FadeContrast"
+                    aria-hidden="true"
+                    >{{ searchShortcutHint }}</kbq-badge
+                >
+            </a>
+        </div>
+
+        <div kbq-navbar-item class="v-nav__button-item">
+            <a
+                kbq-button
+                kbqStyle="filled"
+                [color]="colors.ContrastFade"
+                class="v-nav__newreq"
+                routerLink="/"
+                data-nav-home
+            >
+                <i kbq-icon="kbq-plus_16"></i>
+                Новый запрос
+            </a>
+        </div>
+    </kbq-navbar-container>
+
+    <!-- The chat list scrolls; the brand block above and the folds, «Система» and user below stay in place. -->
+    <kbq-navbar-container #list class="v-nav__list">
+        @if (groups().active.length) {
+            <div class="v-nav__section kbq-caps-compact-strong">Активные</div>
+            @for (item of groups().active; track key(item)) {
+                <ng-container *ngTemplateOutlet="chatRow; context: { $implicit: item, trail: 'status' }" />
+            }
+        }
+
+        @if (groups().done.length) {
+            <div class="v-nav__section kbq-caps-compact-strong">Готово</div>
+            @for (item of groups().done; track key(item)) {
+                <ng-container *ngTemplateOutlet="chatRow; context: { $implicit: item, trail: 'status' }" />
+            }
+        }
+    </kbq-navbar-container>
+
+    <!-- Pinned to the bottom: «Отложенные» / «Архив» (their open lists scroll on their own when long), then «Система»
+         and the user. -->
+    <kbq-navbar-container class="v-nav__bottom">
+        @if (listOverflows()) {
+            <kbq-navbar-divider />
+        }
+        @if (groups().snoozed.length || groups().archive.length) {
+            <div class="v-nav__folds">
+                @if (groups().snoozed.length) {
+                    <button
+                        kbq-navbar-item
+                        type="button"
+                        class="v-nav__fold"
+                        [attr.aria-expanded]="snoozedOpen()"
+                        (click)="snoozedOpen.update(toggle)"
+                    >
+                        <i
+                            [kbq-icon]="snoozedOpen() ? 'kbq-chevron-down_16' : 'kbq-chevron-right_16'"
+                            [color]="colors.ContrastFade"
+                        ></i>
+                        <kbq-navbar-title>Отложенные</kbq-navbar-title>
+                        <span class="v-nav__count">{{ groups().snoozed.length }}</span>
+                    </button>
+                    @if (snoozedOpen()) {
+                        @for (item of groups().snoozed; track key(item)) {
+                            <ng-container *ngTemplateOutlet="chatRow; context: { $implicit: item, trail: 'when' }" />
+                        }
+                    }
+                }
+                @if (groups().snoozed.length && groups().archive.length) {
+                    <kbq-navbar-divider />
+                }
+                @if (groups().archive.length) {
+                    <button
+                        kbq-navbar-item
+                        type="button"
+                        class="v-nav__fold"
+                        [attr.aria-expanded]="archiveOpen()"
+                        (click)="archiveOpen.update(toggle)"
+                    >
+                        <i
+                            [kbq-icon]="archiveOpen() ? 'kbq-chevron-down_16' : 'kbq-chevron-right_16'"
+                            [color]="colors.ContrastFade"
+                        ></i>
+                        <kbq-navbar-title>Архив</kbq-navbar-title>
+                        <span class="v-nav__count">{{ groups().archive.length }}</span>
+                    </button>
+                    @if (archiveOpen()) {
+                        @for (item of groups().archive; track key(item)) {
+                            <ng-container *ngTemplateOutlet="chatRow; context: { $implicit: item, trail: 'none' }" />
+                        }
+                    }
+                }
+            </div>
+            <kbq-navbar-divider />
+        }
+        @if (auth.isAdmin()) {
+            <button
+                kbq-navbar-item
+                type="button"
+                class="v-nav__system"
+                [class.kbq-active]="inAdmin()"
+                [kbqDropdownTriggerFor]="systemMenu"
+            >
+                <i kbq-icon="kbq-gear_16" [color]="inAdmin() ? colors.Contrast : colors.ContrastFade"></i>
+                <kbq-navbar-title>Система</kbq-navbar-title>
+            </button>
+        }
+
+        @if (auth.user(); as user) {
+            <button
+                kbq-navbar-item
+                type="button"
+                class="v-nav__user"
+                [kbqDropdownTriggerFor]="userMenu"
+                [attr.aria-label]="user.login + ' · ' + auth.roleLabel()"
+            >
+                <span class="v-nav__avatar" aria-hidden="true">{{ initials() }}</span>
+                <!-- The row shows the person only, as in the prototype; the role is in the menu caption. A plain span,
+                     not kbq-navbar-title: the title slot would move the avatar after the text and add a chevron. -->
+                <span class="v-nav__user-name" kbq-title>{{ user.login }}</span>
+            </button>
+        }
+    </kbq-navbar-container>
+
+    <!-- Declared inside the navbar so the rows are its content children (roving focus, expanded state). -->
+    <ng-template #chatRow let-item let-trail="trail">
+        <a
+            kbq-navbar-item
+            class="v-nav__chat"
+            [class.v-nav__chat_menu]="cm.opened()"
+            [routerLink]="route(item)"
+            routerLinkActive="kbq-active"
+            #chatLink="routerLinkActive"
+            [attr.data-key]="key(item)"
+            (keydown.shift.f10)="$event.preventDefault(); cm.openFromKeyboard()"
+            (keydown.contextmenu)="$event.preventDefault(); cm.openFromKeyboard()"
+        >
+            <i [kbq-icon]="kindIcon(item)" [color]="chatLink.isActive ? colors.Contrast : colors.ContrastFade"></i>
+            <kbq-navbar-title>{{ item.title }}</kbq-navbar-title>
+            @switch (trail) {
+                @case ('status') {
+                    @let label = statusText(item);
+                    <span
+                        class="v-nav__st"
+                        role="img"
+                        [attr.aria-label]="label"
+                        [kbqTooltip]="label"
+                        [kbqPlacement]="placements.Right"
+                    >
+                        <!-- Only Активные is coloured (prototype): finished chats get neutral icons, the label tells the outcome. -->
+                        @switch (statusMark(item)) {
+                            @case ('waiting') {
+                                <i kbq-icon="kbq-circle-exclamation_16" [color]="colors.Warning"></i>
+                            }
+                            @case ('running') {
+                                <kbq-progress-spinner mode="indeterminate" />
+                            }
+                            @case ('success') {
+                                <i kbq-icon="kbq-circle-check_16" [color]="colors.ContrastFade"></i>
+                            }
+                            @case ('failed') {
+                                <i kbq-icon="kbq-circle-exclamation_16" [color]="colors.ContrastFade"></i>
+                            }
+                            @case ('cancelled') {
+                                <i kbq-icon="kbq-circle-xmark_16" [color]="colors.ContrastFade"></i>
+                            }
+                            @default {
+                                <i kbq-icon="kbq-clock_16" [color]="colors.ContrastFade"></i>
+                            }
+                        }
+                    </span>
+                }
+                @case ('when') {
+                    <span class="v-nav__st v-nav__when kbq-text-compact">{{ returnTime(item) }}</span>
+                }
+            }
+            <v-chat-menu #cm="vChatMenu" class="v-nav__more" appearance="row" [item]="item" />
+        </a>
+    </ng-template>
+</kbq-vertical-navbar>
+
+<kbq-dropdown #systemMenu="kbqDropdown">
+    @for (entry of systemEntries; track entry.link) {
+        <a kbq-dropdown-item [routerLink]="entry.link" [class.kbq-selected]="isCurrent(entry.link)">
+            <i [kbq-icon]="entry.icon"></i>{{ entry.label }}
+        </a>
+    }
+</kbq-dropdown>
+
+<kbq-dropdown #userMenu="kbqDropdown" yPosition="above">
+    @if (auth.user(); as user) {
+        <!-- Captions: the stock kbq-select optgroup label (kbq-optgroup itself only works inside kbq-select). -->
+        <label class="kbq-optgroup-label">{{ user.login }} · {{ auth.roleLabel() }}</label>
+    }
+    <label class="kbq-optgroup-label">Тема</label>
+    @for (option of themeOptions; track option.id) {
+        <button
+            kbq-dropdown-item
+            role="menuitemradio"
+            [class.kbq-selected]="theme.mode() === option.id"
+            [attr.aria-checked]="theme.mode() === option.id"
+            (click)="theme.setMode(option.id)"
+        >
+            {{ option.label }}
+            @if (theme.mode() === option.id) {
+                <span kbqDropdownItemAction><i kbq-icon="kbq-check_16" [color]="colors.ContrastFade"></i></span>
+            }
+        </button>
+    }
+    <kbq-divider />
+    <button kbq-dropdown-item (click)="logout()">
+        <i kbq-icon="kbq-arrow-right-from-bracket_16"></i>Выйти
+    </button>
+</kbq-dropdown>
