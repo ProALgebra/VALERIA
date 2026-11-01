@@ -1,0 +1,26 @@
+[Unit]
+Description=Valeria Telegram user client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=valeria-telegram
+Group=valeria-telegram
+WorkingDirectory=/opt/valeria-telegram-bot
+EnvironmentFile=/etc/valeria-telegram-bot.env
+Environment=TELEGRAM_STATE_DB=/var/lib/valeria-telegram/state.db
+ExecStart=/opt/valeria-telegram-bot/.venv/bin/valeria-telegram-bot --env-file /etc/valeria-telegram-bot.env
+Restart=on-failure
+RestartSec=5
+StateDirectory=valeria-telegram
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/valeria-telegram
+
+[Install]
+WantedBy=multi-user.target
