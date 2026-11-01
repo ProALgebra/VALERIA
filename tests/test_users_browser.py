@@ -48,6 +48,7 @@ def test_user_updates_mattermost_username_in_profile():
         page.add_init_script("window.EventSource = class { close() {} };")
         page.route("**/*", handle)
         page.goto("http://users.test/#/profile")
+        playwright.expect(page.locator("#profile-workspace-form")).to_have_count(0)
         username = page.locator('#profile-form [name="mattermost_username"]')
         playwright.expect(username).to_be_visible()
         username.fill("akhamitsevich")
@@ -132,4 +133,94 @@ def test_admin_opens_user_card_and_updates_visible_settings(
             "status": "active",
             "max_active_jobs": 3,
         }]
+        browser.close()
+
+
+@pytest.mark.parametrize("settings_page", ["profile", "users"])
+def test_admin_assigns_own_workspace_without_reload(settings_page):
+    playwright = pytest.importorskip("playwright.sync_api")
+    static = Path(__file__).parents[1] / "src/opencode_web/static"
+    admin = {
+        "id": "admin", "login": "admin", "role": "admin", "tasks_only": False,
+        "workspace_path": None, "status": "active", "max_active_jobs": None,
+        "mattermost_username": None,
+    }
+    folder = "/workspaces/admin/project"
+    updates = []
+    auth_requests = []
+    errors = []
+
+    def handle(route):
+        path = urlparse(route.request.url).path
+        if static_response(route, static, path):
+            return
+        payload = []
+        if path == "/api/auth/me":
+            auth_requests.append(path)
+            payload = {"user": admin, "csrf_token": "csrf"}
+        elif path == "/api/config/public":
+            payload = {
+                "workspace": admin["workspace_path"], "agents": ["build"],
+                "default_agent": "build", "max_active_sessions": 1,
+                "max_active_jobs_hard_limit": 5,
+            }
+        elif path == "/api/options":
+            payload = {"agents": ["build"], "default_agent": "build", "models": []}
+        elif path == "/api/tasks":
+            payload = [{"id": "task", "title": "Тестовая таска", "description": ""}]
+        elif path == "/api/admin/users":
+            payload = [admin]
+        elif path == "/api/admin/users/admin" and route.request.method == "PATCH":
+            data = route.request.post_data_json
+            updates.append(data)
+            assert route.request.headers["x-csrf-token"] == "csrf"
+            if settings_page == "profile" and len(updates) == 1:
+                route.fulfill(status=409, json={"detail": "Workspace is already assigned"})
+                return
+            admin["workspace_path"] = folder
+            payload = admin
+        route.fulfill(json=payload)
+
+    with playwright.sync_playwright() as engine:
+        browser = engine.chromium.launch()
+        page = browser.new_page()
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.add_init_script("window.EventSource = class { close() {} };")
+        page.route("**/*", handle)
+        page.goto(f"http://users.test/#/{'dialogs' if settings_page == 'profile' else 'users'}")
+        if settings_page == "profile":
+            playwright.expect(page.get_by_role("button", name="Создать диалог")).to_be_disabled()
+            page.get_by_role("button", name="Назначить рабочую папку").click()
+            form = page.locator("#profile-workspace-form")
+            form.locator('[name="workspace_path"]').fill("occupied")
+            form.get_by_role("button", name="Сохранить папку").click()
+            playwright.expect(page.locator("#toast")).to_have_text("Workspace is already assigned")
+            playwright.expect(form.locator('[name="workspace_path"]')).to_have_value("occupied")
+            playwright.expect(form.get_by_role("button", name="Сохранить папку")).to_be_enabled()
+            form.locator('[name="workspace_path"]').fill("  admin/project  ")
+            form.get_by_role("button", name="Сохранить папку").click()
+            playwright.expect(page.locator("#toast")).to_have_text("Рабочая папка сохранена")
+            playwright.expect(form.locator('[name="workspace_path"]')).to_have_value(folder)
+            assert updates == [
+                {"workspace_path": "occupied"}, {"workspace_path": "admin/project"},
+            ]
+        else:
+            form = page.locator("#user-settings-form")
+            form.locator('[name="workspace_path"]').fill("admin/project")
+            form.get_by_role("button", name="Сохранить настройки").click()
+            playwright.expect(form.locator('[name="workspace_path"]')).to_have_value(folder)
+            assert len(updates) == 1
+            assert updates[0]["workspace_path"] == "admin/project"
+
+        page.locator('[data-route="tasks"]').click()
+        playwright.expect(page.get_by_role("button", name="Запустить таску")).to_be_enabled()
+        page.locator('[data-route="consultations"]').click()
+        playwright.expect(page.get_by_role("button", name="Начать диалог")).to_be_enabled()
+        page.locator('[data-route="dialogs"]').click()
+        playwright.expect(page.locator('#new-chat input[disabled]')).to_have_value(folder)
+        playwright.expect(page.get_by_role("button", name="Создать диалог")).to_be_enabled()
+        shortcut = page.get_by_role("button", name="Назначить рабочую папку")
+        playwright.expect(shortcut).to_have_count(0)
+        assert len(auth_requests) == 1
+        assert not errors
         browser.close()

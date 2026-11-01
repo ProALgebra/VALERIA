@@ -266,6 +266,7 @@ async function renderDialogs() {
       </section>
       <form class="card" id="new-chat"><h3>Новый диалог</h3>
         <div class="field"><label>Рабочая папка</label><input class="input mono" value="${esc(config.workspace || "Не назначена")}" disabled></div>
+        ${!config.workspace && state.me.role === "admin" ? `<button class="btn" type="button" data-route="profile">Назначить рабочую папку</button>` : ""}
         <div class="selectors"><div class="field" style="flex:1"><label>Режим</label><select class="input" name="agent" id="new-chat-agent">${initialOptions.agents.map(a => `<option value="${esc(a)}" ${a === initialOptions.default_agent ? "selected" : ""}>${esc(a[0].toUpperCase() + a.slice(1))}</option>`).join("")}</select></div>
         <div class="field" style="flex:2"><label>Модель</label><select class="input" name="model" id="new-chat-model" ${modelsLoading ? "disabled" : ""}>${modelsLoading ? `<option value="">Модели OpenCode загружаются…</option>` : modelOptions(models, initialOptions.default_model)}</select><span class="hint" id="model-load-status">${modelsLoading ? "Интерфейс уже доступен; каталог загрузится отдельно." : `${models.length} моделей доступно`}</span></div></div>
         <div class="field"><label>Шаблон сообщения</label><select class="input" id="template"><option value="">Без шаблона</option>${templates.map(t => `<option value="${t.id}" ${state.draftTemplate?.id === t.id ? "selected" : ""}>${esc(t.title)}</option>`).join("")}</select></div>
@@ -991,6 +992,15 @@ function mattermostUsernameInput(value = "", name = "mattermost_username") {
     `autocomplete="off"><span class="hint">Username из Mattermost, без отображаемого имени. Можно с @.</span>`;
 }
 
+function updateCurrentUser(user) {
+  if (user.id !== state.me?.id) return;
+  const workspaceChanged = user.workspace_path !== state.me.workspace_path;
+  state.me = user;
+  if (workspaceChanged) {
+    state.options = null;
+  }
+}
+
 async function renderProfile() {
   const user = state.me;
   const access = user.role === "admin" ? "Администратор" : user.tasks_only ? "Таски и консультации" : "Пользователь";
@@ -1002,8 +1012,33 @@ async function renderProfile() {
         <p class="hint">${user.mattermost_user_id && !user.mattermost_username ? "Уведомления уже настроены по внутреннему ID. Введите username, чтобы обновить понятную привязку. " : ""}После проверки username вы будете получать личные уведомления о завершении тасок и готовых ответах консультаций.</p>
         <div class="actions"><button class="btn btn-primary" type="submit">Сохранить профиль</button>${user.mattermost_user_id ? `<button class="btn btn-danger" type="button" id="profile-mattermost-clear">Отключить уведомления</button>` : ""}</div>
       </form>
-    </div></div>`;
+    </div>
+    ${user.role === "admin" ? `<div class="card profile-card"><h3>Рабочая папка</h3>
+      <form id="profile-workspace-form">
+        <div class="field"><label for="profile-workspace-path">Путь к папке</label><input class="input mono" id="profile-workspace-path" name="workspace_path" value="${esc(user.workspace_path || "")}" placeholder="Например: admin/project" required></div>
+        <p class="hint">Папка для ваших диалогов, тасок и консультаций. Укажите путь внутри разрешённых каталогов сервера. Если разрешён один каталог, можно указать относительный путь. Недостающая папка будет создана.</p>
+        <p class="hint">Сменить папку можно после завершения задач. При смене папки старые диалоги архивируются.</p>
+        <button class="btn btn-primary" type="submit">Сохранить папку</button>
+      </form>
+    </div>` : ""}</div>`;
   app.innerHTML = shell(content, "Профиль"); bindShell();
+  document.querySelector("#profile-workspace-form")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const input = form.elements.workspace_path;
+    input.value = input.value.trim();
+    if (!form.reportValidity()) return;
+    const button = form.querySelector("button[type=submit]");
+    button.disabled = true;
+    try {
+      updateCurrentUser(await api(`/api/admin/users/${encodeURIComponent(user.id)}`, {
+        method: "PATCH", body: JSON.stringify({workspace_path: input.value}),
+      }));
+      notify("Рабочая папка сохранена");
+      await renderProfile();
+    } catch (err) { notify(err.message); }
+    finally { button.disabled = false; }
+  });
   document.querySelector("#profile-form").addEventListener("submit", async event => {
     event.preventDefault();
     if (!event.currentTarget.reportValidity()) return;
@@ -1013,14 +1048,14 @@ async function renderProfile() {
       const data = Object.fromEntries(new FormData(event.currentTarget));
       data.mattermost_username = data.mattermost_username.trim() || null;
       if (user.mattermost_user_id && !user.mattermost_username && !data.mattermost_username) delete data.mattermost_username;
-      state.me = await api("/api/profile", {method: "PATCH", body: JSON.stringify(data)});
+      updateCurrentUser(await api("/api/profile", {method: "PATCH", body: JSON.stringify(data)}));
       notify("Профиль сохранён");
       await renderProfile();
     } catch (err) { button.disabled = false; notify(err.message); }
   });
   document.querySelector("#profile-mattermost-clear")?.addEventListener("click", async () => {
     try {
-      state.me = await api("/api/profile", {method: "PATCH", body: JSON.stringify({mattermost_username: null})});
+      updateCurrentUser(await api("/api/profile", {method: "PATCH", body: JSON.stringify({mattermost_username: null})}));
       notify("Уведомления Mattermost отключены");
       await renderProfile();
     } catch (err) { notify(err.message); }
@@ -1060,10 +1095,15 @@ async function renderUsers() {
     const rawLimit = new FormData(event.currentTarget).get("max_active_jobs").trim();
     data.max_active_jobs = rawLimit ? Number(rawLimit) : null;
     if (selected.mattermost_user_id && !selected.mattermost_username && !data.mattermost_username) delete data.mattermost_username;
-    try { await api(`/api/admin/users/${selected.id}`, {method: "PATCH", body: JSON.stringify(data)}); notify("Настройки пользователя сохранены"); await renderUsers(); } catch (err) { notify(err.message); }
+    try {
+      updateCurrentUser(await api(`/api/admin/users/${selected.id}`, {method: "PATCH", body: JSON.stringify(data)}));
+      notify("Настройки пользователя сохранены");
+      if (state.me.role === "admin") await renderUsers();
+      else await navigate(defaultRoute());
+    } catch (err) { notify(err.message); }
   });
   document.querySelector("#admin-mattermost-clear")?.addEventListener("click", async () => {
-    try { await api(`/api/admin/users/${selected.id}`, {method: "PATCH", body: JSON.stringify({mattermost_username: null})}); notify("Mattermost-уведомления отключены"); await renderUsers(); } catch (err) { notify(err.message); }
+    try { updateCurrentUser(await api(`/api/admin/users/${selected.id}`, {method: "PATCH", body: JSON.stringify({mattermost_username: null})})); notify("Mattermost-уведомления отключены"); await renderUsers(); } catch (err) { notify(err.message); }
   });
   document.querySelector("#reset-password-form")?.addEventListener("submit", async event => {
     event.preventDefault(); if (!event.currentTarget.reportValidity()) return;

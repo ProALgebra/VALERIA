@@ -96,6 +96,7 @@ tr:last-child td { border-bottom: 0; }
 .empty { border: 1px dashed #34485a; border-radius: 9px; color: var(--muted); text-align: center; padding: 42px 18px; }
 .profile-page { max-width: 820px; }
 .profile-card { padding: 22px; }
+.profile-card + .profile-card { margin-top: 20px; }
 .profile-summary { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; }
 .profile-summary h3 { margin: 0 0 4px; font-size: 20px; }
 .profile-avatar { width: 48px; height: 48px; font-size: 19px; }
