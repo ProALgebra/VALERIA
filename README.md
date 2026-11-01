@@ -2,18 +2,311 @@
 
 **Virtual Agentic Language-model Execution, Routing & Interface Administrator**
 
+[English](#english) | [Русский](#русский)
+
+## English
+
+Administrative interface for running and routing LLM agents.
+V.A.L.E.R.I.A. provides a multi-user web interface for OpenCode with assigned
+workspaces, a shared job queue, Build/Plan modes, templates, tasks, Markdown
+responses, and an administration panel.
+
+### Requirements
+
+- Python 3.12+;
+- `/usr/bin/opencode` installed;
+- access to an LLM provider configured in OpenCode.
+
+### Local setup
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+cp .env.example .env
+mkdir -p .secrets data/workspaces
+openssl rand -base64 32 > .secrets/admin-password
+chmod 600 .secrets/admin-password
+set -a
+source .env
+set +a
+.venv/bin/opencode-web
+```
+
+Before starting, configure at least:
+
+- `SESSION_SECRET` — a random string of at least 32 characters;
+- `OPENCODE_SERVER_PASSWORD`;
+- `ALLOWED_WORKSPACE_ROOTS` — defaults to `./data/workspaces` for local setup;
+- `BOOTSTRAP_ADMIN_PASSWORD_FILE`.
+
+The bootstrap administrator is created only on the first startup with an empty
+database. Its password is read from a protected file and stored only as an
+Argon2id hash.
+
+Open `http://127.0.0.1:8081`. Additional accounts, workspaces, templates, and the
+active session limit are configured in the administration panel.
+
+The initial administrator has no workspace assigned. In “Profile” (“Профиль”),
+enter a path in “Folder path” (“Путь к папке”) and click “Save folder”
+(“Сохранить папку”). For example, `admin/project` creates a directory inside
+`ALLOWED_WORKSPACE_ROOTS` when a single root directory is configured. You can also
+specify an absolute path within the allowed directories. The workspace takes
+effect immediately without signing in again; it can also be changed in your
+account entry under “Users” (“Пользователи”). The workspace cannot be changed
+while jobs are queued or running.
+
+A [systemd setup with OpenCode/MCP/LSP process cleanup](docs/server-process-lifecycle.md)
+is available for the `/opt/valeria` deployment. Install it before using the updated
+`run-local.sh`; migration and rollback instructions are provided in that document.
+
+### Tasks
+
+In “Task settings” (“Настройка тасок”), the administrator creates a task with a
+user-facing title and description, a hidden prompt, an OpenCode mode, a specific
+model from the same catalog available in chat, and an optional model variant.
+Saving is disabled while the model catalog is loading or unavailable; the catalog
+can be reloaded without losing entered data. If a previously selected model is no
+longer available, select an available model before saving. Published tasks appear
+under “Tasks” (“Таски”); drafts are visible only to administrators. Editing or
+deleting a task definition does not change existing runs or remove their history.
+
+Users select a task, optionally add their own text, and run it in their assigned
+workspace. Their text is appended after the administrator's prompt. Users see only
+the run title, timestamps, and status: queued, preparing the environment, running,
+completed, or failed. The prompt, messages, reasoning, tools, and technical run
+errors are not exposed through the user interface or API.
+
+A run initially uses the selected task's title. When OpenCode assigns a session
+title, it is appended after a colon: “Task title: OpenCode session title”. The task
+title is saved when the run starts, so later edits to the definition do not rename
+historical runs. Titles update in the background without reloading the form or
+losing the user's additional text.
+
+Creating a dialog, consultation, or manual task run saves the request to SQLite
+without waiting for OpenCode. The dispatcher starts the environment and creates a
+session when the job receives a slot in the shared queue. Until then, the history
+shows the saved request and preparation status; an empty dialog does not start an
+environment. Startup failures are saved with the job, after which users can submit
+the request again. Accepted jobs survive application restarts. The browser uses
+`Idempotency-Key`: retrying an HTTP request after a network failure with the same
+key returns the original result without creating a duplicate, while a different
+request with that key receives `409`.
+
+Each run uses a single regular OpenCode session with one user message. Tasks share
+the FIFO queue and active session limit with chats. OpenCode questions are answered
+automatically using the recommended option, or the first available option if none
+is marked as recommended. Users do not need to continue the interaction manually.
+
+If a question has no answer options, or the current OpenCode policy requires manual
+approval of an action, the task fails. Automatic answers do not change the
+configured permission policy.
+
+The “Users” section offers a “Tasks and consultations” account type (`tasks_only`).
+These users can run published tasks, view their run statuses, and use consultations;
+regular chats, templates, and their APIs are unavailable to them. Consultations are
+available independently of whether regular dialogs are enabled. This mode can also
+be enabled or disabled for existing users. Administrators see all task runs and
+their positions in the shared queue.
+
+To run tasks from MCP clients, use [Valeria Tasks MCP](mcp/mcp-valeria-tasks/README.md).
+Its configuration specifies the Valeria URL and the account used to create runs.
+The tools show available tasks, run statuses, and final answers.
+
+[Valeria Administrator MCP](mcp/mcp-valeria-administrator/README.md) provides
+administration from an MCP client: users, tasks and their audiences, queues, limits,
+templates, consultations, runs, statistics, and audit records. Configure a Valeria
+account with the `admin` role.
+
+[Valeria Telegram Bot](integrations/telegram-valeria-bot/README.md) provides access
+from Telegram. After signing in with their own account, users can select tasks,
+consultations, or dialogs, receive results, and answer clarification questions.
+The bot runs as a separate process; setup instructions and an example configuration
+are available in the integration directory.
+
+### Statistics
+
+The “Statistics” tab is available to administrators and shows successful task runs
+across all users: counts for the selected day and all time, plus two daily averages —
+from execution start to completion and from queue entry to completion. Today is
+selected by default; each day is determined by the browser's time zone using the
+task's completion timestamp. Data refreshes on task events and through the
+“Refresh” button.
+
+Failures, cancellations, dialogs, and consultations are excluded. Repeated runs and
+pipeline stages are counted separately. Tasks without valid timestamps are excluded
+from the corresponding average; an empty sample displays “No data”. Counts include
+the full saved history, including more than 500 runs.
+
+API: `GET /api/admin/statistics?day=2026-10-04&timezone=UTC`.
+Both parameters are optional and default to the current day and `UTC`.
+
+### Running with Docker
+
+The stack runs the OpenCode Web container together with OpenCode CLI, Conan, and local
+MCP servers. The service connects to the `opencode` bridge network with outbound
+internet access enabled. OpenCode and MCP configuration is included in the image,
+while all mutable state is stored inside the project directory.
+
+Install Docker Engine and Compose on Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install docker.io docker-compose-v2
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+newgrp docker
+```
+
+After copying the entire directory, including hidden files, run:
+
+```bash
+docker compose build
+docker compose up -d
+docker compose ps
+docker compose logs -f web
+```
+
+Copy the entire directory, including the hidden `.env` and `.secrets` files and directories and the shared `data` directory. `data` stores SQLite, user workspaces, OpenCode state and cache, the Memory MCP database, and Conan. `data/workspaces` is mounted inside the container at `/home/appuser/workspaces`, keeping saved user paths inside the container stable.
+
+Example of copying to another server with all hidden data:
+
+```bash
+rsync -a --exclude='.git/' --exclude='.venv/' './' user@server:/opt/opencode-web/
+ssh user@server 'cd /opt/opencode-web && docker compose up --build -d'
+```
+
+For Git operations over SSH, place the key and `known_hosts` in `.secrets/ssh`. The private SSH key is not copied automatically.
+
+#### Automatic GPG commit signing in Docker
+
+The container supports OpenPGP/GPG signing of all Git commits and tags. On a new server, first create a dedicated key with an email address verified in GitLab:
+
+```bash
+sudo apt install gnupg
+gpg --full-generate-key
+gpg --list-secret-keys --keyid-format LONG
+```
+
+Add the output of `gpg --armor --export <KEY_ID>` to GitLab under “Profile → Access → GPG keys”. Then prepare the private key and passphrase for the container:
+
+```bash
+mkdir -p .secrets/gpg
+chmod 700 .secrets/gpg
+gpg --armor --export-secret-keys <KEY_ID> > .secrets/gpg/private.asc
+read -r -s -p 'GPG passphrase: ' GPG_KEY_PASSPHRASE
+printf '%s' "$GPG_KEY_PASSPHRASE" > .secrets/gpg/passphrase
+unset GPG_KEY_PASSPHRASE
+chmod 600 .secrets/gpg/private.asc .secrets/gpg/passphrase
+```
+
+Set the full key fingerprint in `.env` and enable signing:
+
+```dotenv
+GIT_USER_NAME=Aleksey Khamitsevich
+GIT_USER_EMAIL=verified-email@example.com
+GIT_GPG_SIGNING_ENABLED=true
+GIT_GPG_KEY_ID=FULL_40_CHARACTER_FINGERPRINT
+GIT_GPG_PRIVATE_KEY_FILE=/app/.secrets/gpg/private.asc
+GIT_GPG_PASSPHRASE_FILE=/app/.secrets/gpg/passphrase
+```
+
+After `docker compose up --build -d`, the entrypoint imports the key into the persistent `data/gnupg` directory and enables `commit.gpgSign` and `tag.gpgSign`. If the key, fingerprint, or passphrase file is unavailable, the container exits with an explicit error instead of starting the application with unsigned commits.
+
+The passphrase file is stored as plain text on the server. Restrict access to `.secrets`, use a dedicated signing-only key, and keep `.secrets` out of Git and the Docker image. OpenCode processes run in the same container and technically have access to mounted secrets; strict isolation requires moving signing to a separate service.
+
+When deploying from `git clone`, create `.env` from `.env.example`, generate a new `SESSION_SECRET`, create `.secrets/admin-password`, and fill in the tokens. Databases, dialogs, and workspaces are not tracked in Git.
+
+By default, the site remains accessible only locally at `http://127.0.0.1:8081`. Inside the container, the application listens on `0.0.0.0`, while the published address is still determined by `APP_HOST`.
+
+To stop:
+
+```bash
+docker compose down
+```
+
+The `data` and `.secrets` directories are excluded from Docker images and Git. Removing containers does not delete this data. YouTrack, GitLab, and LLM tokens are stored only in `.env`; `opencode/config/opencode.jsonc` contains only references to environment variables.
+
+Mutable data layout:
+
+```text
+data/
+├── opencode-web.db
+├── workspaces/
+├── opencode/{share,state,cache}/
+├── mcp/memory/
+├── conan/
+└── gnupg/
+```
+
+### Development
+
+```bash
+.venv/bin/ruff check src tests
+.venv/bin/pytest
+```
+
+Project documentation:
+
+- [technical specification](docs/technical-specification.md);
+- [consultation interface and its configuration](docs/consultations.md);
+- [design prompts](docs/design-prompts.md).
+
+### Licensing
+
+V.A.L.E.R.I.A. — Virtual Agentic Language-model Execution, Routing & Interface
+Administrator — is source-available under a three-part licensing model.
+
+- The [V.A.L.E.R.I.A. Community License 1.0](LICENSE.md) permits personal,
+  educational, research, and unlimited internal organizational use, including
+  self-hosting, private modifications, and commercial work performed with the
+  platform.
+- A separate [Commercial License](legal/LICENSE_COMMERCIAL.md) is required for
+  hosted SaaS, provider-controlled managed hosting, external customer access,
+  commercial redistribution, OEM embedding, and white-label offerings.
+- The [Enterprise License](legal/LICENSE_ENTERPRISE.md) governs only separately
+  identified proprietary Enterprise Components and negotiated services. It does
+  not reduce Community rights.
+
+Revenue from code, reports, consulting, or other independent work product made
+with V.A.L.E.R.I.A. does not by itself require a paid license. Organizations of
+any size may use Community Components internally without limits based on company
+size, revenue, employees, agents, tasks, tokens, internal users, or servers.
+
+See the [license FAQ](legal/LICENSE_FAQ.md), [commercial overview](legal/COMMERCIAL.md),
+[Russian summary](legal/LICENSING_SUMMARY_RU.md), and [third-party notices](NOTICE.md).
+Commercial licensing contact: **[COMMERCIAL LICENSING CONTACT TO BE ADDED]**.
+
+The Community License is a custom source-available license, not an OSI-approved
+open-source license. Third-party materials retain their own licenses. The legal
+documents are drafts requiring professional review before publication or use in
+a transaction.
+
+### Current MVP limitations
+
+- The backend starts a separate `opencode serve` process for each user workspace that is needed.
+- OpenCode processes listen only on loopback and are not directly accessible from the browser.
+- SQLite stores users, dialog associations, templates, task definitions, the queue with run history, and the audit log.
+- OpenCode stores dialog content and performs the agent's work.
+- Consultations use the shared queue and Build mode; SQLite stores only questions and final answers for display, and the administrator configures the model.
+- The owner of a regular dialog and the administrator can see the full OpenCode runtime payload and reasoning; user access to a task is limited to its run status.
+- `cwd` and the permission policy do not provide a complete filesystem sandbox. Strict user isolation requires containers or separate system accounts.
+
+---
+
+## Русский
+
 Административный интерфейс для выполнения и маршрутизации LLM-агентов.
 V.A.L.E.R.I.A. предоставляет многопользовательский веб-интерфейс к OpenCode с
 назначаемыми рабочими папками, общей очередью заданий, режимами Build/Plan,
 шаблонами, задачами, Markdown-ответами и административной панелью.
 
-## Требования
+### Требования
 
 - Python 3.12+;
 - установленный `/usr/bin/opencode`;
 - доступ к настроенному в OpenCode LLM-провайдеру.
 
-## Локальный запуск
+### Локальный запуск
 
 ```bash
 python3.12 -m venv .venv
@@ -46,7 +339,7 @@ OpenCode/MCP/LSP](docs/server-process-lifecycle.md). Его нужно уста�
 использованием обновлённого `run-local.sh`; порядок переноса и отката описан
 в документе.
 
-## Таски
+### Таски
 
 В разделе «Настройка тасок» администратор создаёт таску: задаёт название и описание для пользователей, скрытый промпт, режим OpenCode, выбирает конкретную модель из того же списка доступных моделей, что и в чате, и, при необходимости, указывает вариант модели. Пока список моделей загружается или недоступен, сохранение заблокировано; список можно загрузить повторно без потери введённых данных. Если ранее выбранная модель больше недоступна, для сохранения нужно выбрать доступную модель. Опубликованные таски появляются в разделе «Таски»; черновики видны только администратору. Изменение или удаление определения не меняет параметры уже созданных запусков и сохраняет их историю.
 
@@ -76,7 +369,7 @@ OpenCode/MCP/LSP](docs/server-process-lifecycle.md). Его нужно уста�
 диалоги, получает результаты и отвечает на уточняющие вопросы. Бот запускается
 отдельным процессом; инструкция и пример конфигурации находятся в каталоге интеграции.
 
-## Статистика
+### Статистика
 
 Вкладка «Статистика» доступна администратору и показывает успешные запуски тасок всех
 пользователей: количество за выбранный день и за всё время, а также два средних времени
@@ -92,7 +385,7 @@ OpenCode/MCP/LSP](docs/server-process-lifecycle.md). Его нужно уста�
 API: `GET /api/admin/statistics?day=2026-10-04&timezone=UTC`.
 Параметры необязательны: по умолчанию используются текущий день и `UTC`.
 
-## Запуск в Docker
+### Запуск в Docker
 
 Комплект запускает контейнер OpenCode Web вместе с OpenCode CLI, Conan и локальными
 MCP-серверами. Сервис подключён к bridge-сети `opencode` с разрешённым исходящим
@@ -129,7 +422,7 @@ ssh user@server 'cd /opt/opencode-web && docker compose up --build -d'
 
 Для Git-операций по SSH поместите ключ и `known_hosts` в `.secrets/ssh`. Приватный SSH-ключ не копируется автоматически.
 
-### Автоматическая GPG-подпись коммитов в Docker
+#### Автоматическая GPG-подпись коммитов в Docker
 
 Контейнер поддерживает OpenPGP/GPG-подпись всех Git-коммитов и тегов. На новом сервере сначала создайте отдельный ключ с email, подтверждённым в GitLab:
 
@@ -190,7 +483,7 @@ data/
 └── gnupg/
 ```
 
-## Разработка
+### Разработка
 
 ```bash
 .venv/bin/ruff check src tests
@@ -203,7 +496,7 @@ data/
 - [консультационный интерфейс и его настройка](docs/consultations.md);
 - [дизайн-промты](docs/design-prompts.md).
 
-## Лицензирование
+### Лицензирование
 
 V.A.L.E.R.I.A. распространяется по трёхуровневой модели source-available:
 
@@ -234,7 +527,7 @@ OSI-approved open-source лицензией. Сторонние компонен
 Юридические документы должны пройти профессиональную проверку до публикации или
 использования в сделках.
 
-## Границы текущего MVP
+### Границы текущего MVP
 
 - backend запускает отдельный `opencode serve` для каждой востребованной пользовательской папки;
 - процессы OpenCode слушают только loopback и недоступны браузеру напрямую;
