@@ -4,6 +4,7 @@ import {questionPanel} from "./questions.js?v=1";
 export function consultationUI({api, shell, bindShell, state, app, esc, notify, navigate}) {
   let current = null;
   let currentMessages = [];
+  const messageRows = new Map();
   let loading = false;
   let revision = 0;
   let questions = null;
@@ -15,8 +16,58 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
     : ({idle: "", queued: "В очереди", dispatching: "Подготовка окружения", running: "Готовится ответ", waiting_permission: "Готовится ответ", completed: "Ответ готов", failed: "Не удалось подготовить ответ. Попробуйте отправить вопрос ещё раз.", cancelled: "Запрос отменён", cancelling: "Запрос останавливается"})[value] || "";
   const prefix = admin => admin ? "/api/admin/consultations" : "/api/consultations";
   const listRows = (items, admin) => items.length ? items.map(item => `<button class="consultation-row" data-consultation="${esc(item.id)}"><strong>${esc(item.title)}</strong><span class="meta">${admin ? `${esc(item.owner_login)} · ` : ""}${esc(new Date(item.updated_at).toLocaleString())}</span><span class="meta">${esc(status(item.status))}</span></button>`).join("") : `<div class="empty">Диалогов пока нет</div>`;
-  const messagesHTML = messages => messages.map((message, index) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-text ${message.role === "assistant" ? "markdown-body" : ""}">${message.role === "assistant" ? renderMarkdown(message.text) : esc(message.text)}</div>${message.role === "assistant" ? `<div class="message-actions"><button class="message-copy" type="button" data-copy-message="${index}" aria-label="Копировать ответ агента">Копировать</button></div>` : message.status !== "completed" ? `<div class="meta" role="status">${esc(status(message.status))}</div>` : ""}</article>`).join("");
+  const messageKey = (message, index) => `${message.role}:${message.id ?? index}`;
+  const messageTextHTML = message => message.role === "assistant" ? renderMarkdown(message.text) : esc(message.text);
+  const messageStatusHTML = message => message.status !== "completed" ? `<div class="meta" role="status">${esc(status(message.status))}</div>` : "";
+  const messageHTML = (message, index) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-text ${message.role === "assistant" ? "markdown-body" : ""}">${messageTextHTML(message)}</div>${message.role === "assistant" ? `<div class="message-actions"><button class="message-copy" type="button" data-copy-message="${index}" aria-label="Копировать ответ агента">Копировать</button></div>` : messageStatusHTML(message)}</article>`;
   const jobsHTML = jobs => (jobs || []).map(job => `<tr><td class="mono">${esc(job.id)}</td><td>${esc(job.queue || "Основная")}</td><td>${esc(job.model)}</td><td>${esc(job.agent)}</td><td>${esc(status(job.status))}</td></tr>`).join("");
+
+  function updateMessages(target, messages) {
+    const keys = new Set(messages.map(messageKey));
+    let changed = false;
+    for (const [key, row] of messageRows) {
+      if (!keys.has(key)) {
+        row.element.remove();
+        messageRows.delete(key);
+        changed = true;
+      }
+    }
+    messages.forEach((message, index) => {
+      const key = messageKey(message, index);
+      let row = messageRows.get(key);
+      if (!row) {
+        const template = document.createElement("template");
+        template.innerHTML = messageHTML(message, index);
+        row = {element: template.content.firstElementChild, text: message.text, status: message.status};
+        messageRows.set(key, row);
+      } else {
+        // Compare source data; the browser normalizes HTML entities when parsing.
+        if (row.text !== message.text) {
+          row.element.querySelector(".message-text").innerHTML = messageTextHTML(message);
+          row.text = message.text;
+          changed = true;
+        }
+        if (message.role === "user" && row.status !== message.status) {
+          const meta = row.element.querySelector('[role="status"]');
+          if (message.status === "completed") meta?.remove();
+          else if (meta) meta.textContent = status(message.status);
+          else row.element.insertAdjacentHTML("beforeend", messageStatusHTML(message));
+          row.status = message.status;
+          changed = true;
+        }
+      }
+      const button = row.element.querySelector("[data-copy-message]");
+      if (button) button.dataset.copyMessage = index;
+      // Moving an unchanged element also disrupts its text selection.
+      const position = target.children[index] || null;
+      if (position !== row.element) {
+        target.insertBefore(row.element, position);
+        changed = true;
+      }
+    });
+    currentMessages = messages;
+    return changed;
+  }
 
   async function copyText(value) {
     if (navigator.clipboard?.writeText) {
@@ -77,6 +128,7 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
     state.route = admin ? "admin-consultations" : "consultations";
     current = null;
     currentMessages = [];
+    messageRows.clear();
     questions = null;
     questionWaiting = false;
     const [items, config, options, users, queueItems] = await Promise.all([
@@ -134,14 +186,15 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
     const data = await api(`${prefix(admin)}/${encodeURIComponent(id)}`);
     if (version !== revision || current !== id || !state.route.endsWith("consultation")) return;
     currentStatus = data.status;
-    currentMessages = data.messages;
     const composer = admin ? `<p class="hint">Просмотр диалога пользователя ${esc(data.owner_login)}</p>` : `<div id="consultation-questions"></div><form id="consultation-send" class="composer"><textarea class="input" name="message" rows="3" maxlength="100000" required aria-label="Сообщение" placeholder="Продолжить диалог"></textarea><button class="btn btn-primary">Отправить</button></form>`;
-    app.innerHTML = shell(`<div class="page consultation-page"><div class="toolbar"><button class="btn" id="consultation-back">← Все диалоги</button><span id="consultation-status" role="status">${esc(status(data.status))}</span></div><section class="card consultation-conversation"><div class="messages" id="consultation-messages">${messagesHTML(data.messages)}</div>${composer}</section>${admin ? `<section class="card"><h3>Задания консультации</h3><div class="table-wrap"><table><thead><tr><th>Задание</th><th>Очередь</th><th>Модель</th><th>Режим</th><th>Статус</th></tr></thead><tbody id="consultation-jobs">${jobsHTML(data.jobs)}</tbody></table></div></section>` : ""}</div>`, data.title);
+    app.innerHTML = shell(`<div class="page consultation-page"><div class="toolbar"><button class="btn" id="consultation-back">← Все диалоги</button><span id="consultation-status" role="status">${esc(status(data.status))}</span></div><section class="card consultation-conversation"><div class="messages" id="consultation-messages"></div>${composer}</section>${admin ? `<section class="card"><h3>Задания консультации</h3><div class="table-wrap"><table><thead><tr><th>Задание</th><th>Очередь</th><th>Модель</th><th>Режим</th><th>Статус</th></tr></thead><tbody id="consultation-jobs">${jobsHTML(data.jobs)}</tbody></table></div></section>` : ""}</div>`, data.title);
     bindShell();
     app.querySelector("#consultation-back").addEventListener("click", () => {
       void navigate(admin ? "/admin-consultations" : "/consultations").catch(error => notify(error.message));
     });
     const messages = app.querySelector("#consultation-messages");
+    messageRows.clear();
+    updateMessages(messages, data.messages);
     bindMessageCopy(messages);
     messages.scrollTop = messages.scrollHeight;
     if (!admin) {
@@ -149,9 +202,11 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
         fetchQuestions: () => api(`/api/consultations/${encodeURIComponent(id)}/questions`),
         reply: (questionId, answers) => api(`/api/consultations/${encodeURIComponent(id)}/questions/${encodeURIComponent(questionId)}/reply`, {method: "POST", body: JSON.stringify({answers})}),
         onWaiting: waiting => {
+          if (version !== revision || current !== id || state.route !== "consultation") return;
+          const answered = questionWaiting && !waiting;
           questionWaiting = waiting;
           updateComposer();
-          if (!waiting) void refresh().catch(error => notify(error.message));
+          if (answered) void refresh().catch(error => notify(error.message));
         },
       });
       updateComposer();
@@ -187,10 +242,10 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
         const target = app.querySelector("#consultation-messages");
         if (!target) return;
         const bottom = target.scrollHeight - target.scrollTop - target.clientHeight < 96;
-        currentMessages = data.messages;
-        const html = messagesHTML(data.messages);
-        if (target.innerHTML !== html) target.innerHTML = html;
-        if (bottom) target.scrollTop = target.scrollHeight;
+        const changed = updateMessages(target, data.messages);
+        const selection = window.getSelection();
+        const selecting = selection && !selection.isCollapsed && (target.contains(selection.anchorNode) || target.contains(selection.focusNode));
+        if (changed && bottom && !selecting) target.scrollTop = target.scrollHeight;
         currentStatus = data.status;
         app.querySelector("#consultation-status").textContent = status(data.status);
         updateComposer();

@@ -1,4 +1,4 @@
-import {consultationUI} from "./consultations.js?v=6";
+import {consultationUI} from "./consultations.js?v=7";
 import {questionPanel} from "./questions.js?v=1";
 import {renderMarkdown} from "./markdown.js?v=1";
 
