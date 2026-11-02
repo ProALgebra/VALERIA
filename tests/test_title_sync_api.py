@@ -25,12 +25,12 @@ class TitleManager:
         self.ensure_calls = 0
 
     @asynccontextmanager
-    async def use(self, workspace, *, wake=True, activity=True):
+    async def use(self, workspace, *, wake=True, activity=True, expected_mode=None):
         assert wake is False
         assert activity is False
         yield self.client
 
-    async def ensure(self, workspace: str) -> TitleClient:
+    async def ensure(self, workspace: str, *, expected_mode=None) -> TitleClient:
         self.ensure_calls += 1
         return self.client
 

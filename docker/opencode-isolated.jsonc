@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "plugin": [],
+  "mcp": {
+    "memory": {
+      "type": "local",
+      "command": [
+        "/opt/valeria/mcp/mcp-memory-server/venv/bin/python",
+        "/opt/valeria/mcp/mcp-memory-server/server.py"
+      ],
+      "environment": {
+        "MCP_MEMORY_DB_PATH": "/home/agent/.mcp-memory/memory.db",
+        "MCP_MEMORY_HYBRID": "false"
+      },
+      "enabled": true
+    },
+    "gitlab": {
+      "type": "local",
+      "command": [
+        "/opt/valeria/mcp/mcp-gitlab-readonly/venv/bin/python",
+        "/opt/valeria/mcp/mcp-gitlab-readonly/server.py"
+      ],
+      "environment": {
+        "GITLAB_URL": "{env:GITLAB_URL}",
+        "GITLAB_TOKEN": "{env:GITLAB_TOKEN}",
+        "GITLAB_REPOSITORY_ROOTS": ".",
+        "GITLAB_CLONE_ROOT": ".",
+        "GITLAB_ALLOW_ABSOLUTE_PATHS": "false",
+        "GITLAB_TRACE_OUTPUT_DIR": "/home/agent/gitlab-traces"
+      },
+      "enabled": false
+    },
+    "vision": {
+      "type": "local",
+      "command": [
+        "/opt/valeria/mcp/mcp-vision-server/venv/bin/python",
+        "/opt/valeria/mcp/mcp-vision-server/server.py"
+      ],
+      "environment": {
+        "VISION_BASE_URL": "{env:VISION_BASE_URL}",
+        "VISION_MODEL": "{env:VISION_MODEL}",
+        "VISION_API_KEY": "{env:VISION_API_KEY}",
+        "VISION_ALLOWED_ROOTS": "."
+      },
+      "enabled": false
+    }
+  }
+}

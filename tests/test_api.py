@@ -78,10 +78,10 @@ class FakeManager:
         self.ensure_calls = 0
 
     @asynccontextmanager
-    async def use(self, workspace, *, wake=True, activity=True):
+    async def use(self, workspace, *, wake=True, activity=True, expected_mode=None):
         yield self.client
 
-    async def ensure(self, workspace: str) -> FakeOpenCodeClient:
+    async def ensure(self, workspace: str, *, expected_mode=None) -> FakeOpenCodeClient:
         self.ensure_calls += 1
         self.workspace = Path(workspace)
         return self.client

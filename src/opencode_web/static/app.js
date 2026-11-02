@@ -1,4 +1,4 @@
-import {consultationUI} from "./consultations.js?v=6";
+import {consultationUI} from "./consultations.js?v=8";
 import {questionPanel} from "./questions.js?v=1";
 import {renderMarkdown} from "./markdown.js?v=1";
 
@@ -13,6 +13,8 @@ const state = {
   selectedTemplate: null,
   draftTemplate: null,
   options: null,
+  optionsRequest: 0,
+  taskOptionsRequest: 0,
   adminContext: false,
   eventSource: null,
   refreshTimer: null,
@@ -34,6 +36,8 @@ const state = {
   stoppingJobs: new Set(),
   statisticsDay: null,
   statisticsRequest: 0,
+  queueRequest: 0,
+  queueModeUI: null,
 };
 
 const TITLE_SYNC_INTERVAL_MS = 5000;
@@ -328,13 +332,14 @@ async function hydrateChatTitles(path, isCurrentView, patchTitles = patchChatTit
 }
 
 async function hydrateDialogOptions() {
+  const request = ++state.optionsRequest;
   const modelSelect = document.querySelector("#new-chat-model");
   const agentSelect = document.querySelector("#new-chat-agent");
   const status = document.querySelector("#model-load-status");
   if (!modelSelect || !agentSelect || !status) return;
   try {
     const options = await api("/api/options");
-    if (state.route !== "dialogs" || !modelSelect.isConnected) return;
+    if (state.route !== "dialogs" || !modelSelect.isConnected || request !== state.optionsRequest) return;
     state.options = options;
     const models = flattenModels(options.models);
     agentSelect.innerHTML = options.agents.map(a => `<option value="${esc(a)}" ${a === options.default_agent ? "selected" : ""}>${esc(a[0].toUpperCase() + a.slice(1))}</option>`).join("");
@@ -345,7 +350,7 @@ async function hydrateDialogOptions() {
       ? "OpenCode сейчас недоступен; будет использована модель по умолчанию."
       : `Доступно моделей: ${models.length} · провайдеров: ${providers.size}`;
   } catch (err) {
-    if (modelSelect.isConnected) {
+    if (modelSelect.isConnected && request === state.optionsRequest) {
       modelSelect.innerHTML = `<option value="">Модель OpenCode по умолчанию</option>`;
       modelSelect.disabled = false;
       status.textContent = `Не удалось загрузить модели: ${err.message}`;
@@ -476,6 +481,26 @@ function updateChatStatus() {
   if (badge) badge.hidden = !waiting;
 }
 
+function updateChatMode(chat) {
+  const composer = document.querySelector("#composer");
+  if (!composer) return;
+  if (chat.archived_reason === "execution_mode_changed") {
+    composer.dataset.modeArchived = "true";
+    if (!composer.querySelector("#chat-mode-hint")) {
+      const hint = document.createElement("p");
+      hint.id = "chat-mode-hint";
+      hint.className = "hint";
+      hint.textContent = "Диалог создан в другом режиме работы. Для продолжения нужен исходный режим.";
+      composer.prepend(hint);
+    }
+    composer.querySelectorAll("input, textarea, select, button").forEach(control => { control.disabled = true; });
+  } else if (composer.dataset.modeArchived) {
+    delete composer.dataset.modeArchived;
+    composer.querySelector("#chat-mode-hint")?.remove();
+    composer.querySelectorAll("input, textarea, select, button").forEach(control => { control.disabled = false; });
+  }
+}
+
 async function refreshChatLive(chatId) {
   if (state.route !== "chat" || state.selectedChat?.id !== chatId) return;
   try {
@@ -486,6 +511,7 @@ async function refreshChatLive(chatId) {
     ]);
     if (state.route !== "chat" || state.selectedChat?.id !== chatId) return;
     state.selectedChat = chat;
+    updateChatMode(chat);
     const messagesTarget = document.querySelector("#message-list");
     const permissionsTarget = document.querySelector("#permission-list");
     const followLatestMessage = messagesTarget ? isNearMessageBottom(messagesTarget) : true;
@@ -526,6 +552,7 @@ async function renderChat(chatId, adminContext = false) {
     <form class="composer" id="composer"><div class="selectors"><select class="input" name="agent">${options.agents.map(a => `<option value="${esc(a)}" ${a === selectedAgent ? "selected" : ""}>${esc(a)}</option>`).join("")}</select><select class="input" name="model">${modelOptions(models, selectedModel)}</select><span class="badge amber" id="question-waiting" hidden>Ожидает вашего ответа</span><span id="latest-job-status">${latest ? jobBadge(latest.status) : ""}</span></div><div class="composer-row"><textarea class="input" name="message" placeholder="${adminContext ? "Сообщение от имени пользователя..." : "Сообщение агенту..."}" required></textarea><button class="btn btn-primary" type="submit">➤</button></div></form>
   </section><aside class="chat-side"><section><h3>Состояние</h3><span class="badge" id="chat-status">${esc(chatStatusText(chat.status))}</span></section><section><h3>Рабочая папка</h3><div class="mono meta">${esc(chat.workspace_snapshot)}</div></section><section><h3>Очередь этого диалога</h3><div>${jobs.length}</div></section><section><h3>Подключённые MCP</h3><div id="chat-mcp"><span class="hint">Загрузка…</span></div></section><section><h3>Поток событий OpenCode</h3><div id="event-log" class="event-log">${renderEventLog()}</div></section></aside></div>`;
   app.innerHTML = shell(content, chat.title); bindShell();
+  updateChatMode(chat);
   bindMessageScroller();
   scrollMessagesToBottom("auto");
   bindPermissionActions(chatId);
@@ -551,7 +578,7 @@ async function renderChat(chatId, adminContext = false) {
     const endpoint = adminContext ? `/api/admin/chats/${chatId}/messages` : `/api/chats/${chatId}/messages`;
     try { await api(endpoint, {method:"POST", body:JSON.stringify(values)}); form.reset(); notify("Сообщение поставлено в очередь"); await refreshChatLive(chatId); }
     catch (err) { notify(err.message); }
-    finally { button.disabled = false; }
+    finally { button.disabled = false; updateChatMode(state.selectedChat || chat); }
   });
 }
 
@@ -820,6 +847,7 @@ function updateTaskSaveState(form) {
 }
 
 async function hydrateTaskOptions() {
+  const request = ++state.taskOptionsRequest;
   const target = document.querySelector("#task-model-field");
   const hint = document.querySelector("#task-model-hint");
   const retry = document.querySelector("#retry-task-models");
@@ -833,7 +861,7 @@ async function hydrateTaskOptions() {
   updateTaskSaveState(form);
   try {
     const options = await api("/api/options");
-    if (state.route !== "admin-tasks" || !target.isConnected) return;
+    if (state.route !== "admin-tasks" || !target.isConnected || request !== state.taskOptionsRequest) return;
     state.options = options;
     const models = options.opencode_unavailable ? [] : flattenModels(options.models);
     current.innerHTML = taskModelOptions(models, current.value);
@@ -845,12 +873,12 @@ async function hydrateTaskOptions() {
         ? "Выберите фиксированную модель для всех запусков таски."
         : "Нет доступных моделей. Проверьте подключение провайдера OpenCode и обновите список.";
   } catch (_) {
-    if (hint.isConnected) {
+    if (hint.isConnected && request === state.taskOptionsRequest) {
       current.innerHTML = taskModelOptions([], current.value);
       hint.textContent = "Не удалось загрузить модели OpenCode. Повторите загрузку списка.";
     }
   } finally {
-    if (form.isConnected) {
+    if (form.isConnected && request === state.taskOptionsRequest) {
       retry.disabled = false;
       updateTaskSaveState(form);
     }
@@ -1247,14 +1275,118 @@ function queueJobAction(job) {
   return `<button class="btn btn-danger" type="button" data-stop-job="${esc(job.id)}">${job.status === "queued" ? "Отменить" : "Остановить"}</button>`;
 }
 
-async function renderQueue() {
-  const queue = await api("/api/admin/queue");
-  const queues = queue.queues || [{id: "default", name: "Основная", priority: 0, max_workers: queue.hard_limit, status: "active", is_system: 1, active: queue.active, queued: queue.queued}];
-  const activeQueues = queues.filter(item => item.status === "active");
-  const rows = queue.jobs.map(job => `<tr><td>${job.sequence}</td><td>${esc(job.queue_name || "Основная")}</td><td><strong>${esc(job.effective_login)}</strong>${job.actor_login !== job.effective_login ? `<div class="badge amber">Отправил ${esc(job.actor_login)}</div>` : ""}</td><td>${job.task_id ? `<span class="badge">Таска</span> <span data-task-run-title="${esc(job.id)}">${esc(queuedTaskTitle(job))}</span>` : `${job.consultation ? `<span class="badge">Консультация</span> ` : ""}${esc(job.chat_title)}`}</td><td>${esc((job.content || "").slice(0, 90))}</td><td>${esc(job.agent)}</td><td>${esc(job.model_id || "default")}</td><td>${jobBadge(job.status)}</td><td>${queueJobAction(job)}</td></tr>`).join("");
-  const queueRows = queues.map(item => `<form class="toolbar queue-settings-row" data-queue-form="${esc(item.id)}"><input class="input" name="name" maxlength="120" value="${esc(item.name)}" ${item.status === "archived" ? "disabled" : ""} required><label>Приоритет <input class="input" name="priority" type="number" min="-1000000" max="1000000" value="${item.priority}" ${item.status === "archived" ? "disabled" : ""}></label><label>Воркеры <input class="input" name="max_workers" type="number" min="1" max="${queue.hard_limit}" value="${item.max_workers || queue.hard_limit}" ${item.status === "archived" ? "disabled" : ""}></label><span class="badge ${item.status === "active" ? "green" : "amber"}">${item.active || 0} активных · ${item.queued || 0} ожидают${item.status === "archived" ? " · архив" : ""}</span>${item.status === "active" ? `<button class="btn" type="submit">Сохранить</button>${item.is_system ? "" : `<button class="btn btn-danger" type="button" data-archive-queue="${esc(item.id)}">Архивировать</button>`}` : ""}</form>`).join("");
-  const defaultOptions = activeQueues.map(item => `<option value="${esc(item.id)}" ${item.id === (queue.default_chat_queue_id || "default") ? "selected" : ""}>${esc(item.name)}</option>`).join("");
-  app.innerHTML = shell(`<div class="page"><div class="stats"><div class="stat"><span>Активные сессии</span><strong>${queue.active} из ${queue.limit}</strong></div><div class="stat"><span>В очереди</span><strong>${queue.queued}</strong></div><div class="stat"><span>Лимит ENV</span><strong>${queue.env_limit}</strong></div></div><form class="toolbar" id="limit-form"><label>Общий лимит активных сессий</label><input class="input" type="number" name="value" min="1" max="${queue.hard_limit}" value="${queue.limit}"><button class="btn btn-primary">Применить</button><button class="btn" type="button" id="reset-limit">Сбросить к ENV</button></form><section class="card"><h3>Очереди</h3><p class="hint">Сначала заполняется очередь с наибольшим приоритетом. Лимит очереди не отменяет общий лимит и лимиты пользователей.</p><div class="queue-settings">${queueRows}</div><form class="toolbar" id="new-queue-form"><input class="input" name="name" maxlength="120" placeholder="Название очереди" required><label>Приоритет <input class="input" name="priority" type="number" min="-1000000" max="1000000" value="0"></label><label>Воркеры <input class="input" name="max_workers" type="number" min="1" max="${queue.hard_limit}" value="1"></label><button class="btn btn-primary">Добавить очередь</button></form><form class="toolbar" id="default-chat-queue-form"><label>Очередь обычных диалогов</label><select class="input" name="queue_id" required>${defaultOptions}</select><button class="btn">Сохранить</button></form></section><section class="card"><h3>Подключённые MCP по активным экземплярам OpenCode</h3><div id="admin-mcp"><span class="hint">Загрузка…</span></div></section><div class="table-wrap"><table><thead><tr><th>№</th><th>Очередь</th><th>Пользователь</th><th>Диалог / таска</th><th>Сообщение</th><th>Режим</th><th>Модель</th><th>Статус</th><th>Действия</th></tr></thead><tbody>${rows}</tbody></table></div></div>`, "Админка · Очереди"); bindShell();
+function executionModeUI(target) {
+  const labels = {direct: "Без изоляции", podman: "С изоляцией"};
+  target.innerHTML = `<form id="execution-mode-form" aria-describedby="execution-mode-description execution-mode-availability execution-mode-busy">
+    <p id="execution-mode-current" role="status">Загружаем режим работы…</p>
+    <fieldset class="execution-mode-options" disabled><legend>Выберите режим работы</legend>
+      <label><input type="radio" name="mode" value="direct"> Без изоляции</label>
+      <label><input type="radio" name="mode" value="podman"> С изоляцией</label>
+    </fieldset>
+    <p id="execution-mode-availability" class="error" role="status"></p>
+    <p id="execution-mode-busy" class="hint"></p>
+    <p id="execution-mode-error" class="error" role="alert"></p>
+    <div class="actions"><button class="btn btn-primary" type="submit" disabled>Сохранить режим</button><button class="btn" type="button" id="execution-mode-retry" hidden>Повторить проверку</button></div>
+  </form>`;
+  const form = target.querySelector("form");
+  const fields = form.querySelector("fieldset");
+  const current = form.querySelector("#execution-mode-current");
+  const availability = form.querySelector("#execution-mode-availability");
+  const busy = form.querySelector("#execution-mode-busy");
+  const error = form.querySelector("#execution-mode-error");
+  const save = form.querySelector("button[type=submit]");
+  const retry = form.querySelector("#execution-mode-retry");
+  let settings = null;
+  let loading = false;
+  let saving = false;
+  let refreshAgain = false;
+
+  function update() {
+    if (!target.isConnected) return;
+    const canChange = settings?.can_change === true;
+    fields.disabled = !settings || !canChange || saving;
+    form.querySelector('[value="podman"]').disabled = settings?.availability?.available !== true;
+    save.disabled = loading || saving || !canChange || form.elements.mode.value === settings?.mode
+      || (form.elements.mode.value === "podman" && settings?.availability?.available !== true);
+    save.textContent = saving ? "Сохраняем…" : "Сохранить режим";
+    retry.hidden = (!error.textContent && settings?.availability?.available !== false) || loading || saving;
+    current.textContent = settings ? `Активный режим: ${labels[settings.mode]}`
+      : loading ? "Загружаем режим работы…" : "Режим работы не загружен";
+    availability.textContent = settings && settings.availability?.available !== true
+      ? `Режим «С изоляцией» недоступен. ${settings.availability?.reason || "Не удалось проверить готовность окружения."}` : "";
+    busy.textContent = settings && !canChange
+      ? "Чтобы изменить режим, дождитесь завершения или отмените все незавершённые задания." : "";
+  }
+
+  function applySettings(value, resetSelection = false) {
+    if (!value || !Object.hasOwn(labels, value.mode)) throw new Error("Не удалось получить режим работы");
+    const selectActual = resetSelection || !settings || settings.mode !== value.mode;
+    settings = value;
+    if (selectActual) form.querySelectorAll('[name="mode"]').forEach(input => {
+      input.checked = input.value === settings.mode;
+    });
+    update();
+  }
+
+  async function refresh() {
+    if (!target.isConnected) return;
+    if (loading || saving) { refreshAgain = true; return; }
+    refreshAgain = false;
+    loading = true;
+    update();
+    try {
+      const value = await api("/api/admin/settings/execution-mode");
+      if (!target.isConnected) return;
+      applySettings(value);
+      error.textContent = "";
+    } catch (err) {
+      if (target.isConnected) error.textContent = err.message;
+    } finally {
+      loading = false;
+      update();
+      if (refreshAgain) void refresh();
+    }
+  }
+
+  form.addEventListener("change", () => { error.textContent = ""; update(); });
+  retry.addEventListener("click", () => { void refresh(); });
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (save.disabled) return;
+    const mode = form.elements.mode.value;
+    saving = true;
+    error.textContent = "";
+    update();
+    try {
+      const value = await api("/api/admin/settings/execution-mode", {method: "PUT", body: JSON.stringify({mode})});
+      if (!target.isConnected) return;
+      applySettings(value, true);
+      notify("Режим работы сохранён");
+    } catch (err) {
+      if (!target.isConnected) return;
+      error.textContent = err.message;
+      // Reconcile another administrator's change or a failed availability check.
+      applySettings(settings, true);
+      try {
+        const actual = await api("/api/admin/settings/execution-mode");
+        if (target.isConnected) applySettings(actual, true);
+      } catch (_) { /* Keep the last confirmed mode if reconciliation fails. */ }
+      if (target.isConnected) error.textContent = err.message;
+    } finally {
+      saving = false;
+      update();
+      if (refreshAgain) void refresh();
+    }
+  });
+  void refresh();
+  return {refresh};
+}
+
+function queueJobRows(queue) {
+  return queue.jobs.map(job => `<tr><td>${job.sequence}</td><td>${esc(job.queue_name || "Основная")}</td><td><strong>${esc(job.effective_login)}</strong>${job.actor_login !== job.effective_login ? `<div class="badge amber">Отправил ${esc(job.actor_login)}</div>` : ""}</td><td>${job.task_id ? `<span class="badge">Таска</span> <span data-task-run-title="${esc(job.id)}">${esc(queuedTaskTitle(job))}</span>` : `${job.consultation ? `<span class="badge">Консультация</span> ` : ""}${esc(job.chat_title)}`}</td><td>${esc((job.content || "").slice(0, 90))}</td><td>${esc(job.agent)}</td><td>${esc(job.model_id || "default")}</td><td>${jobBadge(job.status)}</td><td>${queueJobAction(job)}</td></tr>`).join("");
+}
+
+function bindQueueStopActions(queue) {
   document.querySelectorAll("[data-stop-job]").forEach(button => button.addEventListener("click", async () => {
     const job = queue.jobs.find(item => item.id === button.dataset.stopJob);
     if (!job || state.stoppingJobs.has(job.id)) return;
@@ -1272,10 +1404,42 @@ async function renderQueue() {
     } finally {
       state.stoppingJobs.delete(job.id);
       if (state.route === "queue") {
-        try { await renderQueue(); } catch (err) { button.disabled = false; button.textContent = action; notify(err.message); }
+        try { await refreshQueueLive(); } catch (err) { button.disabled = false; button.textContent = action; notify(err.message); }
       }
     }
   }));
+}
+
+async function refreshQueueLive() {
+  const target = document.querySelector("#queue-jobs");
+  if (state.route !== "queue" || !target) return;
+  const request = ++state.queueRequest;
+  const queue = await api("/api/admin/queue");
+  if (state.route !== "queue" || !target.isConnected || request !== state.queueRequest) return;
+  target.innerHTML = queueJobRows(queue);
+  document.querySelector("#queue-active").textContent = `${queue.active} из ${queue.limit}`;
+  document.querySelector("#queue-waiting").textContent = queue.queued;
+  document.querySelectorAll("[data-queue-count]").forEach(badge => {
+    const item = queue.queues?.find(item => item.id === badge.dataset.queueCount);
+    if (item) badge.textContent = `${item.active || 0} активных · ${item.queued || 0} ожидают${item.status === "archived" ? " · архив" : ""}`;
+  });
+  bindQueueStopActions(queue);
+  void state.queueModeUI?.refresh();
+  void hydrateTaskTitles();
+}
+
+async function renderQueue() {
+  const request = ++state.queueRequest;
+  const queue = await api("/api/admin/queue");
+  if (state.route !== "queue" || request !== state.queueRequest) return;
+  const queues = queue.queues || [{id: "default", name: "Основная", priority: 0, max_workers: queue.hard_limit, status: "active", is_system: 1, active: queue.active, queued: queue.queued}];
+  const activeQueues = queues.filter(item => item.status === "active");
+  const rows = queueJobRows(queue);
+  const queueRows = queues.map(item => `<form class="toolbar queue-settings-row" data-queue-form="${esc(item.id)}"><input class="input" name="name" maxlength="120" value="${esc(item.name)}" ${item.status === "archived" ? "disabled" : ""} required><label>Приоритет <input class="input" name="priority" type="number" min="-1000000" max="1000000" value="${item.priority}" ${item.status === "archived" ? "disabled" : ""}></label><label>Воркеры <input class="input" name="max_workers" type="number" min="1" max="${queue.hard_limit}" value="${item.max_workers || queue.hard_limit}" ${item.status === "archived" ? "disabled" : ""}></label><span data-queue-count="${esc(item.id)}" class="badge ${item.status === "active" ? "green" : "amber"}">${item.active || 0} активных · ${item.queued || 0} ожидают${item.status === "archived" ? " · архив" : ""}</span>${item.status === "active" ? `<button class="btn" type="submit">Сохранить</button>${item.is_system ? "" : `<button class="btn btn-danger" type="button" data-archive-queue="${esc(item.id)}">Архивировать</button>`}` : ""}</form>`).join("");
+  const defaultOptions = activeQueues.map(item => `<option value="${esc(item.id)}" ${item.id === (queue.default_chat_queue_id || "default") ? "selected" : ""}>${esc(item.name)}</option>`).join("");
+  app.innerHTML = shell(`<div class="page"><div class="stats"><div class="stat"><span>Активные сессии</span><strong id="queue-active">${queue.active} из ${queue.limit}</strong></div><div class="stat"><span>В очереди</span><strong id="queue-waiting">${queue.queued}</strong></div><div class="stat"><span>Лимит ENV</span><strong>${queue.env_limit}</strong></div></div><form class="toolbar" id="limit-form"><label>Общий лимит активных сессий</label><input class="input" type="number" name="value" min="1" max="${queue.hard_limit}" value="${queue.limit}"><button class="btn btn-primary">Применить</button><button class="btn" type="button" id="reset-limit">Сбросить к ENV</button></form><section class="card execution-mode-card"><h3>Режим работы</h3><p class="hint" id="execution-mode-description">Режим применяется ко всей системе. При переключении старые диалоги архивируются и остаются доступны для чтения. Истории двух режимов раздельные; возврат к исходному режиму позволяет продолжить его диалоги. Опубликованные задачи и результаты сохраняются. Изменить режим можно после завершения всех заданий.</p><div id="execution-mode-settings"></div></section><section class="card"><h3>Очереди</h3><p class="hint">Сначала заполняется очередь с наибольшим приоритетом. Лимит очереди не отменяет общий лимит и лимиты пользователей.</p><div class="queue-settings">${queueRows}</div><form class="toolbar" id="new-queue-form"><input class="input" name="name" maxlength="120" placeholder="Название очереди" required><label>Приоритет <input class="input" name="priority" type="number" min="-1000000" max="1000000" value="0"></label><label>Воркеры <input class="input" name="max_workers" type="number" min="1" max="${queue.hard_limit}" value="1"></label><button class="btn btn-primary">Добавить очередь</button></form><form class="toolbar" id="default-chat-queue-form"><label>Очередь обычных диалогов</label><select class="input" name="queue_id" required>${defaultOptions}</select><button class="btn">Сохранить</button></form></section><section class="card"><h3>Подключённые MCP по активным экземплярам OpenCode</h3><div id="admin-mcp"><span class="hint">Загрузка…</span></div></section><div class="table-wrap"><table><thead><tr><th>№</th><th>Очередь</th><th>Пользователь</th><th>Диалог / таска</th><th>Сообщение</th><th>Режим</th><th>Модель</th><th>Статус</th><th>Действия</th></tr></thead><tbody id="queue-jobs">${rows}</tbody></table></div></div>`, "Админка · Очереди"); bindShell();
+  bindQueueStopActions(queue);
+  state.queueModeUI = executionModeUI(document.querySelector("#execution-mode-settings"));
   hydrateAdminMcp();
   void hydrateTaskTitles();
   document.querySelector("#limit-form").addEventListener("submit", async event => { event.preventDefault(); const value = Number(new FormData(event.currentTarget).get("value")); try { await api("/api/admin/settings/concurrency", {method:"PATCH", body:JSON.stringify({value})}); await renderQueue(); } catch(err) { notify(err.message); } });
@@ -1359,6 +1523,16 @@ async function renderAudit() {
 }
 
 function scheduleLiveRefresh(event) {
+  if (event.type === "execution_mode.updated") {
+    state.options = null;
+    if (state.route === "chat" && state.selectedChat) void refreshChatLive(state.selectedChat.id);
+    if (state.route === "dialogs") void hydrateDialogOptions();
+    if (state.route === "admin-tasks") void hydrateTaskOptions();
+    if (state.route === "admin-consultations") void consultations.refreshModels();
+    void consultations.refresh().catch(err => notify(err.message));
+    if (state.route === "queue") void refreshQueueLive().catch(err => notify(err.message));
+    return;
+  }
   if (state.route === "statistics" && ["job.updated", "task.updated"].includes(event.type)) {
     clearTimeout(state.refreshTimer);
     state.refreshTimer = setTimeout(() => {
@@ -1369,7 +1543,7 @@ function scheduleLiveRefresh(event) {
     void consultations.refresh().catch(err => notify(err.message));
     if (state.route === "queue") {
       clearTimeout(state.refreshTimer);
-      state.refreshTimer = setTimeout(renderQueue, 250);
+      state.refreshTimer = setTimeout(() => { void refreshQueueLive().catch(err => notify(err.message)); }, 250);
     }
     return;
   }
@@ -1390,7 +1564,7 @@ function scheduleLiveRefresh(event) {
     if (state.route === "admin-user-tasks" && event.owner_user_id === state.adminTaskOwner) void refreshTaskRuns();
     if (state.route === "queue") {
       clearTimeout(state.refreshTimer);
-      state.refreshTimer = setTimeout(renderQueue, 250);
+      state.refreshTimer = setTimeout(() => { void refreshQueueLive().catch(err => notify(err.message)); }, 250);
     }
     return;
   }
@@ -1413,7 +1587,7 @@ function scheduleLiveRefresh(event) {
   }
   if (state.route === "queue" && event.type === "job.updated") {
     clearTimeout(state.refreshTimer);
-    state.refreshTimer = setTimeout(renderQueue, 250);
+    state.refreshTimer = setTimeout(() => { void refreshQueueLive().catch(err => notify(err.message)); }, 250);
   } else if (state.route === "dialogs" && event.type === "job.updated") {
     clearTimeout(state.refreshTimer);
     state.refreshTimer = setTimeout(renderDialogs, 250);

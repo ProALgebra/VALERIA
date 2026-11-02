@@ -65,10 +65,10 @@ class Manager:
         self.client = client
 
     @asynccontextmanager
-    async def use(self, workspace, *, wake=True, activity=True):
+    async def use(self, workspace, *, wake=True, activity=True, expected_mode=None):
         yield self.client
 
-    async def ensure(self, workspace):
+    async def ensure(self, workspace, *, expected_mode=None):
         return self.client
 
 

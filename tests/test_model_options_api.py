@@ -34,7 +34,7 @@ class CatalogManager:
         self.workspaces: list[str] = []
         self.fail = fail
 
-    async def ensure(self, workspace: str) -> CatalogClient:
+    async def ensure(self, workspace: str, *, expected_mode=None) -> CatalogClient:
         assert Path(workspace).is_dir()
         self.workspaces.append(workspace)
         if self.fail:
