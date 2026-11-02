@@ -11,7 +11,11 @@ import pytest
 from opencode_web.database import Database
 from opencode_web.dispatcher import QueueDispatcher
 from opencode_web.events import EventBroker
-from opencode_web.opencode_client import OpenCodeError, OpenCodeReadTimeout
+from opencode_web.opencode_client import (
+    OpenCodeError,
+    OpenCodeReadTimeout,
+    OpenCodeTransportError,
+)
 
 
 def question(request_id: str = "question-1", session_id: str = "session-task") -> dict[str, Any]:
@@ -420,9 +424,11 @@ async def test_restart_resumes_idle_pending_task_without_resending_prompt(
         assert len(client.replies) == 1
 
 
-async def test_poll_read_timeout_retries_with_capped_exponential_backoff(
+@pytest.mark.parametrize("error_type", [OpenCodeTransportError, OpenCodeReadTimeout])
+async def test_poll_transport_error_retries_indefinitely_with_three_hour_backoff_cap(
     runner: Any,
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OpenCodeTransportError],
 ) -> None:
     dispatcher, _, _ = runner
     delays: list[float] = []
@@ -434,47 +440,183 @@ async def test_poll_read_timeout_retries_with_capped_exponential_backoff(
     async def request() -> str:
         nonlocal attempts
         attempts += 1
-        if attempts <= 7:
-            raise OpenCodeReadTimeout("poll timeout")
+        if attempts <= 18:
+            raise error_type("poll disconnected")
         return "ready"
 
     monkeypatch.setattr("opencode_web.dispatcher.asyncio.sleep", record_sleep)
 
     assert await dispatcher._poll_opencode("job-task", "status", request) == "ready"
-    assert delays == [1, 2, 4, 8, 16, 30, 30]
+    assert delays == [
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+        10800, 10800, 10800, 10800,
+    ]
+    assert attempts == 19
 
 
-async def test_task_survives_read_timeout_from_every_monitor_poll(runner: Any) -> None:
+@pytest.mark.parametrize("recover", [False, True])
+@pytest.mark.parametrize("error_type", [OpenCodeTransportError, OpenCodeReadTimeout])
+async def test_task_survives_transport_error_from_every_monitor_and_recovery_read(
+    runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    recover: bool,
+    error_type: type[OpenCodeTransportError],
+) -> None:
     dispatcher, queue, client = runner
     client.message_list[-1]["parts"] = [{"type": "text", "text": "Final result"}]
-    client.status_read_timeouts = 1
-    client.question_read_timeouts = 1
-    client.permission_read_timeouts = 1
+    calls: dict[str, int] = {}
+    for operation in ("session_statuses", "questions", "permissions", "messages"):
+        original = getattr(client, operation)
+
+        async def fail_once(
+            *args: Any,
+            operation: str = operation,
+            original: Any = original,
+        ) -> Any:
+            calls[operation] = calls.get(operation, 0) + 1
+            if calls[operation] == 1:
+                raise error_type(f"{operation} disconnected")
+            return await original(*args)
+
+        monkeypatch.setattr(client, operation, fail_once)
+
+    if recover:
+        queue.job["status"] = "running"
+        await dispatcher.recover()
+    else:
+        await dispatcher._execute(dict(queue.job))
+
+    assert queue.job["status"] == "completed"
+    assert queue.job["error_code"] is None
+    assert queue.job["result"] == {"message_id": "assistant-final", "text": "Final result"}
+    assert calls == {
+        "session_statuses": 2 if recover else 4,
+        "questions": 2 if recover else 4,
+        "permissions": 2 if recover else 4,
+        "messages": 2,
+    }
+    assert len(client.prompts) == (0 if recover else 1)
+    assert client.aborted == []
+
+
+async def test_task_stays_running_through_repeated_transport_failures(
+    runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher, queue, client = runner
+    attempts = 0
+    delays: list[float] = []
+
+    async def disconnected_statuses() -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 18:
+            raise OpenCodeTransportError("server disconnected")
+        return {}
+
+    async def observe_retry(delay: float) -> None:
+        delays.append(delay)
+        assert queue.job["status"] == "running"
+        assert queue.job["error_code"] is None
+        assert len(client.prompts) == 1
+        assert client.aborted == []
+
+    monkeypatch.setattr(client, "session_statuses", disconnected_statuses)
+    monkeypatch.setattr("opencode_web.dispatcher.asyncio.sleep", observe_retry)
 
     await dispatcher._execute(dict(queue.job))
 
     assert queue.job["status"] == "completed"
     assert queue.job["error_code"] is None
-    assert client.status_calls == 4
-    assert client.question_calls == 4
-    assert client.permission_calls == 4
+    assert delays.count(10800) == 4
+    assert client.aborted == []
 
 
-async def test_recovery_survives_read_timeout_from_every_service_poll(runner: Any) -> None:
+async def test_stopping_during_transport_retry_cancels_without_sleeping(
+    runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher, _, _ = runner
+
+    async def disconnected_request() -> None:
+        dispatcher._stopping = True
+        raise OpenCodeTransportError("server disconnected")
+
+    async def unexpected_sleep(delay: float) -> None:
+        pytest.fail("A stopping dispatcher must not wait for transport backoff")
+
+    monkeypatch.setattr("opencode_web.dispatcher.asyncio.sleep", unexpected_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await dispatcher._poll_opencode("job-task", "status", disconnected_request)
+
+
+async def test_cancelling_worker_during_transport_backoff_keeps_job_recoverable(
+    runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     dispatcher, queue, client = runner
-    queue.job["status"] = "running"
-    client.message_list[-1]["parts"] = [{"type": "text", "text": "Final result"}]
-    client.status_read_timeouts = 1
-    client.question_read_timeouts = 1
-    client.permission_read_timeouts = 1
+    retry_started = asyncio.Event()
+    wait_forever = asyncio.Event()
 
-    await dispatcher.recover()
+    async def disconnected_statuses() -> dict[str, Any]:
+        raise OpenCodeTransportError("server disconnected")
 
-    assert queue.job["status"] == "completed"
+    async def wait_in_backoff(delay: float) -> None:
+        retry_started.set()
+        await wait_forever.wait()
+
+    monkeypatch.setattr(client, "session_statuses", disconnected_statuses)
+    monkeypatch.setattr("opencode_web.dispatcher.asyncio.sleep", wait_in_backoff)
+    worker = asyncio.create_task(dispatcher._execute(dict(queue.job)))
+    await asyncio.wait_for(retry_started.wait(), timeout=1)
+
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    assert queue.job["status"] == "running"
     assert queue.job["error_code"] is None
-    assert client.status_calls == 2
-    assert client.question_calls == 2
-    assert client.permission_calls == 2
+    assert len(client.prompts) == 1
+    assert client.aborted == []
+
+
+async def test_stop_job_interrupts_question_retry_holding_the_job_lock(
+    runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher, queue, client = runner
+    queue.job["effective_user_id"] = "user-task"
+    retry_started = asyncio.Event()
+    wait_forever = asyncio.Event()
+
+    async def disconnected_questions() -> list[dict[str, Any]]:
+        raise OpenCodeTransportError("server disconnected")
+
+    async def wait_in_backoff(delay: float) -> None:
+        retry_started.set()
+        await wait_forever.wait()
+
+    monkeypatch.setattr(queue, "cancel_queued_job", lambda job_id: False, raising=False)
+    monkeypatch.setattr(queue, "audit", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(client, "questions", disconnected_questions)
+    monkeypatch.setattr("opencode_web.dispatcher.asyncio.sleep", wait_in_backoff)
+    worker = asyncio.create_task(dispatcher._execute(dict(queue.job)))
+    try:
+        await asyncio.wait_for(retry_started.wait(), timeout=1)
+
+        await dispatcher.stop_job(queue.job["id"])
+        await asyncio.wait_for(asyncio.gather(*tuple(dispatcher._workers)), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(worker, timeout=1)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    assert queue.job["status"] == "cancelled"
+    assert queue.job["error_code"] is None
+    assert len(client.prompts) == 1
+    assert client.aborted == ["session-task"]
 
 
 async def test_recovered_worker_handles_failure_and_publishes_terminal_status(runner: Any) -> None:

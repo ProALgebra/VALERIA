@@ -22,9 +22,9 @@ class ConsultationClient(FakeOpenCodeClient):
         self.pending_questions = []
         self.question_replies = []
 
-    async def create_session(self, title=None, *, permission=None):
+    async def create_session(self, title=None, *, permission=None, **kwargs):
         self.permission = permission
-        session = await super().create_session(title)
+        session = await super().create_session(title, **kwargs)
         return {**session, "permission": permission}
 
     async def delete_session(self, session_id):
@@ -679,7 +679,12 @@ async def test_opencode_client_sends_session_rules_and_system():
         )
     finally:
         await client.close()
-    assert requests[0] == ("POST", "/session", {"title": "Consultation", "permission": []})
+    creation_key = requests[0][2]["metadata"]["shodanCreationKey"]
+    assert isinstance(creation_key, str) and creation_key
+    assert requests[0] == ("POST", "/session", {
+        "title": "Consultation", "permission": [],
+        "metadata": {"shodanCreationKey": creation_key},
+    })
     assert requests[1] == ("PATCH", "/session/session", {"permission": []})
     assert requests[2][2]["agent"] == "build"
     assert requests[2][2]["system"] == "Consultation instruction"

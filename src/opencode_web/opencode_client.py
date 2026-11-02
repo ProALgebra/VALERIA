@@ -9,23 +9,60 @@ import socket
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
 from .config import Settings
 
 logger = logging.getLogger(__name__)
+OPENCODE_RETRY_INITIAL_SECONDS = 1
+OPENCODE_RETRY_MAX_SECONDS = 3 * 60 * 60
 
 
 class OpenCodeError(RuntimeError):
     pass
 
 
-class OpenCodeReadTimeout(OpenCodeError):
+class OpenCodeTransportError(OpenCodeError):
+    """A temporary transport failure, possibly after OpenCode accepted a request."""
+
+    def __init__(self, message: str, *, request_not_sent: bool = False):
+        super().__init__(message)
+        self.request_not_sent = request_not_sent
+
+
+class OpenCodeReadTimeout(OpenCodeTransportError):
     """OpenCode accepted a connection but did not return a response in time."""
+
+
+async def _await_or_cancel(
+    awaitable: Awaitable[Any], cancel_event: asyncio.Event | None = None,
+) -> Any:
+    """Allow cancellation of a safe read or backoff to release the job lock."""
+    if cancel_event is None:
+        return await awaitable
+    operation = asyncio.ensure_future(awaitable)
+    cancellation = asyncio.create_task(cancel_event.wait())
+    try:
+        if cancel_event.is_set():
+            raise asyncio.CancelledError
+        await asyncio.wait({operation, cancellation}, return_when=asyncio.FIRST_COMPLETED)
+        if cancel_event.is_set():
+            raise asyncio.CancelledError
+        return await operation
+    finally:
+        operation.cancel()
+        cancellation.cancel()
+        await asyncio.gather(operation, cancellation, return_exceptions=True)
+
+
+async def _wait_for_retry(delay: float, cancel_event: asyncio.Event | None = None) -> None:
+    await _await_or_cancel(asyncio.sleep(delay), cancel_event)
 
 
 @dataclass(slots=True)
@@ -58,7 +95,12 @@ class OpenCodeClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _request(
+        self, method: str, path: str, *, before_send: Callable[[], bool] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if before_send is not None and not before_send():
+            raise asyncio.CancelledError
         try:
             response = await self._client.request(method, path, **kwargs)
             response.raise_for_status()
@@ -74,6 +116,18 @@ class OpenCodeClient:
             raise OpenCodeReadTimeout(
                 f"OpenCode response timed out: {method} {path}"
             ) from exc
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.ProxyError,
+        ) as exc:
+            raise OpenCodeTransportError(
+                f"OpenCode transport failed: {method} {path} ({type(exc).__name__})",
+                request_not_sent=isinstance(
+                    exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+                ),
+            ) from exc
         except httpx.HTTPError as exc:
             raise OpenCodeError(f"OpenCode request failed: {method} {path}") from exc
         if response.status_code == 204 or not response.content:
@@ -88,11 +142,86 @@ class OpenCodeClient:
 
     async def create_session(
         self, title: str | None = None, *, permission: list[dict[str, str]] | None = None,
+        creation_key: str | None = None, recover_only: bool = False,
+        cancel_event: asyncio.Event | None = None,
+        creation_state: Callable[[bool], bool] | None = None,
     ) -> dict[str, Any]:
+        return await self._create_session(
+            self._request, title, permission=permission, creation_key=creation_key,
+            recover_only=recover_only, cancel_event=cancel_event, creation_state=creation_state,
+        )
+
+    @staticmethod
+    async def _create_session(
+        request: Callable[..., Awaitable[Any]],
+        title: str | None = None, *, permission: list[dict[str, str]] | None = None,
+        creation_key: str | None = None, recover_only: bool = False,
+        cancel_event: asyncio.Event | None = None,
+        creation_state: Callable[[bool], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Keep creation state across retries while resolving a live client per request."""
+        reconcile = creation_key is not None or recover_only
+        creation_key = creation_key or uuid4().hex
         body = {"title": title} if title else {}
+        body["metadata"] = {"shodanCreationKey": creation_key}
         if permission is not None:
             body["permission"] = permission
-        return await self._request("POST", "/session", json=body)
+        may_create = not recover_only
+        delay = OPENCODE_RETRY_INITIAL_SECONDS
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise asyncio.CancelledError
+            try:
+                if reconcile:
+                    # OpenCode defaults to only the 100 latest sessions. SQLite's
+                    # unlimited limit also finds sessions created during long outages.
+                    sessions = await _await_or_cancel(
+                        request("GET", "/session", params={"limit": -1}), cancel_event,
+                    )
+                    if not isinstance(sessions, list):
+                        raise OpenCodeError("OpenCode returned invalid session creation recovery")
+                    matches = [
+                        session for session in sessions
+                        if isinstance(session, dict)
+                        and isinstance(session.get("metadata"), dict)
+                        and session["metadata"].get("shodanCreationKey") == creation_key
+                    ]
+                    if len(matches) > 1:
+                        raise OpenCodeError("OpenCode returned multiple sessions for creation key")
+                    if matches:
+                        return matches[0]
+                if may_create:
+                    try:
+                        # Mark at the raw client's send boundary, after any
+                        # workspace startup/lease acquisition has finished.
+                        return await request(
+                            "POST", "/session", json=body,
+                            **({"before_send": partial(creation_state, True)}
+                               if creation_state is not None else {}),
+                        )
+                    except OpenCodeTransportError as exc:
+                        # An empty list cannot prove that an accepted POST has
+                        # finished. Only connection/pool failures are safe to resend.
+                        may_create = exc.request_not_sent
+                        if may_create and creation_state is not None:
+                            creation_state(False)
+                        reconcile = True
+                        raise
+            except OpenCodeTransportError:
+                logger.warning(
+                    "OpenCode session creation transport failed; retrying %s in %s seconds",
+                    "creation recovery" if not may_create else "safe creation",
+                    delay,
+                    extra={"creation_key": creation_key},
+                )
+            else:
+                logger.warning(
+                    "OpenCode session creation outcome unknown; checking again in %s seconds",
+                    delay,
+                    extra={"creation_key": creation_key},
+                )
+            await _wait_for_retry(delay, cancel_event)
+            delay = min(delay * 2, OPENCODE_RETRY_MAX_SECONDS)
 
     async def sessions(self) -> list[dict[str, Any]]:
         result = await self._request("GET", "/session")
@@ -226,11 +355,17 @@ class WorkspaceClient:
         self.manager = manager
         self.workspace = workspace
 
+    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        async with self.manager.use(self.workspace) as client:
+            return await client._request(method, path, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_") or name in {"close", "global_events"}:
             raise AttributeError(name)
 
         async def call(*args: Any, **kwargs: Any) -> Any:
+            if name == "create_session":
+                return await OpenCodeClient._create_session(self._request, *args, **kwargs)
             async with self.manager.use(self.workspace) as client:
                 return await getattr(client, name)(*args, **kwargs)
 

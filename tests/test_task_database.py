@@ -38,7 +38,7 @@ def start_task(
     database: Database,
     user: dict[str, Any],
     task: dict[str, Any],
-    session_id: str,
+    session_id: str | None,
     *,
     max_queued: int = 10,
     user_input: str = "My pipeline is 123",
@@ -200,6 +200,68 @@ def test_initial_task_title_migration_backfills_once(task_database) -> None:
         assert restored["task_title"] == task["title"]
     finally:
         reopened.close()
+
+
+def test_session_creation_attempt_survives_requeue_and_restart_until_attached(
+    task_database,
+) -> None:
+    database, _, user, task = task_database
+    run = start_task(database, user, task, None)
+    assert run["session_creation_started"] == 0
+    assert not database.mark_session_creation_started(run["id"])
+    assert not database.mark_session_creation_started("missing-job")
+    assert database.claim_next_job(1)["id"] == run["id"]
+    assert database.mark_session_creation_started(run["id"])
+    assert database.mark_session_creation_started(run["id"])
+    assert database.get_job(run["id"])["session_creation_started"] == 1
+
+    database.requeue_interrupted_job(run["id"])
+    reopened = Database(database.path, "x" * 32)
+    try:
+        reopened.initialize()
+        restored = reopened.claim_next_job(1)
+        assert restored["id"] == run["id"]
+        assert restored["session_pending"] == 1
+        assert restored["session_creation_started"] == 1
+        assert reopened.attach_task_session(run["id"], "recovered-session")
+        attached = reopened.get_job(run["id"])
+        assert attached["session_id"] == "recovered-session"
+        assert attached["session_pending"] == 0
+        assert attached["session_creation_started"] == 0
+        assert not reopened.mark_session_creation_started(run["id"])
+    finally:
+        reopened.close()
+
+
+def test_unsent_session_creation_is_safe_to_retry_after_restart(task_database) -> None:
+    database, _, user, task = task_database
+    run = start_task(database, user, task, None)
+    assert database.claim_next_job(1)["id"] == run["id"]
+    assert database.set_session_creation_started(run["id"], True)
+    assert database.set_session_creation_started(run["id"], False)
+    database.requeue_interrupted_job(run["id"])
+    reopened = Database(database.path, "x" * 32)
+    try:
+        reopened.initialize()
+        restored = reopened.claim_next_job(1)
+        assert restored["id"] == run["id"]
+        assert restored["session_pending"] == 1
+        assert restored["session_creation_started"] == 0
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["running", "waiting_permission", "waiting_question", "cancelling", "cancelled",
+     "completed", "failed"],
+)
+def test_session_creation_attempt_requires_pending_dispatching_job(task_database, status) -> None:
+    database, _, user, task = task_database
+    run = start_task(database, user, task, None)
+    database.set_job_status(run["id"], status)
+    assert not database.mark_session_creation_started(run["id"])
+    assert database.get_job(run["id"])["session_creation_started"] == 0
 
 
 def test_tasks_share_chat_fifo_and_concurrency_limit(task_database) -> None:
@@ -374,7 +436,10 @@ def test_enqueue_rejects_changes_during_session_creation(task_database, change: 
     assert database._one("SELECT COUNT(*) AS total FROM chats")["total"] == 0
 
 
-def test_initialize_migrates_existing_tables_without_changing_data(tmp_path: Path) -> None:
+@pytest.mark.parametrize("creation_started", [None, 1])
+def test_initialize_migrates_existing_tables_without_changing_data(
+    tmp_path: Path, creation_started: int | None,
+) -> None:
     path = tmp_path / "legacy.sqlite"
     connection = sqlite3.connect(path)
     connection.executescript("""
@@ -417,6 +482,14 @@ def test_initialize_migrates_existing_tables_without_changing_data(tmp_path: Pat
         INSERT INTO task_run_results(job_id, message_id, text, saved_at)
             VALUES ('job', 'msg_result', 'Legacy result', 'now');
     """)
+    if creation_started is not None:
+        connection.execute(
+            "ALTER TABLE queue_jobs ADD COLUMN session_creation_started INTEGER NOT NULL DEFAULT 0"
+        )
+        connection.execute(
+            "UPDATE queue_jobs SET session_creation_started = ?", (creation_started,)
+        )
+        connection.commit()
     connection.close()
     database = Database(path, "x" * 32)
     try:
@@ -429,6 +502,7 @@ def test_initialize_migrates_existing_tables_without_changing_data(tmp_path: Pat
         assert database.get_job("job")["task_id"] is None
         assert database.get_job("job")["content"] == "Legacy prompt"
         assert database.get_job("job")["resume_monitor"] == 0
+        assert database.get_job("job")["session_creation_started"] == (creation_started or 0)
         assert database.get_job("job")["queue_id"] == "default"
         assert database.get_work_queue("default")["name"] == "Основная"
         assert database.get_task_result("job")["text"] == "Legacy result"

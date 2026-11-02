@@ -302,7 +302,7 @@ async def test_dispatcher_executes_entire_pipeline_with_one_input(task_database,
     async def fast_sleep(_):
         await sleep(0)
 
-    async def create_session(title):
+    async def create_session(title, **kwargs):
         return {"id": f"session-{len(prompts)}"}
 
     async def send_prompt(session_id, **kwargs):

@@ -92,6 +92,15 @@ the request again. Accepted jobs survive application restarts. The browser uses
 key returns the original result without creating a duplicate, while a different
 request with that key receives `409`.
 
+Temporary transport failures while polling OpenCode do not fail or abort a job.
+Read requests retry indefinitely, with exponential backoff starting at one second
+and capped at three hours between attempts. Cancellation interrupts the backoff.
+Session creation uses a durable creation marker: after a lost POST response,
+Shodan looks up the original session instead of creating another one, including
+after restart. A POST is repeated only when the transport confirms it was not
+sent. If acceptance remains uncertain, recovery keeps checking for the marked
+session; an empty lookup alone does not allow another POST.
+
 Each run uses a single regular OpenCode session with one user message. Tasks share
 the FIFO queue and active session limit with chats. OpenCode questions are answered
 automatically using the recommended option, or the first available option if none
@@ -348,6 +357,8 @@ OpenCode/MCP/LSP](docs/server-process-lifecycle.md). Его нужно уста�
 Сначала запуск называется так же, как выбранная таска. Когда OpenCode присвоит сессии название, оно добавится после двоеточия: «Название таски: Название сессии OpenCode». Название таски сохраняется на момент запуска, поэтому последующее редактирование определения не переименовывает историю. Названия обновляются в фоне без перезагрузки формы и потери введённого дополнения.
 
 Создание диалога, консультации и ручной запуск таски сохраняются в SQLite без ожидания OpenCode. Диспетчер запускает окружение и создаёт сессию, когда задание получает слот в общей очереди. До этого история показывает сохранённый запрос и статус подготовки; пустой диалог не запускает окружение. Ошибка запуска сохраняется у задания, после чего пользователь может отправить запрос повторно. Принятые задания переживают перезапуск приложения. Браузер использует `Idempotency-Key`: повтор HTTP-запроса после сетевого сбоя с тем же ключом возвращает первоначальный результат без дубля, а другой запрос с этим ключом получает `409`.
+
+Временные транспортные ошибки при опросе OpenCode не завершают задание и не прерывают сессию. Запросы чтения повторяются без ограничения числа попыток: экспоненциальная пауза начинается с одной секунды и ограничена тремя часами между попытками. Отмена задания прерывает ожидание. Создание сессии использует сохраняемую метку: после потери ответа на POST Shodan ищет исходную сессию, в том числе после перезапуска. Повторный POST разрешён только при подтверждении, что запрос ещё не отправлен. При неизвестном результате продолжается поиск сессии по метке; одного пустого ответа для повторного создания недостаточно.
 
 Каждый запуск выполняется как одна обычная сессия OpenCode с одним пользовательским сообщением. Таски используют общую FIFO-очередь и общий лимит активных сессий вместе с чатами. На вопросы OpenCode автоматически выбирается рекомендуемый вариант; если он не обозначен, выбирается первый предложенный вариант. Интерактивное продолжение со стороны пользователя не требуется.
 

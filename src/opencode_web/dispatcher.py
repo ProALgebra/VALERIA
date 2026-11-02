@@ -13,14 +13,22 @@ from weakref import WeakValueDictionary
 from .consultations import CONSULTATION_PERMISSIONS, CONSULTATION_SYSTEM, final_answer
 from .database import Database
 from .events import EventBroker
-from .opencode_client import OpenCodeError, OpenCodeManager, OpenCodeReadTimeout
+from .opencode_client import (
+    OPENCODE_RETRY_INITIAL_SECONDS,
+    OPENCODE_RETRY_MAX_SECONDS,
+    OpenCodeError,
+    OpenCodeManager,
+    OpenCodeTransportError,
+    _await_or_cancel,
+    _wait_for_retry,
+)
 from .questions import question_event, session_questions
 from .task_results import task_final_answer
 
 logger = logging.getLogger(__name__)
 STOP_RETRY_SECONDS = 5
-POLL_READ_RETRY_INITIAL_SECONDS = 1
-POLL_READ_RETRY_MAX_SECONDS = 30
+POLL_READ_RETRY_INITIAL_SECONDS = OPENCODE_RETRY_INITIAL_SECONDS
+POLL_READ_RETRY_MAX_SECONDS = OPENCODE_RETRY_MAX_SECONDS
 CONTINUE_PROMPT = "План принят. Продолжай: реализуй предложенный план."
 
 
@@ -48,6 +56,19 @@ class QueueDispatcher:
         self._stopping = False
         self._job_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
         self._cancellations: dict[str, asyncio.Task[None]] = {}
+        self._retry_cancellations: WeakValueDictionary[str, asyncio.Event] = WeakValueDictionary()
+
+    def _retry_cancellation(self, job_id: str) -> asyncio.Event:
+        event = self._retry_cancellations.get(job_id)
+        if event is None:
+            event = asyncio.Event()
+            self._retry_cancellations[job_id] = event
+        job = self.database.get_job(job_id)
+        if self._stopping or not job or job["status"] in {
+            "completed", "failed", "cancelled", "cancelling",
+        }:
+            event.set()
+        return event
 
     async def _poll_opencode(
         self,
@@ -56,18 +77,21 @@ class QueueDispatcher:
         request: Callable[[], Awaitable[Any]],
     ) -> Any:
         delay = POLL_READ_RETRY_INITIAL_SECONDS
+        cancel_event = self._retry_cancellation(job_id)
         while True:
+            if self._stopping or cancel_event.is_set():
+                raise asyncio.CancelledError
             try:
-                return await request()
-            except OpenCodeReadTimeout:
+                return await _await_or_cancel(request(), cancel_event)
+            except OpenCodeTransportError:
                 if self._stopping:
                     raise asyncio.CancelledError from None
                 logger.warning(
-                    "OpenCode poll timed out; retrying in %s seconds",
+                    "OpenCode poll transport failed; retrying in %s seconds",
                     delay,
                     extra={"job_id": job_id, "operation": operation},
                 )
-                await asyncio.sleep(delay)
+                await _wait_for_retry(delay, cancel_event)
                 delay = min(delay * 2, POLL_READ_RETRY_MAX_SECONDS)
 
     def _job_lock(self, job_id: str) -> Lock:
@@ -87,6 +111,9 @@ class QueueDispatcher:
             self.database.set_job_status(job_id, "cancelling")
         job = self.database.get_job(job_id)
         if job["status"] == "cancelling":
+            event = self._retry_cancellations.get(job_id)
+            if event is not None:
+                event.set()
             self._start_cancellation(job_id)
         await self._publish_job_update(job_id)
         self.wake()
@@ -167,7 +194,8 @@ class QueueDispatcher:
             await asyncio.gather(*self._workers, return_exceptions=True)
 
     async def _run(self) -> None:
-        await self.recover()
+        recovering = self.database.active_jobs()
+        self._spawn(self.recover(recovering), "queue-recovery")
         while not self._stopping:
             launched = False
             while job := self.database.claim_next_job(self.limit, self.per_user_default):
@@ -186,14 +214,14 @@ class QueueDispatcher:
         self._workers.add(task)
         task.add_done_callback(self._workers.discard)
 
-    async def recover(self) -> None:
+    async def recover(self, jobs: list[dict[str, Any]] | None = None) -> None:
         """Reconcile jobs which were active when the gateway stopped.
 
         A dispatching job without a persisted OpenCode message is safe to put back
         into FIFO. Once OpenCode accepted the message, an interrupted generation is
         never resent automatically: doing so could duplicate filesystem changes.
         """
-        for job in self.database.active_jobs():
+        for job in self.database.active_jobs() if jobs is None else jobs:
             job = self.database.get_job(job["id"])
             if job["status"] == "cancelling":
                 self._start_cancellation(job["id"])
@@ -262,7 +290,9 @@ class QueueDispatcher:
                     self.database.set_job_status(job["id"], "running")
                     self._spawn(self._execute(job, client), f"recovered-job-{job['id']}")
                 else:
-                    messages = await client.messages(job["session_id"])
+                    messages = await self._poll_opencode(
+                        job["id"], "recovery-messages", partial(client.messages, job["session_id"])
+                    )
                     user_found, result = self._message_result(
                         messages, job.get("phase2_message_id") or job["message_id"],
                         task_session=bool(job.get("task_id"))
@@ -302,6 +332,16 @@ class QueueDispatcher:
                         self.database.set_job_status(job["id"], "failed", "assistant_error")
                     else:
                         self.database.set_job_status(job["id"], "failed", "interrupted_by_restart")
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if self._stopping or (current_task is not None and current_task.cancelling()):
+                    raise
+                current = self.database.get_job(job["id"])
+                if current and current["status"] not in {"cancelling", "cancelled"}:
+                    raise
+                # Cancelling one job's retry must not stop startup recovery or
+                # prevent the dispatcher from serving the remaining queue.
+                continue
             except OpenCodeError:
                 logger.exception("OpenCode recovery failed", extra={"job_id": job["id"]})
                 self.database.set_job_status(job["id"], "failed", "recovery_unavailable")
@@ -473,12 +513,19 @@ class QueueDispatcher:
                             raise TaskExecutionError("invalid_monitor_resume")
                     else:
                         if job.get("session_pending"):
+                            recover_only = bool(job.get("session_creation_started"))
                             session = await client.create_session(
                                 title=job.get("task_initial_title") or (
                                     job["chat_title"] if job.get("consultation") else None
                                 ),
                                 **({"permission": CONSULTATION_PERMISSIONS}
                                    if job.get("consultation") else {}),
+                                creation_key=job_id,
+                                recover_only=recover_only,
+                                cancel_event=self._retry_cancellation(job_id),
+                                creation_state=partial(
+                                    self.database.set_session_creation_started, job_id
+                                ),
                             )
                             session_id = session.get("id") or session.get("sessionID")
                             if not session_id:
@@ -498,10 +545,13 @@ class QueueDispatcher:
                             # old restrictions with the actual configured agent rules,
                             # refreshing them when configuration changes. New sessions
                             # inherit directly. Recovery of active jobs skips this path.
-                            session = await client.session(job["session_id"])
+                            session = await self._poll_opencode(
+                                job_id, "session", partial(client.session, job["session_id"])
+                            )
                             if session.get("permission"):
+                                agents = await self._poll_opencode(job_id, "agents", client.agents)
                                 standard = next(
-                                    (agent.get("permission") for agent in await client.agents()
+                                    (agent.get("permission") for agent in agents
                                      if agent.get("name") == job["agent"]), None,
                                 )
                                 if not standard:
@@ -583,8 +633,12 @@ class QueueDispatcher:
                     model_variant=current["model_variant"],
                 )
             except OpenCodeError:
+                messages = await self._poll_opencode(
+                    job["id"], "build-submission-messages",
+                    partial(client.messages, current["session_id"]),
+                )
                 found, _ = self._message_result(
-                    await client.messages(current["session_id"]), message_id, task_session=True
+                    messages, message_id, task_session=True
                 )
                 if not found:
                     raise TaskExecutionError("build_submission_uncertain") from None
@@ -647,6 +701,11 @@ class QueueDispatcher:
                     await self.events.publish(
                         question_event(job["workspace_snapshot"], job["session_id"])
                     )
+            current = self.database.get_job(job_id)
+            if not current or current["status"] in {
+                "completed", "failed", "cancelled", "cancelling",
+            }:
+                return
             idle_polls = 0 if busy or pending_question else idle_polls + 1
             if busy or is_task or is_consultation:
                 permissions = await self._poll_opencode(
@@ -675,15 +734,16 @@ class QueueDispatcher:
             # prompt_async can return before its busy transition is visible.
             # Consecutive idle polls also cover very fast completed prompts.
             if idle_polls >= 3:
-                if is_consultation:
-                    answer = final_answer(
-                        await client.messages(job["session_id"]), job["message_id"]
+                if is_consultation or is_task:
+                    messages = await self._poll_opencode(
+                        job_id, "messages", partial(client.messages, job["session_id"])
                     )
+                if is_consultation:
+                    answer = final_answer(messages, job["message_id"])
                     if not answer:
                         raise TaskExecutionError("incomplete_response")
                     self.database.complete_consultation_run(job_id, answer)
                 if is_task:
-                    messages = await client.messages(job["session_id"])
                     _, result = self._message_result(
                         messages,
                         job.get("phase2_message_id") or job["message_id"],

@@ -18,7 +18,7 @@ class TaskClient:
         self.deleted = []
         self.generated_titles = {}
 
-    async def create_session(self, title=None):
+    async def create_session(self, title=None, **kwargs):
         session = {"id": f"session-{len(self.created)}", "title": title}
         self.created.append(session)
         return session

@@ -17,7 +17,7 @@ class FakeOpenCodeClient:
         self.session_records: dict[str, dict[str, Any]] = {}
         self.last_create_title: str | None = None
 
-    async def create_session(self, title: str | None = None) -> dict[str, Any]:
+    async def create_session(self, title: str | None = None, **kwargs: Any) -> dict[str, Any]:
         self.session_count += 1
         self.last_create_title = title
         session = {

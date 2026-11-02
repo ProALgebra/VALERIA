@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS queue_jobs (
     task_title TEXT,
     task_initial_title TEXT,
     user_input TEXT,
+    session_creation_started INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN (
       'queued', 'dispatching', 'running', 'waiting_permission', 'waiting_question',
       'completed', 'failed', 'cancelling', 'cancelled'
@@ -337,6 +338,7 @@ class Database:
                 ("pipeline_json", "TEXT"),
                 ("parent_job_id", "TEXT REFERENCES queue_jobs(id)"),
                 ("session_pending", "INTEGER NOT NULL DEFAULT 0"),
+                ("session_creation_started", "INTEGER NOT NULL DEFAULT 0"),
                 ("plan_first", "INTEGER NOT NULL DEFAULT 0"),
                 ("phase2_message_id", "TEXT"),
                 ("resume_content", "TEXT"),
@@ -417,8 +419,8 @@ class Database:
             "provider_id", "model_id", "model_variant", "task_id", "task_title",
             "task_initial_title", "user_input", "status", "created_at", "started_at",
             "finished_at", "error_code", "pipeline_json", "parent_job_id",
-            "session_pending", "plan_first", "phase2_message_id", "resume_content",
-            "resume_from_message_id", "resume_monitor",
+            "session_pending", "session_creation_started", "plan_first", "phase2_message_id",
+            "resume_content", "resume_from_message_id", "resume_monitor",
             "queue_id",
         )
         names = ", ".join(columns)
@@ -456,6 +458,7 @@ class Database:
                         pipeline_json TEXT,
                         parent_job_id TEXT REFERENCES queue_jobs(id),
                         session_pending INTEGER NOT NULL DEFAULT 0,
+                        session_creation_started INTEGER NOT NULL DEFAULT 0,
                         plan_first INTEGER NOT NULL DEFAULT 0,
                         phase2_message_id TEXT,
                         resume_content TEXT,
@@ -1493,7 +1496,8 @@ class Database:
                       q.queue_id, q.task_id, q.task_title, q.task_initial_title,
                       q.user_input, q.status, q.created_at, q.started_at,
                       q.finished_at, q.error_code, q.parent_job_id,
-                      q.session_pending, q.plan_first, q.phase2_message_id,
+                      q.session_pending, q.session_creation_started,
+                      q.plan_first, q.phase2_message_id,
                       q.resume_from_message_id, q.resume_monitor,
                       owner.login AS effective_login, actor.login AS actor_login,
                       c.title AS chat_title, c.consultation AS consultation,
@@ -1969,6 +1973,20 @@ class Database:
                  json.dumps({"task_id": task_id, "parent_job_id": parent["id"]}), now),
             )
 
+    def mark_session_creation_started(self, job_id: str) -> bool:
+        """Persist an uncertain creation attempt before submitting it to OpenCode."""
+        return self.set_session_creation_started(job_id, True)
+
+    def set_session_creation_started(self, job_id: str, started: bool) -> bool:
+        """Track whether a pending session creation might have reached OpenCode."""
+        with self.transaction() as connection:
+            result = connection.execute(
+                """UPDATE queue_jobs SET session_creation_started = ?
+                   WHERE id = ? AND session_pending = 1 AND status = 'dispatching'""",
+                (int(started), job_id),
+            )
+            return result.rowcount == 1
+
     def attach_task_session(self, job_id: str, session_id: str) -> bool:
         """Attach one session to the chat and all turns queued before it existed."""
         with self.transaction() as connection:
@@ -1980,7 +1998,8 @@ class Database:
             if not row:
                 return False
             connection.execute(
-                """UPDATE queue_jobs SET session_id = ?, session_pending = 0
+                """UPDATE queue_jobs SET session_id = ?, session_pending = 0,
+                   session_creation_started = 0
                    WHERE chat_id = ? AND session_pending = 1""",
                 (session_id, row["chat_id"]),
             )
