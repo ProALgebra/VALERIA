@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import logging
 import os
-import secrets
 import signal
 import socket
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -25,7 +24,6 @@ from .backends.retry import _await_or_cancel as _await_or_cancel
 from .backends.retry import _wait_for_retry as _wait_for_retry
 from .backends.v1 import OpenCodeV1Backend
 from .config import Settings
-from .podman_runtime import PodmanError, PodmanRuntime
 
 # Compatibility import for integrations using the original V1 client.
 OpenCodeClient = OpenCodeV1Backend
@@ -46,8 +44,6 @@ class OpenCodeInstance:
     users: int = 0
     activity_version: int = 0
     idle_since: float | None = None
-    container_name: str | None = None
-    cleanup_pending: bool = False
 
 
 class WorkspaceClient(SessionCreation):
@@ -56,21 +52,20 @@ class WorkspaceClient(SessionCreation):
     def __init__(self, manager: OpenCodeManager, workspace: str):
         self.manager = manager
         self.workspace = workspace
-        self.execution_mode = manager.execution_mode
 
     async def close(self) -> None:
         """Workspace handles own no transport; each call releases its lease."""
 
     async def health(self) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.health()
 
     async def path(self) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.path()
 
     async def find_created_session(self, creation_key: str) -> dict[str, Any] | None:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.find_created_session(creation_key)
 
     async def create_session_once(
@@ -81,7 +76,7 @@ class WorkspaceClient(SessionCreation):
         creation_key: str,
         before_send: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.create_session_once(
                 title,
                 permission=permission,
@@ -90,25 +85,25 @@ class WorkspaceClient(SessionCreation):
             )
 
     async def sessions(self) -> list[dict[str, Any]]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.sessions()
 
     async def session(self, session_id: str) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.session(session_id)
 
     async def delete_session(self, session_id: str) -> bool:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.delete_session(session_id)
 
     async def update_session_permissions(
         self, session_id: str, permission: list[dict[str, str]]
     ) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.update_session_permissions(session_id, permission)
 
     async def messages(self, session_id: str) -> list[dict[str, Any]]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.messages(session_id)
 
     async def send_prompt_async(
@@ -123,7 +118,7 @@ class WorkspaceClient(SessionCreation):
         model_variant: str | None,
         system: str | None = None,
     ) -> None:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.send_prompt_async(
                 session_id,
                 message_id=message_id,
@@ -136,45 +131,45 @@ class WorkspaceClient(SessionCreation):
             )
 
     async def abort(self, session_id: str) -> bool:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.abort(session_id)
 
     async def respond_permission(
         self, session_id: str, permission_id: str, response: str, remember: bool
     ) -> bool:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.respond_permission(session_id, permission_id, response, remember)
 
     async def session_statuses(self) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.session_statuses()
 
     async def permissions(self) -> list[dict[str, Any]]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.permissions()
 
     async def questions(self) -> list[dict[str, Any]]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.questions()
 
     async def respond_question(self, request_id: str, answers: list[list[str]]) -> bool:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.respond_question(request_id, answers)
 
     async def mcp_statuses(self) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.mcp_statuses()
 
     async def providers(self) -> dict[str, Any]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.providers()
 
     async def agents(self) -> list[dict[str, Any]]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             return await client.agents()
 
     async def global_events(self) -> AsyncIterator[dict[str, Any]]:
-        async with self.manager.use(self.workspace, expected_mode=self.execution_mode) as client:
+        async with self.manager.use(self.workspace) as client:
             async for event in client.global_events():
                 yield event
 
@@ -184,17 +179,8 @@ class OpenCodeManager:
         self,
         settings: Settings,
         event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-        *,
-        execution_mode: str = "direct",
     ):
-        if execution_mode not in {"direct", "podman"}:
-            raise ValueError("Unknown execution mode")
         self.settings = settings
-        self.execution_mode = execution_mode
-        self.podman = PodmanRuntime(settings)
-        self._podman_preparation_lock = asyncio.Lock()
-        self._podman_reconciled = False
-        self._switching_mode = False
         self.event_sink = event_sink
         self._instances: dict[str, OpenCodeInstance] = {}
         self._lock = asyncio.Lock()
@@ -219,11 +205,9 @@ class OpenCodeManager:
     async def ensure(
         self,
         workspace_raw: str,
-        *,
-        expected_mode: str | None = None,
     ) -> WorkspaceClient:
         workspace = str(self.settings.validate_workspace(workspace_raw))
-        async with self.use(workspace, expected_mode=expected_mode or self.execution_mode):
+        async with self.use(workspace):
             return self._clients.setdefault(workspace, WorkspaceClient(self, workspace))
 
     @asynccontextmanager
@@ -233,23 +217,18 @@ class OpenCodeManager:
         *,
         wake: bool = True,
         activity: bool = True,
-        expected_mode: str | None = None,
     ) -> AsyncIterator[OpenCodeBackend | None]:
         """Pin a process across requests; background probes never wake or refresh it."""
         key = str(self.settings.validate_workspace(workspace_raw))
-        mode = expected_mode or self.execution_mode
         instance = None
         while instance is None:
             if wake:
-                client = await self._ensure_client(key, expected_mode=mode)
+                client = await self._ensure_client(key)
             async with self._lock:
-                if mode != self.execution_mode:
-                    raise OpenCodeError("Режим работы диалога изменился")
                 candidate = self._instances.get(key)
                 if (
                     candidate
                     and candidate.process.returncode is None
-                    and not candidate.cleanup_pending
                     and candidate.ready.is_set()
                     and not candidate.startup_error
                     and (not wake or candidate.client is client)
@@ -277,31 +256,26 @@ class OpenCodeManager:
     async def _ensure_client(
         self,
         workspace_raw: str,
-        *,
-        expected_mode: str | None = None,
     ) -> OpenCodeBackend:
         workspace = self.settings.validate_workspace(workspace_raw)
         key = str(workspace)
         starter = False
         async with self._lock:
-            if expected_mode is not None and expected_mode != self.execution_mode:
-                raise OpenCodeError("Режим работы диалога изменился")
             if self._closing:
                 raise OpenCodeError("OpenCode manager is shutting down")
-            if self._switching_mode:
-                raise OpenCodeError("Меняется режим работы. Повторите запрос позже")
             existing = self._instances.get(key)
-            if existing and (existing.process.returncode is not None or existing.cleanup_pending):
+            if existing and existing.process.returncode is None:
+                instance = existing
+            if existing and existing.process.returncode is not None:
                 await self._stop_instance(existing)
                 self._instances.pop(key, None)
                 existing = None
-            if existing:
-                instance = existing
 
             if not existing:
                 starter = True
+                if not self.settings.opencode_bin.exists():
+                    raise OpenCodeError(f"OpenCode binary not found: {self.settings.opencode_bin}")
                 port = self._free_port()
-                container_name = None
                 username = (
                     "opencode"
                     if self.settings.opencode_api_version == "v2"
@@ -309,60 +283,45 @@ class OpenCodeManager:
                 )
                 password = self.settings.opencode_password
                 client_host = self.settings.opencode_host
-                if self.execution_mode == "podman":
-                    try:
-                        await self._prepare_podman()
-                        password = secrets.token_urlsafe(32)
-                        runtime = await self.podman.start(workspace, port, username, password)
-                        process = runtime.process
-                        container_name = runtime.container_name
-                        client_host = "127.0.0.1"
-                    except PodmanError as exc:
-                        raise OpenCodeError(str(exc)) from exc
-                else:
-                    if not self.settings.opencode_bin.exists():
-                        raise OpenCodeError(
-                            f"OpenCode binary not found: {self.settings.opencode_bin}"
+                environment = os.environ.copy()
+                environment["OPENCODE_SERVER_USERNAME"] = username
+                if password:
+                    environment["OPENCODE_SERVER_PASSWORD"] = password
+                if self.settings.opencode_api_version == "v2":
+                    environment.pop("OPENCODE_SERVER_USERNAME", None)
+                    environment["OPENCODE_PASSWORD"] = password
+                    state = self.settings.opencode_v2_state_root.expanduser().resolve()
+                    state = state / hashlib.sha256(str(workspace).encode()).hexdigest()
+                    for variable, directory in (
+                        ("XDG_DATA_HOME", "data"),
+                        ("XDG_STATE_HOME", "state"),
+                        ("XDG_CACHE_HOME", "cache"),
+                        ("XDG_CONFIG_HOME", "config"),
+                    ):
+                        path = state / directory
+                        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        environment[variable] = str(path)
+                    # Do not inherit a V1 global config containing V1 plugins.
+                    environment.pop("OPENCODE_CONFIG", None)
+                    environment.pop("OPENCODE_CONFIG_CONTENT", None)
+                    environment.pop("OPENCODE_CONFIG_DIR", None)
+                    if self.settings.opencode_v2_config_dir:
+                        environment["OPENCODE_CONFIG"] = str(
+                            self.settings.opencode_v2_config_dir.resolve() / "opencode.jsonc"
                         )
-                    environment = os.environ.copy()
-                    environment["OPENCODE_SERVER_USERNAME"] = username
-                    if password:
-                        environment["OPENCODE_SERVER_PASSWORD"] = password
-                    if self.settings.opencode_api_version == "v2":
-                        environment.pop("OPENCODE_SERVER_USERNAME", None)
-                        environment["OPENCODE_PASSWORD"] = password
-                        state = self.settings.opencode_v2_state_root.expanduser().resolve()
-                        state = state / hashlib.sha256(str(workspace).encode()).hexdigest()
-                        for variable, directory in (
-                            ("XDG_DATA_HOME", "data"),
-                            ("XDG_STATE_HOME", "state"),
-                            ("XDG_CACHE_HOME", "cache"),
-                            ("XDG_CONFIG_HOME", "config"),
-                        ):
-                            path = state / directory
-                            path.mkdir(parents=True, exist_ok=True, mode=0o700)
-                            environment[variable] = str(path)
-                        # Do not inherit a V1 global config containing V1 plugins.
-                        environment.pop("OPENCODE_CONFIG", None)
-                        environment.pop("OPENCODE_CONFIG_CONTENT", None)
-                        environment.pop("OPENCODE_CONFIG_DIR", None)
-                        if self.settings.opencode_v2_config_dir:
-                            environment["OPENCODE_CONFIG"] = str(
-                                self.settings.opencode_v2_config_dir.resolve() / "opencode.jsonc"
-                            )
-                    process = await asyncio.create_subprocess_exec(
-                        str(self.settings.opencode_bin),
-                        "serve",
-                        "--hostname",
-                        self.settings.opencode_host,
-                        "--port",
-                        str(port),
-                        cwd=workspace,
-                        env=environment,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                        start_new_session=os.name == "posix",
-                    )
+                process = await asyncio.create_subprocess_exec(
+                    str(self.settings.opencode_bin),
+                    "serve",
+                    "--hostname",
+                    self.settings.opencode_host,
+                    "--port",
+                    str(port),
+                    cwd=workspace,
+                    env=environment,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=os.name == "posix",
+                )
                 client = create_backend(
                     f"http://{client_host}:{port}",
                     username,
@@ -376,7 +335,6 @@ class OpenCodeManager:
                     process,
                     client,
                     process_group=process.pid if os.name == "posix" else None,
-                    container_name=container_name,
                 )
                 self._instances[key] = instance
 
@@ -398,51 +356,6 @@ class OpenCodeManager:
             instance.ready.set()
             await self.stop_workspace(key, expected_instance=instance)
             raise
-
-    async def _prepare_podman(self) -> None:
-        async with self._podman_preparation_lock:
-            if not self._podman_reconciled:
-                await self.podman.preflight()
-                await self.podman.reconcile()
-                self._podman_reconciled = True
-
-    async def recover_runtime(self) -> None:
-        """Reap previous workers before accepting work, even with an empty queue."""
-        if self.execution_mode != "podman":
-            return
-        async with self._podman_preparation_lock:
-            try:
-                # No image/config requirement: an operator may have removed either.
-                await self.podman.reconcile()
-            except PodmanError as exc:
-                self._podman_reconciled = False
-                raise OpenCodeError(str(exc)) from exc
-            self._podman_reconciled = True
-
-    async def change_execution_mode(self, mode: str) -> None:
-        """Drain process leases before changing the runtime for future requests."""
-        if mode not in {"direct", "podman"}:
-            raise ValueError("Unknown execution mode")
-        async with self._lock:
-            if self._closing or self._switching_mode:
-                raise OpenCodeError("Режим работы сейчас нельзя изменить")
-            if any(item.users or not item.ready.is_set() for item in self._instances.values()):
-                raise OpenCodeError("Дождитесь завершения текущих запросов OpenCode")
-            self._switching_mode = True
-            try:
-                for key, instance in tuple(self._instances.items()):
-                    await self._stop_instance(instance)
-                    self._instances.pop(key, None)
-                if self.execution_mode == "podman" or mode == "podman":
-                    try:
-                        await self.podman.reconcile()
-                    except PodmanError as exc:
-                        raise OpenCodeError(str(exc)) from exc
-                self._clients.clear()
-                self.execution_mode = mode
-                self._podman_reconciled = False
-            finally:
-                self._switching_mode = False
 
     async def _start_instance(self, instance: OpenCodeInstance) -> OpenCodeBackend:
         process, client, workspace = instance.process, instance.client, instance.workspace
@@ -577,9 +490,9 @@ class OpenCodeManager:
                 if instance.idle_since is None:
                     instance.idle_since = now
                 elif now - instance.idle_since >= self.settings.opencode_idle_timeout_seconds:
-                    # Keep ownership until cleanup succeeds, including a failed Podman rm.
+                    # Final check + removal share the lock used by request leases/startup.
+                    self._instances.pop(key)
                     await self._stop_instance(instance)
-                    self._instances.pop(key, None)
                     logger.info("Stopped idle OpenCode workspace %s", key)
         except Exception:
             self._touch(instance)
@@ -604,10 +517,9 @@ class OpenCodeManager:
         async with self._lock:
             if expected_instance is not None and self._instances.get(key) is not expected_instance:
                 return
-            instance = self._instances.get(key)
+            instance = self._instances.pop(key, None)
             if instance:
                 await self._stop_instance(instance)
-                self._instances.pop(key, None)
 
     @staticmethod
     def _signal_instance(instance: OpenCodeInstance, sig: signal.Signals) -> None:
@@ -618,7 +530,6 @@ class OpenCodeManager:
                 instance.process.send_signal(sig)
 
     async def _stop_instance(self, instance: OpenCodeInstance) -> None:
-        instance.cleanup_pending = True
         try:
             try:
                 if instance.event_task:
@@ -628,13 +539,6 @@ class OpenCodeManager:
             finally:
                 await instance.client.close()
         finally:
-            if instance.container_name:
-                try:
-                    await self.podman.stop(instance.container_name)
-                    instance.container_name = None
-                except PodmanError as exc:
-                    # Do not release ownership/capacity until the container is removed.
-                    raise OpenCodeError(str(exc)) from exc
             self._signal_instance(instance, signal.SIGTERM)
             try:
                 await asyncio.wait_for(instance.process.wait(), 10)
@@ -664,10 +568,5 @@ class OpenCodeManager:
         for instance, result in zip(instances, results, strict=True):
             if isinstance(result, BaseException):
                 logger.error("OpenCode cleanup failed for %s: %s", instance.workspace, result)
-        try:
-            await self.podman.cleanup_pending_starts()
-        except PodmanError as exc:
-            failures.append(exc)
-            logger.exception("Failed to clean up an incomplete isolated worker launch")
         if strict and failures:
             raise OpenCodeError("Cannot confirm cleanup before the backend switch") from failures[0]

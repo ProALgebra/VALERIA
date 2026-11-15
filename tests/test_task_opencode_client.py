@@ -41,13 +41,12 @@ async def mock_client(
 class LeaseTrackingManager:
     def __init__(self, client: OpenCodeClient):
         self.client = client
-        self.execution_mode = "direct"
         self.leases = 0
         self.clients: list[OpenCodeClient] = []
 
     @asynccontextmanager
     async def use(
-        self, workspace: str, *, expected_mode: str | None = None,
+        self, workspace: str,
     ) -> AsyncIterator[OpenCodeClient]:
         client = self.client
         self.clients.append(client)
@@ -628,7 +627,7 @@ async def test_creation_state_stays_clear_until_post_client_acquisition_complete
     async with mock_client(transport) as client:
         @asynccontextmanager
         async def use(
-            workspace: str, *, expected_mode: str | None = None,
+            workspace: str,
         ) -> AsyncIterator[OpenCodeClient]:
             nonlocal acquisitions
             acquisitions += 1
@@ -640,7 +639,7 @@ async def test_creation_state_stays_clear_until_post_client_acquisition_complete
             yield client
 
         workspace_client = WorkspaceClient(
-            SimpleNamespace(use=use, execution_mode="direct"), "workspace",
+            SimpleNamespace(use=use), "workspace",
         )
         pending = asyncio.create_task(workspace_client.create_session(
             creation_key="post-acquisition", creation_state=creation_state,

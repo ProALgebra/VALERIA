@@ -53,12 +53,12 @@ class TaskManager:
         self.client = TaskClient()
 
     @asynccontextmanager
-    async def use(self, workspace, *, wake=True, activity=True, expected_mode=None):
+    async def use(self, workspace, *, wake=True, activity=True):
         assert wake is False
         assert activity is False
         yield self.client
 
-    async def ensure(self, workspace, *, expected_mode=None):
+    async def ensure(self, workspace):
         return self.client
 
     async def close(self):
@@ -517,7 +517,7 @@ async def test_task_title_sync_skips_workspace_outside_roots(task_app):
     )
     original_ensure = t.manager.ensure
 
-    async def ensure(workspace, *, expected_mode=None):
+    async def ensure(workspace):
         if workspace == legacy["workspace_path"]:
             raise ConfigError("Workspace is outside ALLOWED_WORKSPACE_ROOTS")
         return await original_ensure(workspace)

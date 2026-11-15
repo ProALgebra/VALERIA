@@ -1,7 +1,7 @@
 # Интеграция OpenCode v1/v2
 
 По умолчанию приложение использует v1. Поддержка v2 проверяется на OpenCode
-2.3.0. Выбор версии API независим от режима `direct`/`podman`.
+2.3.0. Обе версии используют существующий прямой запуск OpenCode.
 
 ## Архитектура
 
@@ -96,9 +96,9 @@ v2, выполните `backend-switch --to v1` с текущими настро
 настройки и бинарник v1. Архивные диалоги остаются доступны для чтения; для новой
 работы создавайте новый диалог.
 
-## Docker и Podman
+## Docker
 
-Оба Dockerfile принимают `OPENCODE_API_VERSION=v1|v2`, `OPENCODE_VERSION=1.18.25`
+Dockerfile принимает `OPENCODE_API_VERSION=v1|v2`, `OPENCODE_VERSION=1.18.25`
 и `OPENCODE_V2_VERSION=2.3.0`. Compose передаёт их из `.env`. Для v1 используется
 пакет `opencode-ai`, для v2 — `@opencode/cli`. После смены версии пересоберите
 основной образ. Требования основной сборки к локальному `opencode/config`
@@ -109,21 +109,6 @@ v2, выполните `backend-switch --to v1` с текущими настро
 В `.env` задайте `OPENCODE_V2_CONFIG_DIR=/app/data/opencode-v2-config`
 и `OPENCODE_V2_STATE_ROOT=/app/data/opencode-v2`. Поместите туда
 `opencode.jsonc` и настройте провайдера до запуска.
-
-Изолированный worker v2:
-
-```sh
-podman build -f docker/Containerfile.opencode \
-  --build-arg OPENCODE_API_VERSION=v2 \
-  --build-arg OPENCODE_V2_VERSION=2.3.0 \
-  -t localhost/valeria-opencode:2.3.0 .
-```
-
-Задайте `PODMAN_IMAGE=localhost/valeria-opencode:2.3.0`, отдельный
-`PODMAN_CONFIG_DIR` с конфигурацией v2 и переменные провайдера в
-`PODMAN_FORWARD_ENV`. Homes v2 находятся в `PODMAN_STATE_ROOT/v2/`, homes v1
-сохраняют прежние пути. Каждый worker получает отдельный пароль через окружение,
-без значения в аргументах процесса.
 
 ## Проверки
 

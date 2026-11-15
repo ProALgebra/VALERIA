@@ -11,7 +11,7 @@ from opencode_web.app import create_app
 from opencode_web.backend_switch import database_process_lock, prepare_backend_switch
 from opencode_web.backends import OpenCodeError
 from opencode_web.config import ConfigError
-from opencode_web.database import Database, ExecutionModeChangingError
+from opencode_web.database import BackendVersionChangedError, Database
 
 
 @pytest.fixture
@@ -64,7 +64,7 @@ def test_switch_preserves_history_and_versions_new_jobs(stored, workspace):
     assert old["archived_reason"] == "backend_version_changed"
     assert not t.db.can_use_chat_backend(old)
     assert t.db.saved_chat_history(old["id"]) == history
-    with pytest.raises(ExecutionModeChangingError):
+    with pytest.raises(BackendVersionChangedError):
         enqueue(t, old)
     new = t.db.create_chat(t.user["id"], None, "New", str(workspace))
     assert new["backend_version"] == "v2"
@@ -134,6 +134,32 @@ async def test_startup_rejects_unprepared_switch_before_runtime_start(stored, se
     with pytest.raises(ConfigError, match="backend-switch"):
         async with app.router.lifespan_context(app):
             pytest.fail("Unprepared version transition must not start the server")
+
+
+async def test_existing_v1_database_starts_without_switch_or_session_recreation(
+    stored, settings,
+):
+    job = enqueue(stored, stored.chat)
+    # Reproduce the published schema before backend versioning was introduced.
+    with stored.db.transaction() as connection:
+        connection.execute("ALTER TABLE chats DROP COLUMN backend_version")
+        connection.execute("ALTER TABLE queue_jobs DROP COLUMN backend_version")
+        connection.execute("DROP TABLE chat_history_snapshots")
+        connection.execute("DELETE FROM settings WHERE key LIKE 'opencode_%'")
+    app = create_app(settings, start_dispatcher=False)
+    async with app.router.lifespan_context(app):
+        db = app.state.database
+        previous_chat = db.get_chat(stored.chat["id"])
+        previous_job = db.get_job(job["id"])
+        assert db.backend_version() == "v1"
+        assert previous_chat["archived_reason"] is None
+        assert previous_chat["opencode_session_id"] == "ses_old"
+        assert db.can_use_chat_backend(previous_chat)
+        assert previous_job["backend_version"] == "v1"
+        assert previous_job["session_id"] == "ses_old"
+        assert previous_job["status"] == "queued"
+        assert not previous_job["session_pending"]
+        assert app.state.manager.instances() == []
 
 
 async def test_orphan_runtime_port_blocks_preparation(stored, settings):

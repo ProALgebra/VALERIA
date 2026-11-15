@@ -20,11 +20,10 @@ def utcnow() -> str:
 
 UNSET = object()
 DEFAULT_QUEUE_ID = "default"
-EXECUTION_MODES = {"direct", "podman"}
 
 
-class ExecutionModeChangingError(RuntimeError):
-    """Submissions and workspace changes pause during a runtime transition."""
+class BackendVersionChangedError(RuntimeError):
+    """An archived session must not be submitted to another OpenCode version."""
 
 
 MATTERMOST_USER_ID_RE = re.compile(r"^[a-z0-9]{26}$")
@@ -251,7 +250,6 @@ class Database:
         self.path = path
         self.session_secret = session_secret
         self._lock = threading.RLock()
-        self._execution_mode_changing = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
@@ -313,10 +311,6 @@ class Database:
             chat_columns = {
                 row[1] for row in self._connection.execute("PRAGMA table_info(chats)").fetchall()
             }
-            if "execution_mode" not in chat_columns:
-                self._connection.execute(
-                    "ALTER TABLE chats ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'direct'"
-                )
             self._connection.execute(
                 """CREATE TABLE IF NOT EXISTS chat_history_snapshots (
                     chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
@@ -573,10 +567,6 @@ class Database:
         if mattermost_username and not mattermost_user_id:
             raise ValueError("Mattermost username must be resolved before saving")
         with self.transaction() as connection:
-            self.assert_execution_mode_ready()
-            if (self.execution_mode() == "podman" and workspace_path
-                    and self.isolated_workspace_conflict(workspace_path)):
-                raise ValueError("Для изоляции рабочие папки не должны пересекаться")
             connection.execute(
                 """INSERT INTO users
                    (id, login, password_hash, role, workspace_path, tasks_only,
@@ -666,13 +656,6 @@ class Database:
         if new_role not in {"user", "admin"} or new_status not in {"active", "disabled"}:
             raise ValueError("Invalid user fields")
         with self.transaction() as connection:
-            self.assert_execution_mode_ready()
-            if (new_workspace != current["workspace_path"]
-                    and self.has_pending_jobs(user_id)):
-                raise ValueError("Рабочую папку нельзя менять при незавершённых заданиях")
-            if (self.execution_mode() == "podman" and new_workspace
-                    and self.isolated_workspace_conflict(new_workspace, user_id)):
-                raise ValueError("Для изоляции рабочие папки не должны пересекаться")
             connection.execute(
                 """UPDATE users SET role = ?, workspace_path = ?, status = ?, tasks_only = ?,
                    max_active_jobs = ?, mattermost_username = ?, mattermost_user_id = ?,
@@ -1182,13 +1165,12 @@ class Database:
         session_id = session_id or f"pending_{chat_id}"
         now = utcnow()
         with self.transaction() as connection:
-            self.assert_execution_mode_ready()
             connection.execute(
                 """INSERT INTO chats
                    (id, owner_user_id, opencode_session_id, title, workspace_snapshot,
                     preferred_agent, preferred_provider_id, preferred_model_id,
-                    preferred_model_variant, created_at, updated_at, consultation, execution_mode)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    preferred_model_variant, created_at, updated_at, consultation)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     chat_id,
                     owner_id,
@@ -1202,7 +1184,6 @@ class Database:
                     now,
                     now,
                     int(consultation),
-                    self.execution_mode(),
                 ),
             )
             connection.execute(
@@ -1322,12 +1303,11 @@ class Database:
         self._active_queue(queue_id)
         with self.transaction() as connection:
             # The caller's chat may predate session attachment by the dispatcher.
-            self.assert_execution_mode_ready()
             chat = self.get_chat(chat["id"])
-            if not chat or chat.get("archived_reason"):
-                raise ExecutionModeChangingError("Диалог архивирован")
+            if not chat:
+                raise ValueError("Диалог не найден")
             if not self.can_use_chat_backend(chat):
-                raise ExecutionModeChangingError("Диалог создан в другом режиме работы")
+                raise BackendVersionChangedError("Диалог архивирован после смены версии OpenCode")
             if max_queued is not None and connection.execute(
                 "SELECT COUNT(*) FROM queue_jobs WHERE status = 'queued'"
             ).fetchone()[0] >= max_queued:
@@ -1406,7 +1386,6 @@ class Database:
         if user_input.strip():
             content += "\n\n" + user_input
         with self.transaction() as connection:
-            self.assert_execution_mode_ready()
             current_user = connection.execute(
                 "SELECT status, workspace_path, auth_version FROM users WHERE id = ?",
                 (user["id"],),
@@ -1442,9 +1421,8 @@ class Database:
                 """INSERT INTO chats
                    (id, owner_user_id, opencode_session_id, title, workspace_snapshot,
                     kind, status, preferred_agent, preferred_provider_id,
-                    preferred_model_id, preferred_model_variant, created_at, updated_at,
-                    execution_mode)
-                   VALUES (?, ?, ?, ?, ?, 'task', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    preferred_model_id, preferred_model_variant, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'task', ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     chat_id,
                     user["id"],
@@ -1458,7 +1436,6 @@ class Database:
                     task["model_variant"],
                     now,
                     now,
-                    self.execution_mode(),
                 ),
             )
             connection.execute(
@@ -2002,13 +1979,11 @@ class Database:
                 """INSERT INTO chats
                    (id, owner_user_id, opencode_session_id, title, workspace_snapshot,
                     kind, status, preferred_agent, preferred_provider_id,
-                    preferred_model_id, preferred_model_variant, created_at, updated_at,
-                    execution_mode)
-                   VALUES (?, ?, ?, ?, ?, 'task', 'queued', ?, ?, ?, ?, ?, ?, ?)""",
+                    preferred_model_id, preferred_model_variant, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'task', 'queued', ?, ?, ?, ?, ?, ?)""",
                 (chat_id, parent["effective_user_id"], session_id, title,
                  parent["workspace_snapshot"], task["agent"], task["provider_id"],
-                 task["model_id"], task["model_variant"], now, now,
-                 self.get_chat(parent["chat_id"])["execution_mode"]),
+                 task["model_id"], task["model_variant"], now, now),
             )
             sequence = connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 FROM queue_jobs"
@@ -2261,13 +2236,6 @@ class Database:
                 (key, queue_id, admin_id, utcnow()),
             )
 
-    def execution_mode(self) -> str:
-        row = self._one("SELECT value FROM settings WHERE key = 'execution_mode'")
-        mode = row["value"] if row else "direct"
-        if mode not in EXECUTION_MODES:
-            raise RuntimeError("Invalid persisted execution mode")
-        return mode
-
     def backend_version(self) -> str:
         row = self._one("SELECT value FROM settings WHERE key = 'opencode_api_version'")
         return row["value"] if row else "v1"
@@ -2275,7 +2243,6 @@ class Database:
     def can_use_chat_backend(self, chat: dict[str, Any]) -> bool:
         return (
             chat.get("backend_version", "v1") == self.backend_version()
-            and chat.get("execution_mode", "direct") == self.execution_mode()
             and chat.get("archived_reason") != "backend_version_changed"
         )
 
@@ -2329,8 +2296,7 @@ class Database:
                 connection.execute(
                     """UPDATE chats SET archived_reason = 'backend_version_changed'
                        WHERE backend_version != ?
-                       AND (archived_reason IS NULL
-                            OR archived_reason = 'execution_mode_changed')""",
+                       AND archived_reason IS NULL""",
                     (target,),
                 )
             self._backend_setting("opencode_api_version", target)
@@ -2342,13 +2308,9 @@ class Database:
         return self._all(
             """SELECT * FROM chats WHERE backend_version = ? AND consultation = 0
                AND opencode_session_id NOT LIKE 'pending_%'
-               ORDER BY execution_mode, workspace_snapshot, created_at""",
+               ORDER BY workspace_snapshot, created_at""",
             (self.backend_version(),),
         )
-
-    def assert_execution_mode_ready(self) -> None:
-        if self._execution_mode_changing:
-            raise ExecutionModeChangingError("Меняется режим работы. Повторите запрос позже")
 
     def has_unfinished_jobs(self) -> bool:
         return self._one(
@@ -2356,50 +2318,6 @@ class Database:
                ('queued', 'dispatching', 'running', 'waiting_permission',
                 'waiting_question', 'cancelling') LIMIT 1"""
         ) is not None
-
-    def begin_execution_mode_change(self) -> None:
-        with self.transaction():
-            self.assert_execution_mode_ready()
-            if self.has_unfinished_jobs():
-                raise ValueError("Завершите или отмените все задания перед сменой режима")
-            self._execution_mode_changing = True
-
-    def end_execution_mode_change(self) -> None:
-        with self._lock:
-            self._execution_mode_changing = False
-
-    def set_execution_mode(self, mode: str, admin_id: str) -> None:
-        if mode not in EXECUTION_MODES:
-            raise ValueError("Unknown execution mode")
-        with self.transaction() as connection:
-            if self.has_unfinished_jobs():
-                raise ValueError("Завершите или отмените все задания перед сменой режима")
-            connection.execute(
-                """INSERT INTO settings(key, value, updated_by, updated_at)
-                   VALUES ('execution_mode', ?, ?, ?)
-                   ON CONFLICT(key) DO UPDATE SET value = excluded.value,
-                     updated_by = excluded.updated_by, updated_at = excluded.updated_at""",
-                (mode, admin_id, utcnow()),
-            )
-            connection.execute(
-                """UPDATE chats SET archived_reason = 'execution_mode_changed'
-                   WHERE execution_mode != ? AND archived_reason IS NULL""", (mode,),
-            )
-            connection.execute(
-                """UPDATE chats SET archived_reason = NULL
-                   WHERE execution_mode = ? AND backend_version = ?
-                   AND archived_reason = 'execution_mode_changed'""",
-                (mode, self.backend_version()),
-            )
-
-    def mode_snapshot_chats(self) -> list[dict[str, Any]]:
-        return self._all(
-            """SELECT * FROM chats WHERE execution_mode = ? AND backend_version = ?
-               AND consultation = 0
-               AND opencode_session_id NOT LIKE 'pending_%'
-               ORDER BY workspace_snapshot, created_at""",
-            (self.execution_mode(), self.backend_version()),
-        )
 
     def save_chat_history(self, chat_id: str, messages: list[dict[str, Any]]) -> None:
         with self.transaction() as connection:
@@ -2415,18 +2333,6 @@ class Database:
             "SELECT messages_json FROM chat_history_snapshots WHERE chat_id = ?", (chat_id,),
         )
         return json.loads(row["messages_json"]) if row else None
-
-    def isolated_workspace_conflict(
-        self, workspace: str, exclude_user_id: str | None = None,
-    ) -> bool:
-        path = Path(workspace).resolve()
-        for user in self.list_users():
-            if user["id"] == exclude_user_id or not user["workspace_path"]:
-                continue
-            other = Path(user["workspace_path"]).resolve()
-            if path == other or path.is_relative_to(other) or other.is_relative_to(path):
-                return True
-        return False
 
     def concurrency_override(self) -> int | None:
         row = self._one("SELECT value FROM settings WHERE key = 'max_active_sessions'")

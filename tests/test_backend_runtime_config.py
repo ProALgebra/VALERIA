@@ -1,10 +1,35 @@
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-from test_execution_mode_manager import runtime_factory as runtime_factory
 
 from opencode_web.config import ConfigError, Settings
-from opencode_web.podman_runtime import PodmanRuntime
+from opencode_web.opencode_client import OpenCodeManager
+
+
+@pytest.fixture
+async def runtime(settings, workspace, tmp_path, monkeypatch):
+    binary = tmp_path / "opencode"
+    binary.touch()
+    manager = OpenCodeManager(replace(
+        settings, opencode_bin=binary, opencode_v2_state_root=tmp_path / "v2-state",
+    ))
+    process = SimpleNamespace(pid=12345, returncode=None, wait=AsyncMock(return_value=0))
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr("opencode_web.opencode_client.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr(manager, "_signal_instance", lambda instance, sig: None)
+    monkeypatch.setattr(manager, "_free_port", lambda: 45100)
+
+    async def ready(instance):
+        instance.ready.set()
+        return instance.client
+
+    monkeypatch.setattr(manager, "_start_instance", ready)
+    try:
+        yield SimpleNamespace(manager=manager, spawn=spawn, workspace=workspace)
+    finally:
+        await manager.close()
 
 
 def test_v2_config_uses_fixed_username_and_password_precedence(monkeypatch, workspace):
@@ -18,7 +43,22 @@ def test_v2_config_uses_fixed_username_and_password_precedence(monkeypatch, work
     assert settings.opencode_api_version == "v2"
     assert settings.opencode_username == "opencode"
     assert settings.opencode_password == "new-password"
-    assert settings.podman_image.endswith(":2.3.0")
+
+
+def test_legacy_environment_keeps_v1_credentials_and_ignores_inactive_v2_config(
+    monkeypatch, workspace, tmp_path,
+):
+    monkeypatch.setenv("SESSION_SECRET", "x" * 32)
+    monkeypatch.setenv("ALLOWED_WORKSPACE_ROOTS", str(workspace))
+    monkeypatch.delenv("OPENCODE_API_VERSION", raising=False)
+    monkeypatch.setenv("OPENCODE_SERVER_USERNAME", "legacy-user")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "legacy-password")
+    monkeypatch.setenv("OPENCODE_PASSWORD", "v2-only-password")
+    monkeypatch.setenv("OPENCODE_V2_CONFIG_DIR", str(tmp_path / "absent-v2-config"))
+    settings = Settings.from_env()
+    assert settings.opencode_api_version == "v1"
+    assert settings.opencode_username == "legacy-user"
+    assert settings.opencode_password == "legacy-password"
 
 
 def test_unknown_backend_is_rejected(settings):
@@ -26,32 +66,39 @@ def test_unknown_backend_is_rejected(settings):
         replace(settings, opencode_api_version="invalid")
 
 
-async def test_direct_v2_separates_state_and_configuration(runtime_factory, tmp_path, monkeypatch):
-    t = runtime_factory()
-    t.manager.settings = replace(
-        t.manager.settings,
-        opencode_api_version="v2",
-        opencode_username="old-name",
-        opencode_v2_state_root=tmp_path / "v2-state",
+async def test_v1_launch_preserves_binary_configuration_and_state_paths(runtime, monkeypatch):
+    manager = runtime.manager
+    monkeypatch.setenv("OPENCODE_CONFIG", "/legacy/opencode.jsonc")
+    monkeypatch.setenv("XDG_DATA_HOME", "/legacy/data")
+    monkeypatch.setenv("XDG_STATE_HOME", "/legacy/state")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/legacy/cache")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/legacy/config")
+    await manager.ensure(str(runtime.workspace))
+    assert runtime.spawn.await_args.args == (
+        str(manager.settings.opencode_bin), "serve", "--hostname", "127.0.0.1", "--port", "45100",
     )
-    monkeypatch.setenv("OPENCODE_CONFIG", "/old/opencode.jsonc")
-    await t.manager.ensure(str(t.workspace))
-    env = t.direct_spawn.await_args.kwargs["env"]
-    assert env["OPENCODE_PASSWORD"] == t.manager.settings.opencode_password
+    env = runtime.spawn.await_args.kwargs["env"]
+    assert env["OPENCODE_CONFIG"] == "/legacy/opencode.jsonc"
+    for key, value in (
+        ("XDG_DATA_HOME", "/legacy/data"), ("XDG_STATE_HOME", "/legacy/state"),
+        ("XDG_CACHE_HOME", "/legacy/cache"), ("XDG_CONFIG_HOME", "/legacy/config"),
+    ):
+        assert env[key] == value
+    assert env["OPENCODE_SERVER_USERNAME"] == manager.settings.opencode_username
+    assert env["OPENCODE_SERVER_PASSWORD"] == manager.settings.opencode_password
+    assert not manager.settings.opencode_v2_state_root.exists()
+
+
+async def test_v2_separates_state_and_configuration(runtime, monkeypatch):
+    manager = runtime.manager
+    manager.settings = replace(manager.settings, opencode_api_version="v2", opencode_username="old")
+    monkeypatch.setenv("OPENCODE_CONFIG", "/legacy/opencode.jsonc")
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", "/legacy/config")
+    monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", "{}")
+    await manager.ensure(str(runtime.workspace))
+    env = runtime.spawn.await_args.kwargs["env"]
+    assert env["OPENCODE_PASSWORD"] == manager.settings.opencode_password
     assert "OPENCODE_SERVER_USERNAME" not in env
-    assert "OPENCODE_CONFIG" not in env
+    assert not {"OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT"} & env.keys()
     for key in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"):
-        assert str(tmp_path / "v2-state") in env[key]
-
-
-def test_podman_v2_uses_versioned_home_and_protected_password(settings, workspace, tmp_path):
-    config = replace(
-        settings, opencode_api_version="v2", podman_state_root=tmp_path / "podman-state"
-    )
-    v2 = PodmanRuntime(config).build_launch(workspace, 45100, "opencode", "test-secret")
-    v1 = PodmanRuntime(settings).build_launch(workspace, 45101, "old-name", "test-secret")
-    assert v2.home_path.is_relative_to(config.podman_state_root / "v2")
-    assert v2.home_path != v1.home_path
-    assert v2.env["OPENCODE_PASSWORD"] == "test-secret"
-    assert "OPENCODE_SERVER_USERNAME" not in v2.env
-    assert "test-secret" not in repr(v2)
+        assert str(manager.settings.opencode_v2_state_root) in env[key]

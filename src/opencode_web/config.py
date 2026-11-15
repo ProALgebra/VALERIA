@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ipaddress
-import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +39,7 @@ def _float(name: str, default: float, *, minimum: float = 0.1) -> float:
         value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number") from exc
-    if not math.isfinite(value) or value < minimum:
+    if value < minimum:
         raise ConfigError(f"{name} must be >= {minimum:g}")
     return value
 
@@ -88,14 +87,6 @@ class Settings:
     mattermost_ca_bundle: Path | None = None
     mattermost_timeout_seconds: float = 30.0
     mattermost_notification_max_attempts: int = 8
-    podman_bin: Path = Path("/usr/bin/podman")
-    podman_image: str = "localhost/valeria-opencode:1.18.25"
-    podman_state_root: Path = Path("./data/podman")
-    podman_config_dir: Path | None = None
-    podman_memory_mb: int = 4096
-    podman_cpus: float = 2.0
-    podman_pids_limit: int = 512
-    podman_forward_env: tuple[str, ...] = ()
     opencode_api_version: str = "v1"
     opencode_v2_state_root: Path = Path("./data/opencode-v2")
     opencode_v2_config_dir: Path | None = None
@@ -108,7 +99,7 @@ class Settings:
     def from_env(cls) -> Settings:
         api_version = os.getenv("OPENCODE_API_VERSION", "v1").strip().lower()
         v2_config = os.getenv("OPENCODE_V2_CONFIG_DIR", "").strip()
-        if v2_config and not (Path(v2_config) / "opencode.jsonc").is_file():
+        if api_version == "v2" and v2_config and not (Path(v2_config) / "opencode.jsonc").is_file():
             raise ConfigError("OPENCODE_V2_CONFIG_DIR must contain opencode.jsonc")
         host = os.getenv("APP_HOST", "127.0.0.1").strip()
         try:
@@ -206,23 +197,6 @@ class Settings:
             mattermost_timeout_seconds=_float("MATTERMOST_TIMEOUT_SECONDS", 30),
             mattermost_notification_max_attempts=_int(
                 "MATTERMOST_NOTIFICATION_MAX_ATTEMPTS", 8
-            ),
-            podman_bin=Path(os.getenv("PODMAN_BIN", "/usr/bin/podman")),
-            podman_image=os.getenv(
-                "PODMAN_IMAGE", "localhost/valeria-opencode:2.3.0" if api_version == "v2"
-                else "localhost/valeria-opencode:1.18.25"
-            ).strip(),
-            podman_state_root=Path(os.getenv("PODMAN_STATE_ROOT", "./data/podman")),
-            podman_config_dir=(
-                Path(os.environ["PODMAN_CONFIG_DIR"])
-                if os.getenv("PODMAN_CONFIG_DIR", "").strip() else None
-            ),
-            podman_memory_mb=_int("PODMAN_MEMORY_MB", 4096),
-            podman_cpus=_float("PODMAN_CPUS", 2.0),
-            podman_pids_limit=_int("PODMAN_PIDS_LIMIT", 512),
-            podman_forward_env=tuple(
-                name.strip() for name in os.getenv("PODMAN_FORWARD_ENV", "").split(",")
-                if name.strip()
             ),
             opencode_api_version=api_version,
             opencode_v2_state_root=Path(os.getenv("OPENCODE_V2_STATE_ROOT", "./data/opencode-v2")),

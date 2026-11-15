@@ -491,7 +491,7 @@ def dispatcher_case(tmp_path, monkeypatch):
         ]}
     )
 
-    async def ensure(workspace, *, expected_mode=None):
+    async def ensure(workspace):
         return client
 
     runner = QueueDispatcher(db, SimpleNamespace(ensure=ensure), EventBroker(), 1)

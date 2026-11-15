@@ -61,15 +61,12 @@ async def prepare_backend_switch(settings: Settings, target: str) -> int:
                 if not database.can_use_chat_backend(chat) and saved is not None:
                     snapshots[chat["id"]] = saved
                 else:
-                    groups[chat["execution_mode"]].append(chat)
-            for mode, chats in groups.items():
-                manager = OpenCodeManager(settings, execution_mode=mode)
+                    groups[chat["workspace_snapshot"]].append(chat)
+            if groups:
+                manager = OpenCodeManager(settings)
                 try:
-                    by_workspace: dict[str, list[dict]] = defaultdict(list)
-                    for chat in chats:
-                        by_workspace[chat["workspace_snapshot"]].append(chat)
-                    for workspace, workspace_chats in by_workspace.items():
-                        client = await manager.ensure(workspace, expected_mode=mode)
+                    for workspace, chats in groups.items():
+                        client = await manager.ensure(workspace)
                         statuses = await client.session_statuses()
                         if any(_busy(status) for status in statuses.values()):
                             raise ConfigError(
@@ -79,7 +76,7 @@ async def prepare_backend_switch(settings: Settings, target: str) -> int:
                             raise ConfigError(
                                 "Resolve pending OpenCode questions and permissions first"
                             )
-                        for chat in workspace_chats:
+                        for chat in chats:
                             snapshots[chat["id"]] = await client.messages(
                                 chat["opencode_session_id"]
                             )

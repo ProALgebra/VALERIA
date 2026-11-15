@@ -259,6 +259,14 @@ async def test_real_backend_prompt_history_events_and_questions(
                 consultation_result = database.consultation_jobs(consultation["id"])[0]
                 assert consultation_result["status"] == "completed", consultation_result
                 assert consultation_result["answer"] == "Local test answer"
+                # The legacy direct runtime must reopen saved sessions after a
+                # process restart, with the same configuration and state paths.
+                await manager.stop_workspace(str(workspace))
+                reopened = await manager.ensure(str(workspace))
+                history = await reopened.messages(completed["session_id"])
+                assert task_final_answer(history, completed["phase2_message_id"])["text"] == (
+                    "Local test answer"
+                )
             finally:
                 database.close()
     finally:
