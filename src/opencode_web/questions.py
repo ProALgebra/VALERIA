@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .opencode_client import OpenCodeClient
+from .backends import OpenCodeBackend
 
 
 def public_questions(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -41,7 +41,7 @@ def public_questions(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def session_questions(
-    client: OpenCodeClient, session_id: str, workspace: str
+    client: OpenCodeBackend, session_id: str, workspace: str
 ) -> list[dict[str, Any]]:
     """Only requests for this session or verified descendants in its workspace."""
     pending = await client.questions()

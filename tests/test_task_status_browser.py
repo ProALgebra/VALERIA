@@ -83,7 +83,8 @@ def test_task_status_launch_events_and_reconnect():
         for phase, label in (("plan", "Планирование"), ("build", "Выполнение")):
             run["phase"] = phase
             page.evaluate(
-                "task => taskEvents.onmessage({data: JSON.stringify({type: 'task.updated', task})})",
+                "task => taskEvents.onmessage({data: "
+                "JSON.stringify({type: 'task.updated', task})})",
                 run,
             )
             playwright.expect(badge).to_have_text(label)

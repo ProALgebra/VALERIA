@@ -4,6 +4,8 @@
 
 [English](#english) | [Русский](#русский)
 
+OpenCode v1/v2: [integration and migration guide](docs/opencode-v2.md) (Russian).
+
 ## English
 
 Administrative interface for running and routing LLM agents.
@@ -58,6 +60,16 @@ while jobs are queued or running.
 A [systemd setup with OpenCode/MCP/LSP process cleanup](docs/server-process-lifecycle.md)
 is available for the `/opt/valeria` deployment. Install it before using the updated
 `run-local.sh`; migration and rollback instructions are provided in that document.
+
+### Workspace isolation
+
+The administrator can switch the whole installation from the default `direct`
+mode to rootless Podman workers, each with its assigned workspace and private
+OpenCode state. Provision the non-root service account, worker image and provider
+configuration using [the Linux isolation guide](docs/opencode-isolation.md).
+Switching requires an idle queue and saves history before archiving conversations
+from the previous mode. Returning to a mode restores its conversations; task
+history and saved results remain available throughout.
 
 ### Tasks
 
@@ -347,6 +359,16 @@ Bootstrap-администратор создаётся только при пе
 OpenCode/MCP/LSP](docs/server-process-lifecycle.md). Его нужно установить перед
 использованием обновлённого `run-local.sh`; порядок переноса и отката описан
 в документе.
+
+### Изоляция рабочих папок
+
+Администратор может переключить всю установку из режима `direct` по умолчанию
+на rootless Podman: отдельное окружение с назначенной рабочей папкой и собственным
+состоянием OpenCode. Подготовка непривилегированной учётной записи сервиса, образа
+и провайдера описана в [инструкции для Linux](docs/opencode-isolation.md).
+Переключение требует отсутствия активных заданий и сохраняет историю перед
+архивацией диалогов предыдущего режима. Возврат к режиму восстанавливает его
+диалоги; история тасок и сохранённые результаты доступны в обоих режимах.
 
 ### Таски
 

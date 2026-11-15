@@ -8,18 +8,24 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opencode_web.database import Database
-from opencode_web.opencode_client import OpenCodeError, OpenCodeInstance, OpenCodeManager
+from opencode_web.opencode_client import (
+    OpenCodeClient,
+    OpenCodeError,
+    OpenCodeInstance,
+    OpenCodeManager,
+)
 
 
 @pytest.fixture
-def idle_manager(settings, workspace, monkeypatch):
+async def idle_manager(settings, workspace, monkeypatch):
     manager = OpenCodeManager(replace(settings, opencode_idle_timeout_seconds=15))
     response = {"/session/status": {}, "/permission": [], "/question": []}
 
     async def request(method, path, **kwargs):
         return response[path]
 
-    client = SimpleNamespace(_request=AsyncMock(side_effect=request))
+    client = OpenCodeClient("http://test", "", "")
+    client._request = AsyncMock(side_effect=request)
     instance = OpenCodeInstance(workspace, 45100, SimpleNamespace(returncode=None), client)
     instance.ready.set()
     manager._instances[str(workspace)] = instance
@@ -27,7 +33,8 @@ def idle_manager(settings, workspace, monkeypatch):
     monkeypatch.setattr(manager, "_stop_instance", AsyncMock())
     clock = [100.0]
     monkeypatch.setattr("opencode_web.opencode_client.monotonic", lambda: clock[0])
-    return manager, instance, response, clock
+    yield manager, instance, response, clock
+    await client.close()
 
 
 async def test_idle_stop_starts_countdown_only_after_confirmed_idle(idle_manager):

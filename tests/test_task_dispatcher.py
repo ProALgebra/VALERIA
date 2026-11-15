@@ -62,6 +62,9 @@ class TaskQueue:
     def active_jobs(self) -> list[dict[str, Any]]:
         return [dict(self.job)]
 
+    def backend_version(self) -> str:
+        return "v1"
+
     def get_job(self, job_id: str) -> dict[str, Any]:
         assert job_id == self.job["id"]
         return dict(self.job)

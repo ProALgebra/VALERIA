@@ -10,6 +10,8 @@ from functools import partial
 from typing import Any
 from weakref import WeakValueDictionary
 
+from .backends import OpenCodeBackend
+from .backends.contracts import OpenCodeSubmissionUncertain, OpenCodeTransportError
 from .consultations import CONSULTATION_PERMISSIONS, CONSULTATION_SYSTEM, final_answer
 from .database import Database
 from .events import EventBroker
@@ -18,7 +20,6 @@ from .opencode_client import (
     OPENCODE_RETRY_MAX_SECONDS,
     OpenCodeError,
     OpenCodeManager,
-    OpenCodeTransportError,
     _await_or_cancel,
     _wait_for_retry,
 )
@@ -64,9 +65,17 @@ class QueueDispatcher:
             event = asyncio.Event()
             self._retry_cancellations[job_id] = event
         job = self.database.get_job(job_id)
-        if self._stopping or not job or job["status"] in {
-            "completed", "failed", "cancelled", "cancelling",
-        }:
+        if (
+            self._stopping
+            or not job
+            or job["status"]
+            in {
+                "completed",
+                "failed",
+                "cancelled",
+                "cancelling",
+            }
+        ):
             event.set()
         return event
 
@@ -83,7 +92,11 @@ class QueueDispatcher:
                 raise asyncio.CancelledError
             try:
                 return await _await_or_cancel(request(), cancel_event)
-            except OpenCodeTransportError:
+            except OpenCodeError as exc:
+                if not isinstance(exc, OpenCodeTransportError) and (
+                    exc.status_code is None or exc.status_code < 500
+                ):
+                    raise
                 if self._stopping:
                     raise asyncio.CancelledError from None
                 logger.warning(
@@ -108,7 +121,11 @@ class QueueDispatcher:
         if job["status"] in {"completed", "failed", "cancelled"}:
             return job
         if not self.database.cancel_queued_job(job_id):
-            self.database.set_job_status(job_id, "cancelling")
+            self.database.set_job_status(
+                job_id,
+                "cancelling",
+                "submission_uncertain" if job.get("error_code") == "submission_uncertain" else None,
+            )
         job = self.database.get_job(job_id)
         if job["status"] == "cancelling":
             event = self._retry_cancellations.get(job_id)
@@ -127,6 +144,7 @@ class QueueDispatcher:
         self._cancellations[job_id] = task
         self._workers.add(task)
         task.add_done_callback(self._workers.discard)
+
         def forget(done: asyncio.Task[None]) -> None:
             if self._cancellations.get(job_id) is done:
                 self._cancellations.pop(job_id, None)
@@ -144,6 +162,13 @@ class QueueDispatcher:
                 try:
                     if not job.get("session_pending"):
                         client = await self.manager.ensure(job["workspace_snapshot"])
+                        if job.get("error_code") == "submission_uncertain":
+                            messages = await client.messages(job["session_id"])
+                            message_id = job.get("phase2_message_id") or job["message_id"]
+                            if not any(
+                                item.get("info", item).get("id") == message_id for item in messages
+                            ):
+                                raise OpenCodeError("Waiting to confirm the submitted input")
                         if not await client.abort(job["session_id"]):
                             raise OpenCodeError("Cancellation not accepted")
                         statuses = await client.session_statuses()
@@ -152,19 +177,34 @@ class QueueDispatcher:
                 except Exception:
                     # Keep capacity reserved on an uncertain outcome. Retry also
                     # survives restart through the durable cancelling status.
-                    first_failure = job.get("error_code") != "stop_unconfirmed"
-                    self.database.set_job_status(job_id, "cancelling", "stop_unconfirmed")
+                    first_failure = job.get("error_code") not in {
+                        "stop_unconfirmed",
+                        "submission_uncertain",
+                    }
+                    self.database.set_job_status(
+                        job_id,
+                        "cancelling",
+                        "submission_uncertain"
+                        if job.get("error_code") == "submission_uncertain"
+                        else "stop_unconfirmed",
+                    )
                     if first_failure:
                         self.database.audit(
-                            None, "job.stop.retry", effective_user_id=job["effective_user_id"],
-                            object_type="job", object_id=job_id,
+                            None,
+                            "job.stop.retry",
+                            effective_user_id=job["effective_user_id"],
+                            object_type="job",
+                            object_id=job_id,
                         )
                         await self._publish_job_update(job_id)
                 else:
                     self.database.set_job_status(job_id, "cancelled")
                     self.database.audit(
-                        None, "job.stop.completed", effective_user_id=job["effective_user_id"],
-                        object_type="job", object_id=job_id,
+                        None,
+                        "job.stop.completed",
+                        effective_user_id=job["effective_user_id"],
+                        object_type="job",
+                        object_id=job_id,
                     )
                     await self._publish_job_update(job_id)
                     self.wake()
@@ -226,6 +266,9 @@ class QueueDispatcher:
             if job["status"] == "cancelling":
                 self._start_cancellation(job["id"])
                 continue
+            if job.get("error_code") == "submission_uncertain":
+                self._spawn(self._recover_uncertain_submission(job), f"uncertain-job-{job['id']}")
+                continue
             try:
                 if job.get("session_pending"):
                     self.database.requeue_interrupted_job(job["id"])
@@ -258,8 +301,10 @@ class QueueDispatcher:
                         self.wake()
                         continue
                 task_pending = False
-                if (job.get("task_id") or job.get("consultation")) and not busy and (
-                    job["status"] != "cancelling"
+                if (
+                    (job.get("task_id") or job.get("consultation"))
+                    and not busy
+                    and (job["status"] != "cancelling")
                 ):
                     questions = await self._poll_opencode(
                         job["id"], "recovery-questions", client.questions
@@ -271,8 +316,11 @@ class QueueDispatcher:
                         request.get("sessionID") == job["session_id"]
                         for request in [*questions, *permissions]
                     )
-                if not job.get("task_id") and not job.get("consultation") and not busy and (
-                    job["status"] != "cancelling"
+                if (
+                    not job.get("task_id")
+                    and not job.get("consultation")
+                    and not busy
+                    and (job["status"] != "cancelling")
                 ):
                     task_pending = bool(
                         await self._poll_opencode(
@@ -294,8 +342,9 @@ class QueueDispatcher:
                         job["id"], "recovery-messages", partial(client.messages, job["session_id"])
                     )
                     user_found, result = self._message_result(
-                        messages, job.get("phase2_message_id") or job["message_id"],
-                        task_session=bool(job.get("task_id"))
+                        messages,
+                        job.get("phase2_message_id") or job["message_id"],
+                        task_session=bool(job.get("task_id")),
                     )
                     if job.get("consultation") and final_answer(messages, job["message_id"]):
                         result = "completed"
@@ -305,8 +354,11 @@ class QueueDispatcher:
                         self.database.set_job_status(
                             job["id"], "failed", "build_submission_uncertain"
                         )
-                    elif (result == "completed" and job.get("plan_first")
-                          and not job.get("phase2_message_id")):
+                    elif (
+                        result == "completed"
+                        and job.get("plan_first")
+                        and not job.get("phase2_message_id")
+                    ):
                         self.database.set_job_status(job["id"], "running")
                         self._spawn(self._execute(job, client), f"recovered-job-{job['id']}")
                     elif job["status"] == "dispatching" and not user_found:
@@ -323,9 +375,12 @@ class QueueDispatcher:
                                 await self._publish_job_update(job["id"])
                                 continue
                         elif job.get("task_id"):
-                            self.database.complete_task_run(job["id"], task_final_answer(
-                                messages, job.get("phase2_message_id") or job["message_id"]
-                            ))
+                            self.database.complete_task_run(
+                                job["id"],
+                                task_final_answer(
+                                    messages, job.get("phase2_message_id") or job["message_id"]
+                                ),
+                            )
                         else:
                             self.database.set_job_status(job["id"], "completed")
                     elif result == "failed":
@@ -346,6 +401,24 @@ class QueueDispatcher:
                 logger.exception("OpenCode recovery failed", extra={"job_id": job["id"]})
                 self.database.set_job_status(job["id"], "failed", "recovery_unavailable")
             await self._publish_job_update(job["id"])
+
+    async def _recover_uncertain_submission(self, job: dict[str, Any]) -> None:
+        while not self._stopping:
+            current = self.database.get_job(job["id"])
+            if not current or current["status"] in {
+                "cancelling",
+                "cancelled",
+                "completed",
+                "failed",
+            }:
+                return
+            try:
+                client = await self.manager.ensure(job["workspace_snapshot"])
+            except OpenCodeError:
+                await asyncio.sleep(POLL_READ_RETRY_MAX_SECONDS)
+                continue
+            await self._execute(current, client)
+            return
 
     async def _publish_job_update(self, job_id: str) -> None:
         job = self.database.get_job(job_id)
@@ -429,15 +502,13 @@ class QueueDispatcher:
     async def _answer_task_questions(
         self,
         job: dict[str, Any],
-        client: Any,
+        client: OpenCodeBackend,
         answered: set[str],
         failures: dict[str, int],
     ) -> bool:
         pending = [
             request
-            for request in await self._poll_opencode(
-                job["id"], "questions", client.questions
-            )
+            for request in await self._poll_opencode(job["id"], "questions", client.questions)
             if request.get("sessionID") == job["session_id"]
         ]
         for request in pending:
@@ -486,20 +557,29 @@ class QueueDispatcher:
             return QueueDispatcher._busy(kind) if kind else bool(status)
         return bool(status)
 
-    async def _execute(self, job: dict[str, Any], client: Any = None) -> None:
+    async def _execute(self, job: dict[str, Any], client: OpenCodeBackend | None = None) -> None:
         job_id = job["id"]
         try:
+            if job.get("backend_version", "v1") != self.database.backend_version():
+                raise TaskExecutionError("backend_version_mismatch")
             # A pending session has nothing to abort yet. Allow cancellation to
             # finish while cold startup is still waiting for readiness.
             prepared_client = None
             current = self.database.get_job(job_id)
-            if (client is None and current and current.get("session_pending")
-                    and current["status"] == "dispatching"):
+            if (
+                client is None
+                and current
+                and current.get("session_pending")
+                and current["status"] == "dispatching"
+            ):
                 prepared_client = await self.manager.ensure(job["workspace_snapshot"])
             async with self._job_lock(job_id):
                 current = self.database.get_job(job_id)
                 if not current or current["status"] in {
-                    "completed", "failed", "cancelled", "cancelling",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "cancelling",
                 }:
                     return
                 if client is None:
@@ -508,18 +588,20 @@ class QueueDispatcher:
                     if not current or current["status"] != "dispatching":
                         return
                     job = current
-                    if job.get("resume_monitor"):
+                    if job.get("resume_monitor") or job.get("error_code") == "submission_uncertain":
                         if job.get("session_pending"):
                             raise TaskExecutionError("invalid_monitor_resume")
                     else:
                         if job.get("session_pending"):
                             recover_only = bool(job.get("session_creation_started"))
                             session = await client.create_session(
-                                title=job.get("task_initial_title") or (
-                                    job["chat_title"] if job.get("consultation") else None
+                                title=job.get("task_initial_title")
+                                or (job["chat_title"] if job.get("consultation") else None),
+                                **(
+                                    {"permission": CONSULTATION_PERMISSIONS}
+                                    if job.get("consultation")
+                                    else {}
                                 ),
-                                **({"permission": CONSULTATION_PERMISSIONS}
-                                   if job.get("consultation") else {}),
                                 creation_key=job_id,
                                 recover_only=recover_only,
                                 cancel_event=self._retry_cancellation(job_id),
@@ -530,8 +612,10 @@ class QueueDispatcher:
                             session_id = session.get("id") or session.get("sessionID")
                             if not session_id:
                                 raise OpenCodeError("OpenCode returned no session ID")
-                            if (job.get("consultation") and session.get(
-                                    "permission", []) != CONSULTATION_PERMISSIONS):
+                            if (
+                                job.get("consultation")
+                                and session.get("permission", []) != CONSULTATION_PERMISSIONS
+                            ):
                                 with suppress(OpenCodeError):
                                     await client.delete_session(session_id)
                                 raise TaskExecutionError("consultation_permissions_unavailable")
@@ -551,38 +635,53 @@ class QueueDispatcher:
                             if session.get("permission"):
                                 agents = await self._poll_opencode(job_id, "agents", client.agents)
                                 standard = next(
-                                    (agent.get("permission") for agent in agents
-                                     if agent.get("name") == job["agent"]), None,
+                                    (
+                                        agent.get("permission")
+                                        for agent in agents
+                                        if agent.get("name") == job["agent"]
+                                    ),
+                                    None,
                                 )
                                 if not standard:
-                                    raise TaskExecutionError(
-                                        "consultation_permissions_unavailable"
-                                    )
-                                if session["permission"][-len(standard):] != standard:
+                                    raise TaskExecutionError("consultation_permissions_unavailable")
+                                if session["permission"][-len(standard) :] != standard:
                                     session = await client.update_session_permissions(
-                                        job["session_id"], standard,
+                                        job["session_id"],
+                                        standard,
                                     )
-                                    if session.get("permission", [])[-len(standard):] != standard:
+                                    if session.get("permission", [])[-len(standard) :] != standard:
                                         raise TaskExecutionError(
                                             "consultation_permissions_unavailable"
                                         )
                         current = self.database.get_job(job_id)
                         if not current or current["status"] != "dispatching":
                             return
-                        await client.send_prompt_async(
-                            job["session_id"],
-                            message_id=job.get("phase2_message_id") or job["message_id"],
-                            content=job.get("resume_content") or job["content"],
-                            agent="plan" if job.get("plan_first") and not job.get(
-                                "phase2_message_id"
-                            ) else job["agent"],
-                            provider_id=job["provider_id"],
-                            model_id=job["model_id"],
-                            model_variant=job["model_variant"],
-                            **({"system": CONSULTATION_SYSTEM}
-                               if job.get("consultation") else {}),
-                        )
-                self.database.set_job_status(job_id, "running")
+                        try:
+                            await client.send_prompt_async(
+                                job["session_id"],
+                                message_id=job.get("phase2_message_id") or job["message_id"],
+                                content=job.get("resume_content") or job["content"],
+                                agent="plan"
+                                if job.get("plan_first") and not job.get("phase2_message_id")
+                                else job["agent"],
+                                provider_id=job["provider_id"],
+                                model_id=job["model_id"],
+                                model_variant=job["model_variant"],
+                                **(
+                                    {"system": CONSULTATION_SYSTEM}
+                                    if job.get("consultation")
+                                    else {}
+                                ),
+                            )
+                        except OpenCodeSubmissionUncertain:
+                            self.database.set_job_status(job_id, "running", "submission_uncertain")
+                current = self.database.get_job(job_id)
+                uncertain = current and current.get("error_code") == "submission_uncertain"
+                self.database.set_job_status(
+                    job_id,
+                    "running",
+                    "submission_uncertain" if uncertain else None,
+                )
             await self.events.publish({"type": "job.updated", "job": self.database.get_job(job_id)})
             await self._monitor(job, client)
         except asyncio.CancelledError:
@@ -604,7 +703,9 @@ class QueueDispatcher:
         finally:
             current = self.database.get_job(job_id)
             if (job.get("task_id") or job.get("consultation")) and (
-                client and current and current["status"] == "failed"
+                client
+                and current
+                and current["status"] == "failed"
                 and not current.get("session_pending")
             ):
                 # Release a hidden interaction or generation after a terminal failure.
@@ -613,7 +714,9 @@ class QueueDispatcher:
             await self._publish_job_update(job_id)
             self.wake()
 
-    async def _start_build_phase(self, job: dict[str, Any], client: Any) -> dict[str, Any] | None:
+    async def _start_build_phase(
+        self, job: dict[str, Any], client: OpenCodeBackend
+    ) -> dict[str, Any] | None:
         async with self._job_lock(job["id"]):
             current = self.database.get_job(job["id"])
             if not current or current["status"] != "running":
@@ -627,26 +730,30 @@ class QueueDispatcher:
             # submission. Cancellation aborts this same session under this lock.
             try:
                 await client.send_prompt_async(
-                    current["session_id"], message_id=message_id,
-                    content=CONTINUE_PROMPT, agent=current["agent"],
-                    provider_id=current["provider_id"], model_id=current["model_id"],
+                    current["session_id"],
+                    message_id=message_id,
+                    content=CONTINUE_PROMPT,
+                    agent=current["agent"],
+                    provider_id=current["provider_id"],
+                    model_id=current["model_id"],
                     model_variant=current["model_variant"],
                 )
+            except OpenCodeSubmissionUncertain:
+                self.database.set_job_status(job["id"], "running", "submission_uncertain")
             except OpenCodeError:
                 messages = await self._poll_opencode(
-                    job["id"], "build-submission-messages",
+                    job["id"],
+                    "build-submission-messages",
                     partial(client.messages, current["session_id"]),
                 )
-                found, _ = self._message_result(
-                    messages, message_id, task_session=True
-                )
+                found, _ = self._message_result(messages, message_id, task_session=True)
                 if not found:
                     raise TaskExecutionError("build_submission_uncertain") from None
             current = self.database.get_job(job["id"])
         await self._publish_job_update(job["id"])
         return current
 
-    async def _monitor(self, job: dict[str, Any], client: Any) -> None:
+    async def _monitor(self, job: dict[str, Any], client: OpenCodeBackend) -> None:
         job_id = job["id"]
         idle_polls = 0
         live_status = "running"
@@ -661,13 +768,28 @@ class QueueDispatcher:
         while not self._stopping:
             current = self.database.get_job(job_id)
             if not current or current["status"] in {
-                "completed", "failed", "cancelled", "cancelling",
+                "completed",
+                "failed",
+                "cancelled",
+                "cancelling",
             }:
                 return
+            if current.get("error_code") == "submission_uncertain":
+                messages = await self._poll_opencode(
+                    job_id,
+                    "submission-reconciliation",
+                    partial(client.messages, job["session_id"]),
+                )
+                message_id = job.get("phase2_message_id") or job["message_id"]
+                if not any(item.get("info", item).get("id") == message_id for item in messages):
+                    await asyncio.sleep(2)
+                    continue
+                self.database.set_job_status(job_id, "running")
             statuses = await self._poll_opencode(
                 job_id, "session-statuses", client.session_statuses
             )
-            busy = self._busy(statuses.get(job["session_id"]))
+            status = statuses.get(job["session_id"])
+            busy = self._busy(status)
             pending_question = False
             if is_task:
                 async with self._job_lock(job_id):
@@ -703,14 +825,15 @@ class QueueDispatcher:
                     )
             current = self.database.get_job(job_id)
             if not current or current["status"] in {
-                "completed", "failed", "cancelled", "cancelling",
+                "completed",
+                "failed",
+                "cancelled",
+                "cancelling",
             }:
                 return
             idle_polls = 0 if busy or pending_question else idle_polls + 1
             if busy or is_task or is_consultation:
-                permissions = await self._poll_opencode(
-                    job_id, "permissions", client.permissions
-                )
+                permissions = await self._poll_opencode(job_id, "permissions", client.permissions)
                 waiting = any(
                     request.get("sessionID") == job["session_id"] for request in permissions
                 )
@@ -734,10 +857,14 @@ class QueueDispatcher:
             # prompt_async can return before its busy transition is visible.
             # Consecutive idle polls also cover very fast completed prompts.
             if idle_polls >= 3:
-                if is_consultation or is_task:
-                    messages = await self._poll_opencode(
-                        job_id, "messages", partial(client.messages, job["session_id"])
-                    )
+                messages = await self._poll_opencode(
+                    job_id, "messages", partial(client.messages, job["session_id"])
+                )
+                if not is_task and not is_consultation:
+                    # Correlate failure with this turn, not an earlier outcome.
+                    _, result = self._message_result(messages, job["message_id"])
+                    if result == "failed":
+                        raise TaskExecutionError("assistant_error")
                 if is_consultation:
                     answer = final_answer(messages, job["message_id"])
                     if not answer:
@@ -760,9 +887,12 @@ class QueueDispatcher:
                     idle_polls = 0
                     continue
                 if is_task:
-                    self.database.complete_task_run(job_id, task_final_answer(
-                        messages, job.get("phase2_message_id") or job["message_id"]
-                    ))
+                    self.database.complete_task_run(
+                        job_id,
+                        task_final_answer(
+                            messages, job.get("phase2_message_id") or job["message_id"]
+                        ),
+                    )
                 elif not is_consultation:
                     self.database.set_job_status(job_id, "completed")
                 return

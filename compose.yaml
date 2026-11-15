@@ -7,11 +7,13 @@ services:
       args:
         APP_UID: ${DOCKER_UID:-1000}
         APP_GID: ${DOCKER_GID:-1000}
+        OPENCODE_API_VERSION: ${OPENCODE_API_VERSION:-v1}
+        OPENCODE_V2_VERSION: ${OPENCODE_V2_VERSION:-2.3.0}
         OPENCODE_VERSION: ${OPENCODE_VERSION:-1.18.25}
         CONAN_VERSION: ${CONAN_VERSION:-2.27.0}
         GIT_USER_NAME: ${GIT_USER_NAME:-OpenCode Web}
         GIT_USER_EMAIL: ${GIT_USER_EMAIL:-opencode-web@localhost}
-    image: opencode-web:${OPENCODE_VERSION:-1.18.25}
+    image: opencode-web:${OPENCODE_API_VERSION:-v1}-${OPENCODE_VERSION:-1.18.25}-${OPENCODE_V2_VERSION:-2.3.0}
     init: true
     restart: unless-stopped
     networks:

@@ -41,11 +41,14 @@ async def mock_client(
 class LeaseTrackingManager:
     def __init__(self, client: OpenCodeClient):
         self.client = client
+        self.execution_mode = "direct"
         self.leases = 0
         self.clients: list[OpenCodeClient] = []
 
     @asynccontextmanager
-    async def use(self, workspace: str) -> AsyncIterator[OpenCodeClient]:
+    async def use(
+        self, workspace: str, *, expected_mode: str | None = None,
+    ) -> AsyncIterator[OpenCodeClient]:
         client = self.client
         self.clients.append(client)
         self.leases += 1
@@ -62,7 +65,7 @@ def recovery_delays(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def record_delay(delay: float, cancel_event: asyncio.Event | None = None) -> None:
         delays.append(delay)
 
-    monkeypatch.setattr("opencode_web.opencode_client._wait_for_retry", record_delay)
+    monkeypatch.setattr("opencode_web.backends.creation._wait_for_retry", record_delay)
     return delays
 
 
@@ -249,7 +252,7 @@ async def test_creation_state_is_marked_only_after_preflight_succeeds(
         events.append(("backoff", started))
         assert not started
 
-    monkeypatch.setattr("opencode_web.opencode_client._wait_for_retry", observe_backoff)
+    monkeypatch.setattr("opencode_web.backends.creation._wait_for_retry", observe_backoff)
     async with mock_client(transport) as client:
         session = await client.create_session(
             creation_key="preflight-state", creation_state=creation_state,
@@ -298,7 +301,7 @@ async def test_proven_unsent_creation_resets_state_before_backoff_and_can_restar
         assert states == [True, False]
         raise asyncio.CancelledError
 
-    monkeypatch.setattr("opencode_web.opencode_client._wait_for_retry", stop_at_backoff)
+    monkeypatch.setattr("opencode_web.backends.creation._wait_for_retry", stop_at_backoff)
     async with mock_client(transport) as client:
         with pytest.raises(asyncio.CancelledError):
             await client.create_session(
@@ -349,7 +352,7 @@ async def test_ambiguous_creation_keeps_started_state_through_recovery(
         assert started
         assert states == [True]
 
-    monkeypatch.setattr("opencode_web.opencode_client._wait_for_retry", observe_backoff)
+    monkeypatch.setattr("opencode_web.backends.creation._wait_for_retry", observe_backoff)
     async with mock_client(transport) as client:
         session = await client.create_session(
             creation_key="ambiguous-state", creation_state=creation_state,
@@ -590,7 +593,7 @@ async def test_creation_recovery_releases_leases_and_uses_replacement_client(
             manager.client = replacement_client
 
         monkeypatch.setattr(
-            "opencode_web.opencode_client._wait_for_retry", replace_during_backoff,
+            "opencode_web.backends.creation._wait_for_retry", replace_during_backoff,
         )
         session = await workspace_client.create_session(creation_key="replacement-key")
 
@@ -624,7 +627,9 @@ async def test_creation_state_stays_clear_until_post_client_acquisition_complete
 
     async with mock_client(transport) as client:
         @asynccontextmanager
-        async def use(workspace: str) -> AsyncIterator[OpenCodeClient]:
+        async def use(
+            workspace: str, *, expected_mode: str | None = None,
+        ) -> AsyncIterator[OpenCodeClient]:
             nonlocal acquisitions
             acquisitions += 1
             if acquisitions == 2:
@@ -634,7 +639,9 @@ async def test_creation_state_stays_clear_until_post_client_acquisition_complete
                 await never_acquire.wait()
             yield client
 
-        workspace_client = WorkspaceClient(SimpleNamespace(use=use), "workspace")
+        workspace_client = WorkspaceClient(
+            SimpleNamespace(use=use, execution_mode="direct"), "workspace",
+        )
         pending = asyncio.create_task(workspace_client.create_session(
             creation_key="post-acquisition", creation_state=creation_state,
         ))

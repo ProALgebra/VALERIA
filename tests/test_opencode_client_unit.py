@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
+import pytest
+
+from opencode_web.backends.contracts import OpenCodeProtocolError
 from opencode_web.opencode_client import OpenCodeClient
 
 
@@ -36,3 +39,13 @@ async def test_session_title_requests_are_owned_by_opencode() -> None:
         ("GET", "/session", {}),
         ("GET", "/session/session-1", {}),
     ]
+
+
+@pytest.mark.parametrize("history", [None, {}, ["invalid"], [{"info": {}, "parts": None}]])
+async def test_invalid_history_cannot_be_saved_as_a_migration_snapshot(history) -> None:
+    class InvalidHistoryClient(RecordingOpenCodeClient):
+        async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+            return history
+
+    with pytest.raises(OpenCodeProtocolError, match="message history"):
+        await InvalidHistoryClient().messages("session-1")

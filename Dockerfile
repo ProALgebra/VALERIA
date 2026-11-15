@@ -1,10 +1,18 @@
 FROM node:22-bookworm-slim AS opencode-build
 
+ARG OPENCODE_API_VERSION=v1
 ARG OPENCODE_VERSION=1.18.25
-RUN npm install --global --omit=dev "opencode-ai@${OPENCODE_VERSION}"
+ARG OPENCODE_V2_VERSION=2.3.0
+RUN case "${OPENCODE_API_VERSION}" in \
+        v1) npm install --global --omit=dev "opencode-ai@${OPENCODE_VERSION}" ;; \
+        v2) npm install --global --omit=dev "@opencode/cli@${OPENCODE_V2_VERSION}" ;; \
+        *) exit 1 ;; \
+    esac \
+    && cp -L /usr/local/bin/opencode /tmp/opencode-launcher
 
 FROM ubuntu:24.04
 
+ARG OPENCODE_API_VERSION=v1
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APP_UID=1000
 ARG APP_GID=1000
@@ -31,9 +39,10 @@ RUN apt-get update \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=opencode-build /usr/local/lib/node_modules/opencode-ai /usr/local/lib/node_modules/opencode-ai
-RUN ln -s /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bin/opencode \
-    && ln -s /usr/local/bin/opencode /usr/bin/opencode \
+COPY --from=opencode-build /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=opencode-build /tmp/opencode-launcher /usr/local/bin/opencode
+COPY --from=opencode-build /usr/local/bin/node /usr/local/bin/node
+RUN ln -s /usr/local/bin/opencode /usr/bin/opencode \
     && /usr/bin/opencode --version \
     && if id ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \
     && groupadd --gid "${APP_GID}" appuser \
@@ -42,6 +51,7 @@ RUN ln -s /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bi
     && ln -s /usr/bin/python3.12 /home/appuser/.pyenv/versions/3.12.3/bin/python3.12
 
 ENV HOME=/home/appuser \
+    OPENCODE_API_VERSION=${OPENCODE_API_VERSION} \
     PATH=/opt/venv/bin:/home/appuser/.local/bin:/usr/local/bin:/usr/bin:/bin \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

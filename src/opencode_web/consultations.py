@@ -147,6 +147,8 @@ def register_consultations(
     def summary(db, chat, *, admin=False):
         result = {key: chat.get(key) for key in ("id", "title", "created_at", "updated_at")}
         result["status"] = db.consultation_status(chat["id"])
+        result["archived_reason"] = chat.get("archived_reason")
+        result["execution_mode"] = chat.get("execution_mode", "direct")
         if admin:
             result["owner_user_id"] = chat["owner_user_id"]
             result["owner_login"] = (db.get_user(chat["owner_user_id"]) or {}).get("login")
@@ -286,13 +288,16 @@ def register_consultations(
         db: Annotated[Database, Depends(database)],
     ) -> list[dict[str, Any]]:
         chat = owned(db, principal, chat_id)
+        if chat.get("archived_reason"):
+            return []
         if not db.waiting_consultation_job(chat_id):
             return []
         if chat["opencode_session_id"].startswith("pending_"):
             return []
         try:
             async with request.app.state.manager.use(
-                chat["workspace_snapshot"], wake=False, activity=False
+                chat["workspace_snapshot"], wake=False, activity=False,
+                expected_mode=chat["execution_mode"],
             ) as client:
                 if client is None:
                     return []
@@ -318,7 +323,9 @@ def register_consultations(
             if not job:
                 raise HTTPException(409, "Вопрос уже закрыт или недоступен")
             try:
-                client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
+                client = await request.app.state.manager.ensure(
+                    chat["workspace_snapshot"], expected_mode=chat["execution_mode"],
+                )
                 pending = await session_questions(
                     client, chat["opencode_session_id"], chat["workspace_snapshot"]
                 )

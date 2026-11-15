@@ -301,7 +301,7 @@ async def test_cancel_during_session_creation_backoff_releases_worker(accepted, 
     client.abort = AsyncMock(return_value=True)
     t.manager.ensure.side_effect = None
     t.manager.ensure.return_value = client
-    monkeypatch.setattr("opencode_web.opencode_client.OPENCODE_RETRY_INITIAL_SECONDS", 10800)
+    monkeypatch.setattr("opencode_web.backends.creation.OPENCODE_RETRY_INITIAL_SECONDS", 10800)
     worker = asyncio.create_task(t.runner._execute(job))
     try:
         await asyncio.wait_for(attempted.wait(), 1)

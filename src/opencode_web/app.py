@@ -9,21 +9,24 @@ from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .backend_switch import database_process_lock
 from .config import ConfigError, Settings
 from .consultations import public_job as public_consultation_job
 from .consultations import register_consultations
 from .database import (
     DEFAULT_QUEUE_ID,
     Database,
+    ExecutionModeChangingError,
     normalize_mattermost_user_id,
     normalize_mattermost_username,
 )
 from .dispatcher import QueueDispatcher
 from .events import EventBroker
+from .execution_modes import register_execution_modes
 from .notifications import (
     MattermostNotificationError,
     NotificationDispatcher,
@@ -331,17 +334,17 @@ def safe_model_catalog(payload: dict[str, Any], allowed: tuple[str, ...]) -> lis
 
 
 def session_id_from(value: Any) -> str | None:
-    if isinstance(value, dict):
-        for key in ("sessionID", "session_id"):
-            if isinstance(value.get(key), str):
-                return value[key]
-        for item in value.values():
-            if result := session_id_from(item):
-                return result
-    elif isinstance(value, list):
-        for item in value:
-            if result := session_id_from(item):
-                return result
+    if not isinstance(value, dict):
+        return None
+    payload = value.get("payload", value)
+    if not isinstance(payload, dict):
+        return None
+    properties = payload.get("properties", {})
+    if not isinstance(properties, dict):
+        return None
+    for owner in (properties, properties.get("info"), properties.get("part")):
+        if isinstance(owner, dict) and isinstance(owner.get("sessionID"), str):
+            return owner["sessionID"]
     return None
 
 
@@ -370,6 +373,8 @@ def safe_mcp_statuses(payload: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def can_receive_event(database: Database, user: dict[str, Any], event: dict[str, Any]) -> bool:
+    if event.get("type") == "execution_mode.updated":
+        return True
     if user["role"] == "admin":
         return True
     if event.get("type") == "job.updated":
@@ -438,53 +443,71 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        database = Database(settings.database_path, settings.session_secret)
-        database.initialize()
-        database.ensure_default_queue_limit(settings.max_active_sessions_hard_limit)
-        bootstrap_admin(database, settings)
-        events = EventBroker()
-
-        async def publish_opencode(event: dict[str, Any]) -> None:
-            if event.get("type") == "opencode.disconnected":
-                await events.publish(event)
-            else:
-                await events.publish(safe_opencode_event(event))
-
-        manager = OpenCodeManager(settings, publish_opencode)
-        dispatcher = QueueDispatcher(
-            database,
-            manager,
-            events,
-            settings.max_active_sessions,
-            settings.max_active_sessions_per_user or None,
-        )
-        notification_dispatcher = NotificationDispatcher(database, settings)
-        app.state.settings = settings
-        app.state.database = database
-        app.state.events = events
-        app.state.manager = manager
-        app.state.dispatcher = dispatcher
-        app.state.notification_dispatcher = notification_dispatcher
-        manager.start_idle_reaper(database.workspace_has_pending_jobs)
-        try:
-            if start_dispatcher:
-                dispatcher.start()
-                notification_dispatcher.start()
-            yield
-        finally:
+        with database_process_lock(settings.database_path):
+            database = Database(settings.database_path, settings.session_secret)
+            database.initialize()
             try:
-                await notification_dispatcher.stop()
+                database.activate_backend(settings.opencode_api_version)
+            except ValueError as exc:
+                database.close()
+                raise ConfigError(str(exc)) from exc
+            database.ensure_default_queue_limit(settings.max_active_sessions_hard_limit)
+            bootstrap_admin(database, settings)
+            events = EventBroker()
+
+            async def publish_opencode(event: dict[str, Any]) -> None:
+                if event.get("type") == "opencode.disconnected":
+                    await events.publish(event)
+                else:
+                    await events.publish(safe_opencode_event(event))
+
+            manager = OpenCodeManager(
+                settings, publish_opencode, execution_mode=database.execution_mode(),
+            )
+            dispatcher = QueueDispatcher(
+                database,
+                manager,
+                events,
+                settings.max_active_sessions,
+                settings.max_active_sessions_per_user or None,
+            )
+            notification_dispatcher = NotificationDispatcher(database, settings)
+            app.state.settings = settings
+            app.state.database = database
+            app.state.events = events
+            app.state.manager = manager
+            app.state.dispatcher = dispatcher
+            app.state.notification_dispatcher = notification_dispatcher
+            try:
+                try:
+                    await manager.recover_runtime()
+                except OpenCodeError:
+                    # Keep the administration interface available for repairing Podman.
+                    # Worker startup will retry reconciliation and never fall back to direct.
+                    logger.exception("Isolated runtime recovery failed; workers remain unavailable")
+                manager.start_idle_reaper(database.workspace_has_pending_jobs)
+                if start_dispatcher:
+                    dispatcher.start()
+                    notification_dispatcher.start()
+                yield
             finally:
                 try:
-                    await dispatcher.stop()
+                    await notification_dispatcher.stop()
                 finally:
                     try:
-                        await manager.close()
+                        await dispatcher.stop()
                     finally:
-                        database.close()
+                        try:
+                            await manager.close()
+                        finally:
+                            database.close()
 
     app = FastAPI(title="OpenCode Web", version="0.1.0", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
+
+    @app.exception_handler(ExecutionModeChangingError)
+    async def execution_mode_busy(request: Request, exc: ExecutionModeChangingError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     def database(request: Request) -> Database:
         return request.app.state.database
@@ -559,10 +582,14 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     async def refresh_chat_title(
         request: Request, db: Database, chat: dict[str, Any]
     ) -> dict[str, Any]:
+        if not db.can_use_chat_backend(chat):
+            return chat
         if chat["opencode_session_id"].startswith("pending_"):
             return chat
         try:
-            client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
+            client = await request.app.state.manager.ensure(
+                chat["workspace_snapshot"], expected_mode=chat["execution_mode"],
+            )
             session = await client.session(chat["opencode_session_id"])
         except OpenCodeError:
             return chat
@@ -571,8 +598,12 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     async def sync_chat_titles(
         request: Request, db: Database, chats: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
+        mode = db.execution_mode()
         by_workspace: dict[str, list[dict[str, Any]]] = {}
         for chat in chats:
+            stored = db.get_chat(chat["id"])
+            if stored and not db.can_use_chat_backend(stored):
+                continue
             by_workspace.setdefault(chat["workspace_snapshot"], []).append(chat)
 
         async def refresh_workspace(
@@ -580,7 +611,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         ) -> list[dict[str, Any]]:
             try:
                 async with request.app.state.manager.use(
-                    workspace, wake=False, activity=False
+                    workspace, wake=False, activity=False, expected_mode=mode,
                 ) as client:
                     if client is None:
                         return []
@@ -651,6 +682,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             workspace, exclude_user_id=exclude_user_id
         ):
             raise HTTPException(409, "Workspace is already assigned")
+        if db.execution_mode() == "podman" and db.isolated_workspace_conflict(
+            workspace, exclude_user_id,
+        ):
+            raise HTTPException(409, "Для изоляции рабочие папки не должны пересекаться")
         return workspace
 
     def validate_agent_model(
@@ -679,6 +714,8 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         content = body.message.strip() if body.message else ""
         if not content:
             return None
+        if chat.get("archived_reason"):
+            raise HTTPException(409, "Диалог архивирован")
         if db.queued_count() >= config.max_queued_messages:
             raise HTTPException(429, "Queue is full")
         pinned_model = None
@@ -798,6 +835,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             "agents": list(settings.allowed_agents),
             "default_agent": settings.default_agent,
             "default_model": settings.default_model,
+            "execution_mode": request.app.state.database.execution_mode(),
         }
         if user["role"] == "admin":
             result["max_active_jobs_hard_limit"] = (
@@ -831,6 +869,8 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             else:
                 result["selected_model"] = config.default_model
             result["selected_model_variant"] = chat.get("preferred_model_variant")
+            if not db.can_use_chat_backend(chat):
+                return result
             if chat["opencode_session_id"].startswith("pending_"):
                 return result
         if not workspace and principal["user"]["role"] == "admin":
@@ -951,14 +991,22 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         result = db.get_task_result(run_id)
         if result is None:
             answer = None
+            chat = db.get_chat(job["chat_id"])
+            cached = db.saved_chat_history(job["chat_id"])
+            if cached is not None:
+                answer = task_final_answer(
+                    cached, job.get("phase2_message_id") or job["message_id"]
+                )
             if not job.get("session_pending") and not (
                 job.get("plan_first") and not job.get("phase2_message_id")
-            ):
+            ) and cached is None and db.can_use_chat_backend(chat):
                 try:
                     # Only legacy runs need OpenCode. Bound startup/history latency;
                     # transient failures must remain retryable, not be cached as empty.
                     async with asyncio.timeout(20):
-                        client = await request.app.state.manager.ensure(job["workspace_snapshot"])
+                        client = await request.app.state.manager.ensure(
+                            job["workspace_snapshot"], expected_mode=chat["execution_mode"],
+                        )
                         messages = await client.messages(job["session_id"])
                     answer = task_final_answer(
                         messages, job.get("phase2_message_id") or job["message_id"]
@@ -1139,11 +1187,16 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         job = db.get_task_run(run_id)
         if not job:
             raise HTTPException(404, "Task run not found")
-        if job.get("session_pending"):
+        chat = db.get_chat(job["chat_id"])
+        if not db.can_use_chat_backend(chat):
+            messages = db.saved_chat_history(chat["id"]) or db.chat_submission_messages(chat["id"])
+        elif job.get("session_pending"):
             messages = db.chat_submission_messages(job["chat_id"])
         else:
             try:
-                client = await request.app.state.manager.ensure(job["workspace_snapshot"])
+                client = await request.app.state.manager.ensure(
+                    job["workspace_snapshot"], expected_mode=chat["execution_mode"],
+                )
                 messages = await client.messages(job["session_id"])
             except OpenCodeError as exc:
                 raise HTTPException(503, "OpenCode is unavailable") from exc
@@ -1225,10 +1278,14 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> list[dict[str, Any]]:
         chat = owned_chat(db, principal, chat_id)
         pending = db.chat_submission_messages(chat_id)
+        if not db.can_use_chat_backend(chat):
+            return db.saved_chat_history(chat_id) or pending
         if chat["opencode_session_id"].startswith("pending_"):
             return pending
         try:
-            client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
+            client = await request.app.state.manager.ensure(
+                chat["workspace_snapshot"], expected_mode=chat["execution_mode"],
+            )
             messages = safe_messages(await client.messages(chat["opencode_session_id"]))
         except OpenCodeError as exc:
             raise HTTPException(503, "OpenCode is unavailable") from exc
@@ -1243,11 +1300,13 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> list[dict[str, Any]]:
         chat = owned_chat(db, principal, chat_id)
-        if chat["opencode_session_id"].startswith("pending_"):
+        if (not db.can_use_chat_backend(chat)
+                or chat["opencode_session_id"].startswith("pending_")):
             return []
         try:
             async with request.app.state.manager.use(
-                chat["workspace_snapshot"], wake=False, activity=False
+                chat["workspace_snapshot"], wake=False, activity=False,
+                expected_mode=chat["execution_mode"],
             ) as client:
                 if client is None:
                     return []
@@ -1267,11 +1326,15 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, bool]:
         chat = owned_chat(db, principal, chat_id)
+        if not db.can_use_chat_backend(chat):
+            raise HTTPException(409, "Диалог создан в другом режиме работы")
         try:
             # Recheck pending state under the same lock as sending.
             # A retry/second tab must never send a second answer to a resolved request.
             async with question_reply_lock:
-                client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
+                client = await request.app.state.manager.ensure(
+                    chat["workspace_snapshot"], expected_mode=chat["execution_mode"],
+                )
                 pending = await session_questions(
                     client, chat["opencode_session_id"], chat["workspace_snapshot"]
                 )
@@ -1316,11 +1379,13 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> list[dict[str, Any]]:
         chat = owned_chat(db, principal, chat_id)
-        if chat["opencode_session_id"].startswith("pending_"):
+        if (not db.can_use_chat_backend(chat)
+                or chat["opencode_session_id"].startswith("pending_")):
             return []
         try:
             async with request.app.state.manager.use(
-                chat["workspace_snapshot"], wake=False, activity=False
+                chat["workspace_snapshot"], wake=False, activity=False,
+                expected_mode=chat["execution_mode"],
             ) as client:
                 if client is None:
                     return []
@@ -1339,10 +1404,14 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
         chat = owned_chat(db, principal, chat_id)
+        if not db.can_use_chat_backend(chat):
+            return {"servers": [], "archived": True}
         if chat["opencode_session_id"].startswith("pending_"):
             return {"servers": [], "pending": True}
         try:
-            client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
+            client = await request.app.state.manager.ensure(
+                chat["workspace_snapshot"], expected_mode=chat["execution_mode"],
+            )
             return {"servers": safe_mcp_statuses(await client.mcp_statuses())}
         except OpenCodeError as exc:
             raise HTTPException(503, "MCP status is unavailable") from exc
@@ -1429,8 +1498,12 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         if body.response not in {"once", "always", "reject"}:
             raise HTTPException(422, "Invalid permission response")
         chat = owned_chat(db, principal, chat_id)
+        if not db.can_use_chat_backend(chat):
+            raise HTTPException(409, "Диалог создан в другом режиме работы")
         try:
-            client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
+            client = await request.app.state.manager.ensure(
+                chat["workspace_snapshot"], expected_mode=chat["execution_mode"],
+            )
             accepted = await client.respond_permission(
                 chat["opencode_session_id"],
                 permission_id,
@@ -1973,5 +2046,8 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     register_consultations(
         app, settings, database, current_principal, csrf_principal,
         admin_read_principal, admin_principal, validate_agent_model,
+    )
+    register_execution_modes(
+        app, settings, database, admin_read_principal, admin_principal,
     )
     return app
