@@ -10,6 +10,16 @@ from functools import partial
 from typing import Any
 from weakref import WeakValueDictionary
 
+from .artifacts import (
+    CONSULTATION_ARTIFACT_INSTRUCTIONS,
+    ArtifactError,
+    ConsultationArtifacts,
+)
+from .attachments import (
+    CONSULTATION_ATTACHMENT_INSTRUCTIONS,
+    AttachmentError,
+    ConsultationAttachments,
+)
 from .backends import OpenCodeBackend
 from .backends.contracts import OpenCodeSubmissionUncertain, OpenCodeTransportError
 from .consultations import CONSULTATION_PERMISSIONS, CONSULTATION_SYSTEM, final_answer
@@ -45,12 +55,16 @@ class QueueDispatcher:
         events: EventBroker,
         default_limit: int,
         per_user_default: int | None = None,
+        artifacts: ConsultationArtifacts | None = None,
+        attachments: ConsultationAttachments | None = None,
     ):
         self.database = database
         self.manager = manager
         self.events = events
         self.default_limit = default_limit
         self.per_user_default = per_user_default
+        self.artifacts = artifacts
+        self.attachments = attachments
         self._task: asyncio.Task[None] | None = None
         self._workers: set[asyncio.Task[None]] = set()
         self._wake = asyncio.Event()
@@ -367,11 +381,29 @@ class QueueDispatcher:
                         if job.get("consultation"):
                             answer = final_answer(messages, job["message_id"])
                             if answer:
-                                self.database.complete_consultation_run(job["id"], answer)
+                                if self.artifacts:
+                                    try:
+                                        self.artifacts.publish_outbox(
+                                            job["chat_id"], job["id"]
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "Cannot publish recovered consultation outbox",
+                                            extra={"job_id": job["id"]},
+                                        )
+                                completed = self.database.complete_consultation_run(
+                                    job["id"], answer
+                                )
+                                if completed and self.artifacts:
+                                    with suppress(Exception):
+                                        self.artifacts.cleanup_staging(
+                                            job["chat_id"], job["id"]
+                                        )
                             else:
                                 self.database.set_job_status(
                                     job["id"], "failed", "incomplete_response"
                                 )
+                                self._discard_consultation_artifacts(job)
                                 await self._publish_job_update(job["id"])
                                 continue
                         elif job.get("task_id"):
@@ -385,8 +417,10 @@ class QueueDispatcher:
                             self.database.set_job_status(job["id"], "completed")
                     elif result == "failed":
                         self.database.set_job_status(job["id"], "failed", "assistant_error")
+                        self._discard_consultation_artifacts(job)
                     else:
                         self.database.set_job_status(job["id"], "failed", "interrupted_by_restart")
+                        self._discard_consultation_artifacts(job)
             except asyncio.CancelledError:
                 current_task = asyncio.current_task()
                 if self._stopping or (current_task is not None and current_task.cancelling()):
@@ -400,6 +434,7 @@ class QueueDispatcher:
             except OpenCodeError:
                 logger.exception("OpenCode recovery failed", extra={"job_id": job["id"]})
                 self.database.set_job_status(job["id"], "failed", "recovery_unavailable")
+                self._discard_consultation_artifacts(job)
             await self._publish_job_update(job["id"])
 
     async def _recover_uncertain_submission(self, job: dict[str, Any]) -> None:
@@ -419,6 +454,11 @@ class QueueDispatcher:
                 continue
             await self._execute(current, client)
             return
+
+    def _discard_consultation_artifacts(self, job: dict[str, Any]) -> None:
+        if self.artifacts and job.get("consultation"):
+            with suppress(Exception):
+                self.artifacts.cleanup_job(job["id"])
 
     async def _publish_job_update(self, job_id: str) -> None:
         job = self.database.get_job(job_id)
@@ -656,6 +696,43 @@ class QueueDispatcher:
                         current = self.database.get_job(job_id)
                         if not current or current["status"] != "dispatching":
                             return
+                        system_prompt = CONSULTATION_SYSTEM
+                        system_prompt = CONSULTATION_SYSTEM
+                        if job.get("consultation") and self.artifacts:
+                            try:
+                                staging = self.artifacts.prepare_job(job["chat_id"], job_id)
+                            except ArtifactError as exc:
+                                logger.warning(
+                                    "Cannot prepare consultation artifact staging",
+                                    extra={"job_id": job_id, "reason": exc.code},
+                                )
+                                raise TaskExecutionError("artifact_staging_unavailable") from exc
+                            system_prompt = (
+                                f"{CONSULTATION_SYSTEM}\n\n"
+                                + CONSULTATION_ARTIFACT_INSTRUCTIONS.format(
+                                    outbox=str(staging.outbox),
+                                    work=str(staging.work),
+                                )
+                            )
+                        if job.get("consultation") and self.attachments:
+                            try:
+                                attached = self.attachments.ensure_inbox(job_id)
+                            except AttachmentError as exc:
+                                logger.warning(
+                                    "Cannot prepare consultation attachments",
+                                    extra={"job_id": job_id, "reason": exc.code},
+                                )
+                                raise TaskExecutionError("attachment_input_unavailable") from exc
+                            if attached:
+                                files = "\n".join(
+                                    "- {name} ({content_type}, {size_bytes} bytes): {path}".format(
+                                        **item
+                                    )
+                                    for item in attached
+                                )
+                                system_prompt += "\n\n" + (
+                                    CONSULTATION_ATTACHMENT_INSTRUCTIONS.format(files=files)
+                                )
                         try:
                             await client.send_prompt_async(
                                 job["session_id"],
@@ -668,7 +745,7 @@ class QueueDispatcher:
                                 model_id=job["model_id"],
                                 model_variant=job["model_variant"],
                                 **(
-                                    {"system": CONSULTATION_SYSTEM}
+                                    {"system": system_prompt}
                                     if job.get("consultation")
                                     else {}
                                 ),
@@ -711,6 +788,8 @@ class QueueDispatcher:
                 # Release a hidden interaction or generation after a terminal failure.
                 with suppress(OpenCodeError):
                     await client.abort(job["session_id"])
+            if current and current["status"] in {"failed", "cancelled"}:
+                self._discard_consultation_artifacts(job)
             await self._publish_job_update(job_id)
             self.wake()
 
@@ -869,7 +948,18 @@ class QueueDispatcher:
                     answer = final_answer(messages, job["message_id"])
                     if not answer:
                         raise TaskExecutionError("incomplete_response")
+                    if self.artifacts:
+                        try:
+                            self.artifacts.publish_outbox(job["chat_id"], job_id)
+                        except Exception:
+                            logger.exception(
+                                "Cannot publish consultation outbox",
+                                extra={"job_id": job_id},
+                            )
                     self.database.complete_consultation_run(job_id, answer)
+                    if self.artifacts:
+                        with suppress(Exception):
+                            self.artifacts.cleanup_staging(job["chat_id"], job_id)
                 if is_task:
                     _, result = self._message_result(
                         messages,

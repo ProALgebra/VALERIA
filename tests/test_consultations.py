@@ -9,6 +9,7 @@ from test_api import FakeManager, FakeOpenCodeClient, login
 from test_task_dispatcher import TaskClient
 
 from opencode_web.app import create_app, event_for_user
+from opencode_web.artifacts import ArtifactError
 from opencode_web.consultations import CONSULTATION_PERMISSIONS, CONSULTATION_SYSTEM, final_answer
 from opencode_web.database import Database
 from opencode_web.dispatcher import QueueDispatcher
@@ -510,6 +511,87 @@ async def test_dispatcher_persists_only_final_answer(dispatcher_case):
     assert client.prompts[0]["content"] == "Question"
     assert db.get_job(job["id"])["content"] == "Question"
     client.update_session_permissions.assert_not_awaited()
+
+
+class StubArtifacts:
+    def __init__(self, root):
+        self.root = root
+        self.published = []
+        self.cleaned = []
+        self.staging_cleaned = []
+
+    def prepare_job(self, chat_id, job_id):
+        root = self.root / chat_id / job_id
+        work = root / "work"
+        outbox = root / "outbox"
+        work.mkdir(parents=True, exist_ok=True)
+        outbox.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(work=work, outbox=outbox)
+
+    def publish_outbox(self, chat_id, job_id):
+        self.published.append((chat_id, job_id))
+        return []
+
+    def cleanup_job(self, job_id):
+        self.cleaned.append(job_id)
+
+    def cleanup_staging(self, chat_id, job_id):
+        self.staging_cleaned.append((chat_id, job_id))
+
+
+async def test_dispatcher_adds_outbox_instructions_and_publishes_fallback(dispatcher_case):
+    db, runner, client, job = dispatcher_case
+    stub = StubArtifacts(db.path.parent / "stub-staging")
+    runner.artifacts = stub
+    await runner._execute(job)
+    system = client.prompts[0]["system"]
+    assert system.startswith(CONSULTATION_SYSTEM)
+    assert str(stub.root / job["chat_id"] / job["id"] / "outbox") in system
+    assert "consultation-artifacts MCP server" in system
+    assert "artifact_publish" in system
+    assert stub.published == [(job["chat_id"], job["id"])]
+    assert stub.staging_cleaned == [(job["chat_id"], job["id"])]
+    assert stub.cleaned == []
+
+
+class StubAttachments:
+    def ensure_inbox(self, job_id):
+        return [{
+            "name": "notes.txt",
+            "path": "/staging/inbox/notes.txt",
+            "content_type": "text/plain",
+            "size_bytes": 5,
+        }]
+
+
+async def test_dispatcher_lists_user_attachments_for_the_agent(dispatcher_case):
+    db, runner, client, job = dispatcher_case
+    runner.artifacts = StubArtifacts(db.path.parent / "stub-staging")
+    runner.attachments = StubAttachments()
+    await runner._execute(job)
+    system = client.prompts[0]["system"]
+    assert system.startswith(CONSULTATION_SYSTEM)
+    assert "notes.txt" in system
+    assert "/staging/inbox/notes.txt" in system
+    assert "read-only" in system
+    assert "недоверенным" in system
+    assert client.prompts[0]["content"] == "Question"
+
+
+class StagingFailureArtifacts(StubArtifacts):
+    def prepare_job(self, chat_id, job_id):
+        raise ArtifactError("staging_unavailable", "No staging")
+
+
+async def test_dispatcher_fails_job_when_staging_is_unavailable(dispatcher_case):
+    db, runner, client, job = dispatcher_case
+    runner.artifacts = StagingFailureArtifacts(db.path.parent / "stub-staging")
+    await runner._execute(job)
+    failed = db.get_job(job["id"])
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "artifact_staging_unavailable"
+    assert runner.artifacts.cleaned == [job["id"]]
+    assert client.prompts == []
 
 
 async def test_old_consultation_inherits_standard_tools_without_losing_history(dispatcher_case):

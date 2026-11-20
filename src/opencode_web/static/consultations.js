@@ -20,7 +20,18 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
   const messageKey = (message, index) => `${message.role}:${message.id ?? index}`;
   const messageTextHTML = message => message.role === "assistant" ? renderMarkdown(message.text) : esc(message.text);
   const messageStatusHTML = message => message.status !== "completed" ? `<div class="meta" role="status">${esc(status(message.status))}</div>` : "";
-  const messageHTML = (message, index) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-text ${message.role === "assistant" ? "markdown-body" : ""}">${messageTextHTML(message)}</div>${message.role === "assistant" ? `<div class="message-actions"><button class="message-copy" type="button" data-copy-message="${index}" aria-label="Копировать ответ агента">Копировать</button></div>` : messageStatusHTML(message)}</article>`;
+  const formatBytes = value => {
+    if (!Number.isFinite(value) || value < 1024) return `${value || 0} Б`;
+    const units = ["КБ", "МБ", "ГБ"];
+    let size = value;
+    let unit = -1;
+    do { size /= 1024; unit += 1; } while (size >= 1024 && unit < units.length - 1);
+    return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
+  };
+  const messageFiles = message => message.role === "assistant" ? (message.artifacts || []) : (message.attachments || []);
+  const filesSignature = message => JSON.stringify(messageFiles(message).map(file => [file.id, file.name, file.size_bytes, file.download_url]));
+  const filesHTML = message => messageFiles(message).map(file => `<a class="message-file" href="${esc(file.download_url)}" download><span class="message-file-name">${esc(file.name)}</span><span class="message-file-meta">${esc(formatBytes(file.size_bytes))}</span></a>`).join("");
+  const messageHTML = (message, index) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-text ${message.role === "assistant" ? "markdown-body" : ""}">${messageTextHTML(message)}</div><div class="message-files">${filesHTML(message)}</div>${message.role === "assistant" ? `<div class="message-actions"><button class="message-copy" type="button" data-copy-message="${index}" aria-label="Копировать ответ агента">Копировать</button></div>` : messageStatusHTML(message)}</article>`;
   const jobsHTML = jobs => (jobs || []).map(job => `<tr><td class="mono">${esc(job.id)}</td><td>${esc(job.queue || "Основная")}</td><td>${esc(job.model)}</td><td>${esc(job.agent)}</td><td>${esc(status(job.status))}</td></tr>`).join("");
 
   function updateMessages(target, messages) {
@@ -39,13 +50,19 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
       if (!row) {
         const template = document.createElement("template");
         template.innerHTML = messageHTML(message, index);
-        row = {element: template.content.firstElementChild, text: message.text, status: message.status};
+        row = {element: template.content.firstElementChild, text: message.text, status: message.status, files: filesSignature(message)};
         messageRows.set(key, row);
       } else {
         // Compare source data; the browser normalizes HTML entities when parsing.
         if (row.text !== message.text) {
           row.element.querySelector(".message-text").innerHTML = messageTextHTML(message);
           row.text = message.text;
+          changed = true;
+        }
+        const files = filesSignature(message);
+        if (row.files !== files) {
+          row.element.querySelector(".message-files").innerHTML = filesHTML(message);
+          row.files = files;
           changed = true;
         }
         if (message.role === "user" && row.status !== message.status) {
@@ -146,19 +163,21 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
     const queues = (queueItems || []).filter(queue => queue.status !== "archived");
     if (!queues.length) queues.push({id: "default", name: "Основная"});
     if (config?.model && !models.some(model => model.id === config.model)) models.push({id: config.model, name: config.model});
-    const controls = admin ? `<section class="card"><h2>Настройки консультаций</h2><form id="consultation-settings" class="toolbar"><label for="consultation-model">Модель</label><select class="input" id="consultation-model" name="model" required><option value="">Выберите модель</option>${models.map(model => `<option value="${esc(model.id)}" ${model.id === config.model ? "selected" : ""}>${esc(model.name)} · ${esc(model.id)}</option>`).join("")}</select><label for="consultation-queue">Очередь</label><select class="input" id="consultation-queue" name="queue_id" required>${queues.map(queue => `<option value="${esc(queue.id)}" ${queue.id === (config.queue_id || "default") ? "selected" : ""}>${esc(queue.name)}</option>`).join("")}</select><button class="btn btn-primary">Сохранить</button></form><p class="hint">Изменения применяются к следующим вопросам. Режим всегда Build.</p></section><form id="consultation-filter" class="toolbar"><input class="input" name="q" placeholder="Поиск по названию или пользователю" aria-label="Поиск диалогов"><select class="input" name="owner_id" aria-label="Пользователь"><option value="">Все пользователи</option>${users.map(user => `<option value="${esc(user.id)}">${esc(user.login)}</option>`).join("")}</select><button class="btn">Найти</button></form>` : `<section class="card"><h2>Новый диалог</h2><form id="consultation-new"><div class="field"><label for="consultation-question">Ваш вопрос</label><textarea class="input" id="consultation-question" name="message" rows="4" maxlength="100000" required placeholder="Задайте вопрос консультанту"></textarea></div><button class="btn btn-primary" ${state.me.workspace_path ? "" : "disabled"}>Начать диалог</button>${state.me.workspace_path ? "" : `<p class="hint">Для консультаций администратор должен назначить рабочую папку.</p>`}</form></section>`;
+    const controls = admin ? `<section class="card"><h2>Настройки консультаций</h2><form id="consultation-settings" class="toolbar"><label for="consultation-model">Модель</label><select class="input" id="consultation-model" name="model" required><option value="">Выберите модель</option>${models.map(model => `<option value="${esc(model.id)}" ${model.id === config.model ? "selected" : ""}>${esc(model.name)} · ${esc(model.id)}</option>`).join("")}</select><label for="consultation-queue">Очередь</label><select class="input" id="consultation-queue" name="queue_id" required>${queues.map(queue => `<option value="${esc(queue.id)}" ${queue.id === (config.queue_id || "default") ? "selected" : ""}>${esc(queue.name)}</option>`).join("")}</select><button class="btn btn-primary">Сохранить</button></form><p class="hint">Изменения применяются к следующим вопросам. Режим всегда Build.</p></section><form id="consultation-filter" class="toolbar"><input class="input" name="q" placeholder="Поиск по названию или пользователю" aria-label="Поиск диалогов"><select class="input" name="owner_id" aria-label="Пользователь"><option value="">Все пользователи</option>${users.map(user => `<option value="${esc(user.id)}">${esc(user.login)}</option>`).join("")}</select><button class="btn">Найти</button></form>` : `<section class="card"><h2>Новый диалог</h2><form id="consultation-new"><div class="field"><label for="consultation-question">Ваш вопрос</label><textarea class="input" id="consultation-question" name="message" rows="4" maxlength="100000" required placeholder="Задайте вопрос консультанту"></textarea></div><div class="field"><label for="consultation-new-files">Файлы</label><input class="input" id="consultation-new-files" name="files" type="file" multiple></div><p class="hint">До 10 файлов, каждый не больше 20 МБ.</p><button class="btn btn-primary" ${state.me.workspace_path ? "" : "disabled"}>Начать диалог</button>${state.me.workspace_path ? "" : `<p class="hint">Для консультаций администратор должен назначить рабочую папку.</p>`}</form></section>`;
     app.innerHTML = shell(`<div class="page">${controls}<section class="card"><h2>${admin ? "Диалоги пользователей" : "Мои диалоги"}</h2><div id="consultation-list">${listRows(items, admin)}</div></section></div>`, admin ? "Админка · Консультации" : "Консультации");
     bindShell();
     bindRows(admin);
     app.querySelector("#consultation-new")?.addEventListener("submit", async event => {
       event.preventDefault();
       const form = event.currentTarget;
-      const message = new FormData(form).get("message").trim();
+      const data = new FormData(form);
+      const message = String(data.get("message") || "").trim();
       if (!message) return;
+      data.set("message", message);
       const button = form.querySelector("button");
       button.disabled = true;
       try {
-        const result = await api(prefix(false), {method: "POST", body: JSON.stringify({message})});
+        const result = await api(prefix(false), {method: "POST", body: data});
         if (form.isConnected) await navigate(`/consultations/${encodeURIComponent(result.id)}`);
       } catch (error) { notify(error.message); }
       finally { button.disabled = false; }
@@ -190,7 +209,7 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
     if (version !== revision || current !== id || !state.route.endsWith("consultation")) return;
     currentStatus = data.status;
     currentArchived = data.archived_reason === "backend_version_changed";
-    const composer = admin ? `<p class="hint">Просмотр диалога пользователя ${esc(data.owner_login)}</p>` : `<p class="hint" id="consultation-archive" hidden>Диалог архивирован после смены конфигурации OpenCode. Для продолжения создайте новый диалог.</p><div id="consultation-questions"></div><form id="consultation-send" class="composer"><textarea class="input" name="message" rows="3" maxlength="100000" required aria-label="Сообщение" placeholder="Продолжить диалог"></textarea><button class="btn btn-primary">Отправить</button></form>`;
+    const composer = admin ? `<p class="hint">Просмотр диалога пользователя ${esc(data.owner_login)}</p>` : `<p class="hint" id="consultation-archive" hidden>Диалог архивирован после смены конфигурации OpenCode. Для продолжения создайте новый диалог.</p><div id="consultation-questions"></div><form id="consultation-send" class="composer"><textarea class="input" name="message" rows="3" maxlength="100000" required aria-label="Сообщение" placeholder="Продолжить диалог"></textarea><label class="file-button"><input name="files" type="file" multiple aria-label="Прикрепить файлы"> Файлы</label><button class="btn btn-primary">Отправить</button></form>`;
     app.innerHTML = shell(`<div class="page consultation-page"><div class="toolbar"><button class="btn" id="consultation-back">← Все диалоги</button><span id="consultation-status" role="status">${esc(status(data.status))}</span></div><section class="card consultation-conversation"><div class="messages" id="consultation-messages"></div>${composer}</section>${admin ? `<section class="card"><h3>Задания консультации</h3><div class="table-wrap"><table><thead><tr><th>Задание</th><th>Очередь</th><th>Модель</th><th>Режим</th><th>Статус</th></tr></thead><tbody id="consultation-jobs">${jobsHTML(data.jobs)}</tbody></table></div></section>` : ""}</div>`, data.title);
     bindShell();
     app.querySelector("#consultation-back").addEventListener("click", () => {
@@ -222,11 +241,16 @@ export function consultationUI({api, shell, bindShell, state, app, esc, notify, 
       const input = form.elements.message;
       const message = input.value.trim();
       if (!message) return;
+      const data = new FormData(form);
+      data.set("message", message);
       const button = form.querySelector("button");
       button.disabled = true;
       try {
-        await api(`${prefix(false)}/${encodeURIComponent(id)}/messages`, {method: "POST", body: JSON.stringify({message})});
-        if (input.value.trim() === message) input.value = "";
+        await api(`${prefix(false)}/${encodeURIComponent(id)}/messages`, {method: "POST", body: data});
+        if (input.value.trim() === message) {
+          input.value = "";
+          form.querySelector('input[type="file"]').value = "";
+        }
         if (form.isConnected) await refresh();
       } catch (error) { notify(error.message); }
       finally { button.disabled = false; }

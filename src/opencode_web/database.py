@@ -375,6 +375,56 @@ class Database:
                            ) WHERE task_id IS NOT NULL"""
                     )
             self._migrate_queue_job_status_constraint()
+            # Keep artifact metadata out of SCHEMA: the queue_jobs status
+            # migration above rebuilds that table on older databases.
+            self._connection.execute(
+                """CREATE TABLE IF NOT EXISTS consultation_artifacts (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL REFERENCES queue_jobs(id) ON DELETE CASCADE,
+                    original_name TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                    sha256 TEXT NOT NULL,
+                    description TEXT,
+                    storage_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'ready', 'expired', 'missing')),
+                    created_at TEXT NOT NULL,
+                    deleted_at TEXT,
+                    UNIQUE(job_id, sha256)
+                )"""
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_consultation_artifacts_chat "
+                "ON consultation_artifacts(chat_id, created_at)"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_consultation_artifacts_job "
+                "ON consultation_artifacts(job_id, status)"
+            )
+            self._connection.execute(
+                """CREATE TABLE IF NOT EXISTS consultation_attachments (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL REFERENCES queue_jobs(id) ON DELETE CASCADE,
+                    original_name TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                    sha256 TEXT NOT NULL,
+                    storage_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(job_id, sha256)
+                )"""
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_consultation_attachments_chat "
+                "ON consultation_attachments(chat_id, created_at)"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_consultation_attachments_job "
+                "ON consultation_attachments(job_id)"
+            )
             for table in ("chats", "queue_jobs"):
                 columns = {row[1] for row in self._connection.execute(
                     f"PRAGMA table_info({table})"
@@ -1859,6 +1909,13 @@ class Database:
             ).fetchone()
             if not current or current["status"] != "completed":
                 return False
+            # Artifacts are only visible when the answer they belong to is
+            # complete. Promotion is part of the same durable transaction.
+            connection.execute(
+                """UPDATE consultation_artifacts SET status = 'ready'
+                   WHERE job_id = ? AND status = 'pending'""",
+                (job_id,),
+            )
             self._enqueue_notification(
                 connection,
                 dedupe_key=f"consultation-answer:{job_id}",
@@ -2163,6 +2220,228 @@ class Database:
                 (utcnow(), row["chat_id"]),
             )
         return True
+
+    def active_consultation_job(self, chat_id: str) -> dict[str, Any] | None:
+        row = self._one(
+            """SELECT q.id FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+               WHERE q.chat_id = ? AND c.consultation = 1
+                 AND q.status IN ('dispatching', 'running', 'waiting_question',
+                                  'waiting_permission')
+               ORDER BY q.sequence DESC LIMIT 1""",
+            (chat_id,),
+        )
+        return self.get_job(row["id"]) if row else None
+
+    def active_consultation_jobs(self) -> list[dict[str, Any]]:
+        return self._all(
+            """SELECT q.id AS job_id, q.chat_id, q.status,
+                      q.session_id AS job_session_id,
+                      c.opencode_session_id, c.workspace_snapshot,
+                      c.title AS chat_title
+               FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+               WHERE c.consultation = 1
+                 AND q.status IN ('dispatching', 'running', 'waiting_question',
+                                  'waiting_permission')
+               ORDER BY q.sequence DESC"""
+        )
+
+    def create_consultation_artifact(
+        self,
+        *,
+        artifact_id: str,
+        chat_id: str,
+        job_id: str,
+        original_name: str,
+        content_type: str,
+        size_bytes: int,
+        sha256: str,
+        description: str | None,
+        storage_key: str,
+        max_files: int,
+        max_total_bytes: int,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            job = connection.execute(
+                """SELECT q.id, q.status, c.consultation
+                   FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+                   WHERE q.id = ? AND q.chat_id = ?""",
+                (job_id, chat_id),
+            ).fetchone()
+            if (
+                not job
+                or not job["consultation"]
+                or job["status"] not in {
+                    "dispatching", "running", "waiting_question", "waiting_permission",
+                }
+            ):
+                raise ValueError("inactive_consultation_job")
+            existing = connection.execute(
+                "SELECT * FROM consultation_artifacts WHERE job_id = ? AND sha256 = ?",
+                (job_id, sha256),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            counts = connection.execute(
+                """SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS total
+                   FROM consultation_artifacts
+                   WHERE job_id = ? AND status IN ('pending', 'ready')""",
+                (job_id,),
+            ).fetchone()
+            if int(counts["count"]) >= max_files:
+                raise ValueError("artifact_file_limit")
+            if int(counts["total"]) + size_bytes > max_total_bytes:
+                raise ValueError("artifact_total_limit")
+            connection.execute(
+                """INSERT INTO consultation_artifacts
+                   (id, chat_id, job_id, original_name, content_type, size_bytes,
+                    sha256, description, storage_key, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (
+                    artifact_id, chat_id, job_id, original_name, content_type,
+                    size_bytes, sha256, description, storage_key, utcnow(),
+                ),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM consultation_artifacts WHERE id = ?", (artifact_id,)
+            ).fetchone())
+
+    def promote_consultation_artifacts(self, job_id: str) -> int:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE consultation_artifacts SET status = 'ready'
+                   WHERE job_id = ? AND status = 'pending'""",
+                (job_id,),
+            )
+            return cursor.rowcount
+
+    def discard_pending_consultation_artifacts(self, job_id: str) -> list[str]:
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """SELECT storage_key FROM consultation_artifacts
+                   WHERE job_id = ? AND status = 'pending'""",
+                (job_id,),
+            ).fetchall()
+            connection.execute(
+                "DELETE FROM consultation_artifacts WHERE job_id = ? AND status = 'pending'",
+                (job_id,),
+            )
+            return [row["storage_key"] for row in rows]
+
+    def consultation_artifacts_for_chat(
+        self,
+        chat_id: str,
+        *,
+        statuses: tuple[str, ...] = ("ready",),
+        job_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        query = (
+            "SELECT * FROM consultation_artifacts "
+            f"WHERE chat_id = ? AND status IN ({placeholders})"
+        )
+        params: list[Any] = [chat_id, *statuses]
+        if job_id is not None:
+            query += " AND job_id = ?"
+            params.append(job_id)
+        query += " ORDER BY created_at, id"
+        return self._all(query, tuple(params))
+
+    def consultation_artifact(
+        self, chat_id: str, artifact_id: str
+    ) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM consultation_artifacts WHERE chat_id = ? AND id = ?",
+            (chat_id, artifact_id),
+        )
+
+    def mark_consultation_artifact_missing(self, artifact_id: str) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE consultation_artifacts
+                   SET status = 'missing', deleted_at = COALESCE(deleted_at, ?)
+                   WHERE id = ? AND status != 'expired'""",
+                (utcnow(), artifact_id),
+            )
+
+    def create_consultation_attachment(
+        self,
+        *,
+        attachment_id: str,
+        chat_id: str,
+        job_id: str,
+        original_name: str,
+        content_type: str,
+        size_bytes: int,
+        sha256: str,
+        storage_key: str,
+        max_files: int,
+        max_total_bytes: int,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            job = connection.execute(
+                """SELECT q.id, q.status, c.consultation
+                   FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+                   WHERE q.id = ? AND q.chat_id = ?""",
+                (job_id, chat_id),
+            ).fetchone()
+            if (
+                not job
+                or not job["consultation"]
+                or job["status"] not in {
+                    "queued", "dispatching", "running", "waiting_question",
+                    "waiting_permission",
+                }
+            ):
+                raise ValueError("inactive_consultation_job")
+            existing = connection.execute(
+                "SELECT * FROM consultation_attachments WHERE job_id = ? AND sha256 = ?",
+                (job_id, sha256),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            counts = connection.execute(
+                """SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS total
+                   FROM consultation_attachments WHERE job_id = ?""",
+                (job_id,),
+            ).fetchone()
+            if int(counts["count"]) >= max_files:
+                raise ValueError("attachment_file_limit")
+            if int(counts["total"]) + size_bytes > max_total_bytes:
+                raise ValueError("attachment_total_limit")
+            connection.execute(
+                """INSERT INTO consultation_attachments
+                   (id, chat_id, job_id, original_name, content_type, size_bytes,
+                    sha256, storage_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    attachment_id, chat_id, job_id, original_name, content_type,
+                    size_bytes, sha256, storage_key, utcnow(),
+                ),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM consultation_attachments WHERE id = ?", (attachment_id,)
+            ).fetchone())
+
+    def consultation_attachments_for_chat(
+        self, chat_id: str, *, job_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM consultation_attachments WHERE chat_id = ?"
+        params: list[Any] = [chat_id]
+        if job_id is not None:
+            query += " AND job_id = ?"
+            params.append(job_id)
+        query += " ORDER BY created_at, id"
+        return self._all(query, tuple(params))
+
+    def consultation_attachment(
+        self, chat_id: str, attachment_id: str
+    ) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM consultation_attachments WHERE chat_id = ? AND id = ?",
+            (chat_id, attachment_id),
+        )
 
     def delete_empty_consultation(self, chat_id: str) -> None:
         with self.transaction() as connection:
