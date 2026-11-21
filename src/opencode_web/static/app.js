@@ -1,6 +1,7 @@
 import {consultationUI} from "./consultations.js?v=10";
 import {questionPanel} from "./questions.js?v=1";
 import {renderMarkdown} from "./markdown.js?v=1";
+import {vflowUI} from "./vflow.js?v=7";
 
 const app = document.querySelector("#app");
 const toast = document.querySelector("#toast");
@@ -34,6 +35,38 @@ const state = {
   stoppingJobs: new Set(),
   statisticsDay: null,
   statisticsRequest: 0,
+  selectedPipeline: null,
+  pipelineRuns: [],
+  pipelineRunStatus: "",
+  pipelineRunOffset: 0,
+  pipelineRunHasMore: false,
+  pipelineRunsLoading: false,
+  adminPipelineId: null,
+  vflowSource: "",
+  vflowEtag: null,
+  vflowDefinitionId: null,
+  vflowSourceInitialized: false,
+  vflowCompile: null,
+  vflowDiagnostics: [],
+  vflowDiagnosticEdge: null,
+  vflowTab: "code",
+  vflowSelectedNode: null,
+  vflowDirty: false,
+  vflowRunId: null,
+  vflowRunDetail: null,
+  vflowEventFilter: "",
+  vflowGraph: null,
+  vflowGraphDirty: false,
+  vflowUndoStack: [],
+  vflowRedoStack: [],
+  vflowConnecting: null,
+  vflowPublicSchema: null,
+  vflowInputSchema: null,
+  vflowPaletteQuery: "",
+  vflowZoom: 1,
+  vflowPanX: 0,
+  vflowPanY: 0,
+  vflowEnabled: true,
 };
 
 const TITLE_SYNC_INTERVAL_MS = 5000;
@@ -43,12 +76,27 @@ const esc = (value = "") => String(value).replace(/[&<>'"]/g, char => ({
 })[char]);
 
 const consultations = consultationUI({api, shell, bindShell, state, app, esc, notify, navigate});
+const vflow = vflowUI({api, shell, bindShell, state, app, esc, notify, navigate});
 
-function notify(message) {
-  toast.textContent = message;
+function notify(message, kind = "status") {
+  const text = String(message ?? "");
+  const isError = kind === "error" || kind === "alert";
   toast.hidden = false;
+  toast.classList.remove("is-hidden");
+  toast.removeAttribute("aria-hidden");
+  toast.setAttribute("role", isError ? "alert" : "status");
+  toast.setAttribute("aria-live", isError ? "assertive" : "polite");
+  toast.setAttribute("aria-atomic", "true");
   clearTimeout(notify.timer);
-  notify.timer = setTimeout(() => { toast.hidden = true; }, 3500);
+  // Clear first so repeating the same message is announced again.
+  toast.textContent = "";
+  requestAnimationFrame(() => {
+    toast.textContent = text;
+  });
+  notify.timer = setTimeout(() => {
+    toast.classList.add("is-hidden");
+    toast.setAttribute("aria-hidden", "true");
+  }, isError ? 6000 : 3500);
 }
 
 // Keep the same request key after an uncertain network failure; share in-flight clicks.
@@ -57,6 +105,7 @@ async function api(path, options = {}) {
   const queued = options.method === "POST" && (
     path === "/api/chats" || path === "/api/consultations" ||
     /^\/api\/tasks\/[^/]+\/runs$/.test(path) ||
+    /^\/api\/pipelines\/[^/]+\/runs$/.test(path) ||
     /^\/api\/(?:admin\/)?(?:chats|consultations)\/[^/]+\/messages$/.test(path)
   );
   if (!queued) return apiRequest(path, options);
@@ -94,13 +143,25 @@ async function apiRequest(path, options = {}) {
   }
   if (!response.ok) {
     let detail = `Ошибка ${response.status}`;
-    try { detail = (await response.json()).detail || detail; } catch (_) { /* empty */ }
+    try {
+      const payload = await response.json();
+      detail = payload.error?.message || payload.detail || detail;
+    } catch (_) { /* empty */ }
     const error = new Error(detail);
     error.status = response.status;
     throw error;
   }
   if (response.status === 204) return null;
   return response.json();
+}
+
+async function loadPublicConfig() {
+  try {
+    const config = await api("/api/config/public");
+    state.vflowEnabled = config.vflow_enabled !== false;
+  } catch (_) {
+    state.vflowEnabled = true;
+  }
 }
 
 function renderLogin(error = "") {
@@ -126,7 +187,7 @@ function renderLogin(error = "") {
     button.disabled = true;
     try {
       const result = await api("/api/auth/login", {method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))});
-      state.me = result.user; state.csrf = result.csrf_token; state.options = null; startEvents(); await renderLocation();
+      state.me = result.user; state.csrf = result.csrf_token; state.options = null; await loadPublicConfig(); startEvents(); await renderLocation();
     } catch (err) {
       renderLogin(err.message);
     }
@@ -134,14 +195,14 @@ function renderLogin(error = "") {
 }
 
 function navButton(route, label) {
-  return `<button data-route="${route}" class="${state.route === route ? "active" : ""}">${label}</button>`;
+  return `<button type="button" data-route="${route}" class="${state.route === route ? "active" : ""}"${state.route === route ? ' aria-current="page"' : ""}>${label}</button>`;
 }
 
 function defaultRoute() {
   return state.me?.tasks_only ? "tasks" : "dialogs";
 }
 
-const routeNames = new Set(["dialogs", "consultations", "templates", "tasks", "profile", "statistics", "admin-consultations", "admin-tasks", "task-access", "users", "queue", "audit"]);
+const routeNames = new Set(["dialogs", "consultations", "templates", "tasks", "pipelines", "profile", "statistics", "admin-consultations", "admin-tasks", "admin-pipelines", "admin-pipeline-editor", "task-access", "users", "queue", "audit"]);
 
 function locationTarget() {
   const raw = location.hash.replace(/^#\/?/, "");
@@ -176,15 +237,16 @@ async function renderLocation() {
 function shell(content, title = "V.A.L.E.R.I.A.") {
   const admin = state.me.role === "admin";
   return `<div class="shell">
-    <aside class="sidebar">
+    <aside class="sidebar" aria-label="Боковая панель">
       <div class="brand"><span class="brand-mark">⌘</span> V.A.L.E.R.I.A. </div>
-      <nav class="nav">
+      <nav class="nav" id="main-nav" aria-label="Основная навигация">
         ${state.me.tasks_only ? "" : navButton("dialogs", "▣ Диалоги")}
         ${navButton("consultations", "◌ Консультации")}
         ${state.me.tasks_only ? "" : navButton("templates", "▱ Шаблоны")}
         ${navButton("tasks", "✓ Таски")}
+        ${state.vflowEnabled ? navButton("pipelines", "▤ Пайплайны") : ""}
         ${admin ? navButton("statistics", "▥ Статистика") : ""}
-        ${admin ? `<div class="hint" style="padding:12px 12px 3px">АДМИНИСТРИРОВАНИЕ</div>${navButton("admin-consultations", "◌ Консультации")}${navButton("admin-tasks", "⚙ Настройка тасок")}${navButton("task-access", "⊞ Доступ к таскам")}${navButton("users", "♙ Пользователи")}${navButton("queue", "≡ Очередь")}${navButton("audit", "⌁ Аудит")}` : ""}
+        ${admin ? `<div class="hint" style="padding:12px 12px 3px">АДМИНИСТРИРОВАНИЕ</div>${navButton("admin-consultations", "◌ Консультации")}${navButton("admin-tasks", "⚙ Настройка тасок")}${state.vflowEnabled ? navButton("admin-pipelines", "⚙ Пайплайны") : ""}${navButton("task-access", "⊞ Доступ к таскам")}${navButton("users", "♙ Пользователи")}${navButton("queue", "≡ Очередь")}${navButton("audit", "⌁ Аудит")}` : ""}
       </nav>
       <div class="sidebar-user">
         <div class="user-row"><span class="avatar">${esc(state.me.login[0]?.toUpperCase())}</span><div><strong>${esc(state.me.login)}</strong><div class="meta">${esc(state.me.role)}</div></div></div>
@@ -193,7 +255,7 @@ function shell(content, title = "V.A.L.E.R.I.A.") {
       </div>
     </aside>
     <section class="content">
-      <header class="topbar"><button class="btn mobile-menu" aria-label="Открыть меню" aria-expanded="false">☰</button><h1 data-shell-title>${esc(title)}</h1><span class="spacer"></span><span class="badge ${admin ? "amber" : "green"}">${admin ? "Администратор" : state.me.tasks_only ? "Таски и консультации" : "Пользователь"}</span></header>
+      <header class="topbar"><button class="btn mobile-menu" aria-label="Открыть меню" aria-expanded="false" aria-controls="main-nav">☰</button><h1 data-shell-title>${esc(title)}</h1><span class="spacer"></span><span class="badge ${admin ? "amber" : "green"}">${admin ? "Администратор" : state.me.tasks_only ? "Таски и консультации" : "Пользователь"}</span></header>
       ${content}
     </section>
   </div>`;
@@ -203,13 +265,22 @@ function bindShell() {
   document.querySelectorAll("[data-route]").forEach(button => button.addEventListener("click", () => {
     if (state.route === "templates" && state.templateDirty && !confirm("Отменить несохранённые изменения шаблона?")) return;
     if (state.route === "admin-tasks" && state.taskAdminDirty && !confirm("Отменить несохранённые изменения таски?")) return;
+    if (state.route === "admin-pipeline-editor" && state.vflowDirty && !confirm("Отменить несохранённые изменения пайплайна?")) return;
     state.templateDirty = false;
     state.taskAdminDirty = false;
-    void navigate(`/${button.dataset.route}`).catch(err => notify(err.message));
+    state.vflowDirty = false;
+    void navigate(`/${button.dataset.route}`).catch(err => notify(err.message, "error"));
   }));
   document.querySelector(".mobile-menu")?.addEventListener("click", event => {
-    const expanded = document.querySelector(".shell").classList.toggle("menu-open");
+    const shellElement = document.querySelector(".shell");
+    const expanded = shellElement.classList.toggle("menu-open");
     event.currentTarget.setAttribute("aria-expanded", String(expanded));
+    event.currentTarget.setAttribute("aria-label", expanded ? "Закрыть меню" : "Открыть меню");
+    if (expanded) {
+      document.querySelector("#main-nav button")?.focus({preventScroll: true});
+    } else {
+      event.currentTarget.focus({preventScroll: true});
+    }
   });
   document.querySelector("#logout")?.addEventListener("click", async () => {
     try { await api("/api/auth/logout", {method: "POST"}); } finally {
@@ -220,7 +291,11 @@ function bindShell() {
 }
 
 async function renderShell(route) {
-  if (state.me.tasks_only && !["tasks", "consultations", "profile"].includes(route)) route = "tasks";
+  if (!state.vflowEnabled && ["pipelines", "admin-pipelines", "admin-pipeline-editor"].includes(route)) {
+    route = defaultRoute();
+    history.replaceState(null, "", `#/${route}`);
+  }
+  if (state.me.tasks_only && !["tasks", "pipelines", "consultations", "profile"].includes(route)) route = "tasks";
   state.route = route;
   try {
     if (route === "dialogs") {
@@ -232,6 +307,9 @@ async function renderShell(route) {
     if (route === "admin-consultations" && state.me.role === "admin") return await consultations.list(true);
     if (route === "templates") return await renderTemplates();
     if (route === "tasks") return await renderTasks();
+    if (route === "pipelines") return await vflow.renderPipelines();
+    if (route === "admin-pipelines" && state.me.role === "admin") return await vflow.renderAdminPipelines();
+    if (route === "admin-pipeline-editor" && state.me.role === "admin") return await vflow.renderAdminPipelineEditor();
     if (route === "profile") return await renderProfile();
     if (route === "statistics" && state.me.role === "admin") return await renderStatistics();
     if (route === "admin-tasks" && state.me.role === "admin") return await renderAdminTasks();
@@ -261,16 +339,16 @@ async function renderDialogs() {
   const content = `<div class="page">
     <div class="page-head"><h2>Диалоги</h2><span class="spacer"></span><span class="badge green">Лимит: ${config.max_active_sessions}</span></div>
     <div class="grid">
-      <section><div class="toolbar"><input class="input" id="chat-search" placeholder="Поиск диалогов..."></div>
+      <section><div class="toolbar"><input class="input" id="chat-search" placeholder="Поиск диалогов..." aria-label="Поиск диалогов"></div>
         <div class="list" id="chat-list">${chats.length ? chats.map(chat => `<button class="list-item" data-chat="${chat.id}"><div class="list-item-head"><strong data-chat-title="${esc(chat.id)}">${esc(chat.title)}</strong>${jobBadge(chat.status)}</div><div class="meta mono">${esc(chat.workspace_snapshot)}</div></button>`).join("") : `<div class="empty">Диалогов пока нет</div>`}</div>
       </section>
       <form class="card" id="new-chat"><h3>Новый диалог</h3>
-        <div class="field"><label>Рабочая папка</label><input class="input mono" value="${esc(config.workspace || "Не назначена")}" disabled></div>
+        <div class="field"><label for="new-chat-workspace">Рабочая папка</label><input class="input mono" id="new-chat-workspace" value="${esc(config.workspace || "Не назначена")}" disabled></div>
         ${!config.workspace && state.me.role === "admin" ? `<button class="btn" type="button" data-route="profile">Назначить рабочую папку</button>` : ""}
-        <div class="selectors"><div class="field" style="flex:1"><label>Режим</label><select class="input" name="agent" id="new-chat-agent">${initialOptions.agents.map(a => `<option value="${esc(a)}" ${a === initialOptions.default_agent ? "selected" : ""}>${esc(a[0].toUpperCase() + a.slice(1))}</option>`).join("")}</select></div>
-        <div class="field" style="flex:2"><label>Модель</label><select class="input" name="model" id="new-chat-model" ${modelsLoading ? "disabled" : ""}>${modelsLoading ? `<option value="">Модели OpenCode загружаются…</option>` : modelOptions(models, initialOptions.default_model)}</select><span class="hint" id="model-load-status">${modelsLoading ? "Интерфейс уже доступен; каталог загрузится отдельно." : `${models.length} моделей доступно`}</span></div></div>
-        <div class="field"><label>Шаблон сообщения</label><select class="input" id="template"><option value="">Без шаблона</option>${templates.map(t => `<option value="${t.id}" ${state.draftTemplate?.id === t.id ? "selected" : ""}>${esc(t.title)}</option>`).join("")}</select></div>
-        <div class="field"><label>Первая задача</label><textarea class="input" name="message" placeholder="Опишите задачу агенту...">${esc(state.draftTemplate?.content || "")}</textarea><span class="hint">Текст шаблона скопирован в черновик и доступен для изменения.</span></div>
+        <div class="selectors"><div class="field" style="flex:1"><label for="new-chat-agent">Режим</label><select class="input" name="agent" id="new-chat-agent">${initialOptions.agents.map(a => `<option value="${esc(a)}" ${a === initialOptions.default_agent ? "selected" : ""}>${esc(a[0].toUpperCase() + a.slice(1))}</option>`).join("")}</select></div>
+        <div class="field" style="flex:2"><label for="new-chat-model">Модель</label><select class="input" name="model" id="new-chat-model" ${modelsLoading ? "disabled" : ""}>${modelsLoading ? `<option value="">Модели OpenCode загружаются…</option>` : modelOptions(models, initialOptions.default_model)}</select><span class="hint" id="model-load-status" role="status" aria-live="polite">${modelsLoading ? "Интерфейс уже доступен; каталог загрузится отдельно." : `${models.length} моделей доступно`}</span></div></div>
+        <div class="field"><label for="template">Шаблон сообщения</label><select class="input" id="template"><option value="">Без шаблона</option>${templates.map(t => `<option value="${t.id}" ${state.draftTemplate?.id === t.id ? "selected" : ""}>${esc(t.title)}</option>`).join("")}</select></div>
+        <div class="field"><label for="new-chat-message">Первая задача</label><textarea class="input" id="new-chat-message" name="message" placeholder="Опишите задачу агенту...">${esc(state.draftTemplate?.content || "")}</textarea><span class="hint">Текст шаблона скопирован в черновик и доступен для изменения.</span></div>
         <button class="btn btn-primary btn-block" type="submit" ${config.workspace ? "" : "disabled"}>Создать диалог</button>
       </form>
     </div></div>`;
@@ -293,7 +371,7 @@ async function renderDialogs() {
       state.draftTemplate = null;
       notify(result.job ? "Диалог создан, сообщение поставлено в очередь" : "Диалог создан");
       await renderChat(result.chat.id);
-    } catch (err) { notify(err.message); }
+    } catch (err) { notify(err.message, "error"); }
     finally { button.disabled = false; }
   });
   void hydrateChatTitles(
@@ -452,7 +530,7 @@ function bindPermissionActions(chatId) {
     try {
       await api(`/api/chats/${chatId}/permissions/${encodeURIComponent(button.dataset.permission)}`, {method:"POST", body:JSON.stringify({response:button.dataset.response, remember:button.dataset.response === "always"})});
       await refreshChatLive(chatId);
-    } catch (err) { button.disabled = false; notify(err.message); }
+    } catch (err) { button.disabled = false; notify(err.message, "error"); }
   }));
 }
 
@@ -522,7 +600,7 @@ async function refreshChatLive(chatId) {
     const latestTarget = document.querySelector("#latest-job-status");
     if (latestTarget) latestTarget.innerHTML = jobs[0] ? jobBadge(jobs[0].status) : "";
     bindPermissionActions(chatId);
-  } catch (err) { notify(err.message); }
+  } catch (err) { notify(err.message, "error"); }
 }
 
 async function renderChat(chatId, adminContext = false) {
@@ -544,7 +622,7 @@ async function renderChat(chatId, adminContext = false) {
   const content = `<div class="chat-layout"><section class="chat-main">
     ${adminContext ? `<div class="card" style="margin:12px;border-color:#815f1d;background:#2a210f">Вы просматриваете диалог пользователя. Сообщение будет считаться отправленным владельцем диалога.</div>` : ""}
     <div class="message-scroll"><div class="messages" id="message-list">${renderMessages(messages)}</div><button class="scroll-to-bottom" id="scroll-to-bottom" type="button" aria-label="Прокрутить диалог до конца" title="Прокрутить до конца" hidden>↓</button></div><div id="permission-list">${renderPermissions(permissions)}</div><div id="question-list" aria-label="Вопросы OpenCode"></div>
-    <form class="composer" id="composer"><div class="selectors"><select class="input" name="agent">${options.agents.map(a => `<option value="${esc(a)}" ${a === selectedAgent ? "selected" : ""}>${esc(a)}</option>`).join("")}</select><select class="input" name="model">${modelOptions(models, selectedModel)}</select><span class="badge amber" id="question-waiting" hidden>Ожидает вашего ответа</span><span id="latest-job-status">${latest ? jobBadge(latest.status) : ""}</span></div><div class="composer-row"><textarea class="input" name="message" placeholder="${adminContext ? "Сообщение от имени пользователя..." : "Сообщение агенту..."}" required></textarea><button class="btn btn-primary" type="submit">➤</button></div></form>
+    <form class="composer" id="composer"><div class="selectors"><select class="input" name="agent" aria-label="Агент">${options.agents.map(a => `<option value="${esc(a)}" ${a === selectedAgent ? "selected" : ""}>${esc(a)}</option>`).join("")}</select><select class="input" name="model" aria-label="Модель">${modelOptions(models, selectedModel)}</select><span class="badge amber" id="question-waiting" hidden>Ожидает вашего ответа</span><span id="latest-job-status">${latest ? jobBadge(latest.status) : ""}</span></div><div class="composer-row"><textarea class="input" name="message" placeholder="${adminContext ? "Сообщение от имени пользователя..." : "Сообщение агенту..."}" aria-label="${adminContext ? "Сообщение от имени пользователя" : "Сообщение агенту"}" required></textarea><button class="btn btn-primary" type="submit" aria-label="Отправить сообщение">➤</button></div></form>
   </section><aside class="chat-side"><section><h3>Состояние</h3><span class="badge" id="chat-status">${esc(chatStatusText(chat.status))}</span></section><section><h3>Рабочая папка</h3><div class="mono meta">${esc(chat.workspace_snapshot)}</div></section><section><h3>Очередь этого диалога</h3><div>${jobs.length}</div></section><section><h3>Подключённые MCP</h3><div id="chat-mcp"><span class="hint">Загрузка…</span></div></section><section><h3>Поток событий OpenCode</h3><div id="event-log" class="event-log">${renderEventLog()}</div></section></aside></div>`;
   app.innerHTML = shell(content, chat.title); bindShell();
   updateChatArchive(chat);
@@ -572,7 +650,7 @@ async function renderChat(chatId, adminContext = false) {
     const values = Object.fromEntries(new FormData(form));
     const endpoint = adminContext ? `/api/admin/chats/${chatId}/messages` : `/api/chats/${chatId}/messages`;
     try { await api(endpoint, {method:"POST", body:JSON.stringify(values)}); form.reset(); notify("Сообщение поставлено в очередь"); await refreshChatLive(chatId); }
-    catch (err) { notify(err.message); }
+    catch (err) { notify(err.message, "error"); }
     finally { button.disabled = false; }
   });
 }
@@ -651,7 +729,7 @@ function bindTaskRunStop() {
       result = await api(`/api/task-runs/${encodeURIComponent(runId)}/stop`, {method: "POST"});
       notify(result.status === "cancelled" ? "Таска отменена" : result.status === "cancelling" ? "Остановка запрошена" : "Таска уже завершена");
     } catch (err) {
-      notify(err.message);
+      notify(err.message, "error");
     } finally {
       state.stoppingJobs.delete(runId);
       if (state.route === "tasks" && target.isConnected) {
@@ -735,7 +813,7 @@ async function refreshTaskRuns() {
     // Update history only: selection, focused inputs and unsaved settings stay intact.
     for (const run of runs.slice().reverse()) patchTaskRun(run);
     void hydrateTaskTitles();
-  } catch (err) { if (target.isConnected) notify(err.message); }
+  } catch (err) { if (target.isConnected) notify(err.message, "error"); }
 }
 
 async function renderTasks(selectedId = state.selectedTask, linkedRunId = null) {
@@ -749,7 +827,7 @@ async function renderTasks(selectedId = state.selectedTask, linkedRunId = null) 
   bindShell();
   document.querySelectorAll("[data-task]").forEach(button => button.addEventListener("click", () => {
     if (location.hash.includes("/tasks/runs/")) history.replaceState(null, "", "#/tasks");
-    void renderTasks(button.dataset.task).catch(err => notify(err.message));
+    void renderTasks(button.dataset.task).catch(err => notify(err.message, "error"));
   }));
   document.querySelector("#refresh-task-runs").addEventListener("click", refreshTaskRuns);
   bindTaskResults();
@@ -784,7 +862,7 @@ async function renderTasks(selectedId = state.selectedTask, linkedRunId = null) 
       patchTaskRun(run);
       void hydrateTaskTitles();
       notify(run.status === "cancelled" ? "Таска отменена: такой запуск уже в очереди или выполняется" : run.status === "queued" ? "Таска поставлена в очередь" : "Таска запущена");
-    } catch (err) { notify(err.message); }
+    } catch (err) { notify(err.message, "error"); }
     finally { button.disabled = false; }
   });
   void hydrateTaskTitles();
@@ -812,9 +890,9 @@ async function renderTaskRun(runId, run = null) {
     const origin = state.taskRunOrigin || {route: "admin-tasks", owner: null};
     document.querySelector("#task-run-back").addEventListener("click", () => {
       if (origin.route === "admin-user-tasks" && origin.owner) {
-        void renderAdminUserTaskRuns(origin.owner).catch(err => notify(err.message));
+        void renderAdminUserTaskRuns(origin.owner).catch(err => notify(err.message, "error"));
       } else {
-        void renderAdminTasks().catch(err => notify(err.message));
+        void renderAdminTasks().catch(err => notify(err.message, "error"));
       }
     });
     scrollMessagesToBottom("auto");
@@ -902,7 +980,7 @@ async function renderAdminTasks(selectedId = state.selectedAdminTask) {
   bindShell();
   const changeSelection = id => {
     if (state.taskAdminDirty && !confirm("Отменить несохранённые изменения таски?")) return;
-    void renderAdminTasks(id).catch(err => notify(err.message));
+    void renderAdminTasks(id).catch(err => notify(err.message, "error"));
   };
   document.querySelectorAll("[data-admin-task]").forEach(button => button.addEventListener("click", () => changeSelection(button.dataset.adminTask)));
   document.querySelector("#new-task").addEventListener("click", () => changeSelection(null));
@@ -914,7 +992,7 @@ async function renderAdminTasks(selectedId = state.selectedAdminTask) {
     if (!row) return;
     const run = runs.find(item => item.id === row.dataset.taskRun) || null;
     state.taskRunOrigin = {route: "admin-tasks", owner: null};
-    void renderTaskRun(row.dataset.taskRun, run).catch(err => notify(err.message));
+    void renderTaskRun(row.dataset.taskRun, run).catch(err => notify(err.message, "error"));
   });
   document.querySelector("#retry-task-models").addEventListener("click", hydrateTaskOptions);
   document.querySelector("#task-visibility").addEventListener("change", event => {
@@ -953,7 +1031,7 @@ async function renderAdminTasks(selectedId = state.selectedAdminTask) {
       state.taskAdminDirty = false;
       notify("Таска сохранена");
       if (form.isConnected) await renderAdminTasks(saved.id);
-    } catch (err) { notify(err.message); }
+    } catch (err) { notify(err.message, "error"); }
     finally { form.dataset.saving = "false"; updateTaskSaveState(form); }
   });
   document.querySelector("#delete-task")?.addEventListener("click", async () => {
@@ -963,7 +1041,7 @@ async function renderAdminTasks(selectedId = state.selectedAdminTask) {
       state.taskAdminDirty = false;
       notify("Таска удалена");
       await renderAdminTasks(null);
-    } catch (err) { notify(err.message); }
+    } catch (err) { notify(err.message, "error"); }
   });
   void hydrateTaskOptions();
   void hydrateTaskTitles();
@@ -995,11 +1073,11 @@ async function renderTemplates(selectedId = state.selectedTemplate?.id) {
   form.addEventListener("submit", async event => {
     event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); data.is_published = data.is_published === "on";
     const path = selected ? `/api/admin/templates/${selected.id}` : "/api/admin/templates";
-    try { const saved = await api(path, {method:selected ? "PATCH" : "POST", body:JSON.stringify(data)}); state.templateDirty = false; notify("Шаблон сохранён"); await renderTemplates(saved.id); } catch (err) { notify(err.message); }
+    try { const saved = await api(path, {method:selected ? "PATCH" : "POST", body:JSON.stringify(data)}); state.templateDirty = false; notify("Шаблон сохранён"); await renderTemplates(saved.id); } catch (err) { notify(err.message, "error"); }
   });
   document.querySelector("#delete-template")?.addEventListener("click", async () => {
     if (!confirm(`Удалить шаблон «${selected.title}»?`)) return;
-    try { await api(`/api/admin/templates/${selected.id}`, {method:"DELETE"}); state.selectedTemplate = null; notify("Шаблон удалён"); await renderTemplates(null); } catch (err) { notify(err.message); }
+    try { await api(`/api/admin/templates/${selected.id}`, {method:"DELETE"}); state.selectedTemplate = null; notify("Шаблон удалён"); await renderTemplates(null); } catch (err) { notify(err.message, "error"); }
   });
 }
 
@@ -1058,7 +1136,7 @@ async function renderProfile() {
       }));
       notify("Рабочая папка сохранена");
       await renderProfile();
-    } catch (err) { notify(err.message); }
+    } catch (err) { notify(err.message, "error"); }
     finally { button.disabled = false; }
   });
   document.querySelector("#profile-form").addEventListener("submit", async event => {
@@ -1073,14 +1151,14 @@ async function renderProfile() {
       updateCurrentUser(await api("/api/profile", {method: "PATCH", body: JSON.stringify(data)}));
       notify("Профиль сохранён");
       await renderProfile();
-    } catch (err) { button.disabled = false; notify(err.message); }
+    } catch (err) { button.disabled = false; notify(err.message, "error"); }
   });
   document.querySelector("#profile-mattermost-clear")?.addEventListener("click", async () => {
     try {
       updateCurrentUser(await api("/api/profile", {method: "PATCH", body: JSON.stringify({mattermost_username: null})}));
       notify("Уведомления Mattermost отключены");
       await renderProfile();
-    } catch (err) { notify(err.message); }
+    } catch (err) { notify(err.message, "error"); }
   });
 }
 
@@ -1109,7 +1187,7 @@ async function renderUsers() {
     <div class="field"><label>Логин</label><input class="input" name="login" required></div><div class="field"><label>Временный пароль</label><input class="input" type="password" name="password" minlength="12" required></div><div class="field"><label>Рабочая папка</label><input class="input mono" name="workspace_path" placeholder="Например: team/project" required><span class="hint">Относительный путь создаётся внутри каталога данных сервера.</span></div><div class="field"><label>Mattermost username (необязательно)</label>${mattermostUsernameInput()}</div><div class="field"><label>Тип учётной записи</label><select class="input" name="account_type"><option value="user">Пользователь: чаты и таски</option><option value="tasks_only">Таски и консультации</option><option value="admin">Администратор</option></select></div><button class="btn btn-primary btn-block">Создать учётную запись</button></form></details>`;
   app.innerHTML = shell(`<div class="page"><div class="page-head"><h2>Пользователи</h2><span class="spacer"></span><span class="badge">${users.length}</span></div><div class="user-admin-grid"><section><div class="list">${list || `<div class="empty">Пользователей нет</div>`}</div>${create}</section>${card}</div></div>`, "Админка · Пользователи"); bindShell();
   document.querySelectorAll("[data-user-card]").forEach(button => button.addEventListener("click", () => { state.selectedAdminUser = button.dataset.userCard; void renderUsers(); }));
-  document.querySelector("#user-form").addEventListener("submit", async event => { event.preventDefault(); if (!event.currentTarget.reportValidity()) return; try { const created = await api("/api/admin/users", {method:"POST", body:JSON.stringify(userFormData(event.currentTarget))}); state.selectedAdminUser = created.id; notify("Пользователь создан"); await renderUsers(); } catch(err) { notify(err.message); } });
+  document.querySelector("#user-form").addEventListener("submit", async event => { event.preventDefault(); if (!event.currentTarget.reportValidity()) return; try { const created = await api("/api/admin/users", {method:"POST", body:JSON.stringify(userFormData(event.currentTarget))}); state.selectedAdminUser = created.id; notify("Пользователь создан"); await renderUsers(); } catch(err) { notify(err.message, "error"); } });
   document.querySelector("#user-settings-form")?.addEventListener("submit", async event => {
     event.preventDefault(); if (!event.currentTarget.reportValidity()) return;
     const data = userFormData(event.currentTarget);
@@ -1122,19 +1200,19 @@ async function renderUsers() {
       notify("Настройки пользователя сохранены");
       if (state.me.role === "admin") await renderUsers();
       else await navigate(defaultRoute());
-    } catch (err) { notify(err.message); }
+    } catch (err) { notify(err.message, "error"); }
   });
   document.querySelector("#admin-mattermost-clear")?.addEventListener("click", async () => {
-    try { updateCurrentUser(await api(`/api/admin/users/${selected.id}`, {method: "PATCH", body: JSON.stringify({mattermost_username: null})})); notify("Mattermost-уведомления отключены"); await renderUsers(); } catch (err) { notify(err.message); }
+    try { updateCurrentUser(await api(`/api/admin/users/${selected.id}`, {method: "PATCH", body: JSON.stringify({mattermost_username: null})})); notify("Mattermost-уведомления отключены"); await renderUsers(); } catch (err) { notify(err.message, "error"); }
   });
   document.querySelector("#reset-password-form")?.addEventListener("submit", async event => {
     event.preventDefault(); if (!event.currentTarget.reportValidity()) return;
     const data = Object.fromEntries(new FormData(event.currentTarget));
-    try { await api(`/api/admin/users/${selected.id}/reset-password`, {method: "POST", body: JSON.stringify(data)}); event.currentTarget.reset(); notify("Пароль сброшен"); } catch (err) { notify(err.message); }
+    try { await api(`/api/admin/users/${selected.id}/reset-password`, {method: "POST", body: JSON.stringify(data)}); event.currentTarget.reset(); notify("Пароль сброшен"); } catch (err) { notify(err.message, "error"); }
   });
   document.querySelectorAll("[data-user-chats]").forEach(btn => btn.addEventListener("click", () => renderAdminUserChats(btn.dataset.userChats)));
-  document.querySelectorAll("[data-user-task-runs]").forEach(btn => btn.addEventListener("click", () => { void renderAdminUserTaskRuns(btn.dataset.userTaskRuns).catch(err => notify(err.message)); }));
-  document.querySelectorAll("[data-user-task-access]").forEach(btn => btn.addEventListener("click", () => { void renderAdminUserTaskAccess(btn.dataset.userTaskAccess).catch(err => notify(err.message)); }));
+  document.querySelectorAll("[data-user-task-runs]").forEach(btn => btn.addEventListener("click", () => { void renderAdminUserTaskRuns(btn.dataset.userTaskRuns).catch(err => notify(err.message, "error")); }));
+  document.querySelectorAll("[data-user-task-access]").forEach(btn => btn.addEventListener("click", () => { void renderAdminUserTaskAccess(btn.dataset.userTaskAccess).catch(err => notify(err.message, "error")); }));
 }
 
 function userFormData(form) {
@@ -1167,7 +1245,7 @@ async function renderAdminUserTaskRuns(userId) {
   app.innerHTML = shell(content, "Админка · Таски пользователя");
   bindShell();
   document.querySelector("#user-tasks-back").addEventListener("click", () => {
-    void renderUsers().catch(err => notify(err.message));
+    void renderUsers().catch(err => notify(err.message, "error"));
   });
   document.querySelector("#refresh-task-runs").addEventListener("click", refreshTaskRuns);
   bindTaskResults();
@@ -1177,7 +1255,7 @@ async function renderAdminUserTaskRuns(userId) {
     if (!row) return;
     const run = runs.find(item => item.id === row.dataset.taskRun) || null;
     state.taskRunOrigin = {route: "admin-user-tasks", owner: userId};
-    void renderTaskRun(row.dataset.taskRun, run).catch(err => notify(err.message));
+    void renderTaskRun(row.dataset.taskRun, run).catch(err => notify(err.message, "error"));
   });
   void hydrateTaskTitles();
 }
@@ -1198,7 +1276,7 @@ async function renderAdminUserTaskAccess(userId) {
   app.innerHTML = shell(content, "Админка · Доступ к таскам");
   bindShell();
   document.querySelector("#user-access-back").addEventListener("click", () => {
-    void renderUsers().catch(err => notify(err.message));
+    void renderUsers().catch(err => notify(err.message, "error"));
   });
   document.querySelector("#save-user-access").addEventListener("click", async event => {
     const button = event.currentTarget;
@@ -1210,7 +1288,7 @@ async function renderAdminUserTaskAccess(userId) {
       await api(`/api/admin/users/${encodeURIComponent(userId)}/task-access`, {method: "PUT", body: JSON.stringify({task_ids: taskIds})});
       notify("Доступ обновлён");
       await renderAdminUserTaskAccess(userId);
-    } catch (err) { button.disabled = false; notify(err.message); }
+    } catch (err) { button.disabled = false; notify(err.message, "error"); }
   });
 }
 
@@ -1251,7 +1329,7 @@ async function renderTaskAccess() {
       }));
       notify("Доступ обновлён");
       await renderTaskAccess();
-    } catch (err) { button.disabled = false; notify(err.message); }
+    } catch (err) { button.disabled = false; notify(err.message, "error"); }
   });
 }
 
@@ -1290,36 +1368,36 @@ async function renderQueue() {
       const result = await api(`/api/admin/jobs/${encodeURIComponent(job.id)}/stop`, {method: "POST"});
       notify(result.status === "cancelled" ? "Задание отменено" : result.status === "cancelling" ? "Остановка запрошена" : "Задание уже завершено");
     } catch (err) {
-      notify(err.message);
+      notify(err.message, "error");
     } finally {
       state.stoppingJobs.delete(job.id);
       if (state.route === "queue") {
-        try { await renderQueue(); } catch (err) { button.disabled = false; button.textContent = action; notify(err.message); }
+        try { await renderQueue(); } catch (err) { button.disabled = false; button.textContent = action; notify(err.message, "error"); }
       }
     }
   }));
   hydrateAdminMcp();
   void hydrateTaskTitles();
-  document.querySelector("#limit-form").addEventListener("submit", async event => { event.preventDefault(); const value = Number(new FormData(event.currentTarget).get("value")); try { await api("/api/admin/settings/concurrency", {method:"PATCH", body:JSON.stringify({value})}); await renderQueue(); } catch(err) { notify(err.message); } });
+  document.querySelector("#limit-form").addEventListener("submit", async event => { event.preventDefault(); const value = Number(new FormData(event.currentTarget).get("value")); try { await api("/api/admin/settings/concurrency", {method:"PATCH", body:JSON.stringify({value})}); await renderQueue(); } catch(err) { notify(err.message, "error"); } });
   document.querySelector("#reset-limit").addEventListener("click", async () => { await api("/api/admin/settings/concurrency/override", {method:"DELETE"}); await renderQueue(); });
   document.querySelectorAll("[data-queue-form]").forEach(form => form.addEventListener("submit", async event => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(form));
     data.priority = Number(data.priority); data.max_workers = Number(data.max_workers);
-    try { await api(`/api/admin/queues/${encodeURIComponent(form.dataset.queueForm)}`, {method: "PATCH", body: JSON.stringify(data)}); notify("Очередь сохранена"); await renderQueue(); } catch (err) { notify(err.message); }
+    try { await api(`/api/admin/queues/${encodeURIComponent(form.dataset.queueForm)}`, {method: "PATCH", body: JSON.stringify(data)}); notify("Очередь сохранена"); await renderQueue(); } catch (err) { notify(err.message, "error"); }
   }));
   document.querySelector("#new-queue-form").addEventListener("submit", async event => {
     event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget));
     data.priority = Number(data.priority); data.max_workers = Number(data.max_workers);
-    try { await api("/api/admin/queues", {method: "POST", body: JSON.stringify(data)}); notify("Очередь добавлена"); await renderQueue(); } catch (err) { notify(err.message); }
+    try { await api("/api/admin/queues", {method: "POST", body: JSON.stringify(data)}); notify("Очередь добавлена"); await renderQueue(); } catch (err) { notify(err.message, "error"); }
   });
   document.querySelector("#default-chat-queue-form").addEventListener("submit", async event => {
     event.preventDefault();
-    try { await api("/api/admin/settings/default-chat-queue", {method: "PUT", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))}); notify("Очередь диалогов сохранена"); await renderQueue(); } catch (err) { notify(err.message); }
+    try { await api("/api/admin/settings/default-chat-queue", {method: "PUT", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))}); notify("Очередь диалогов сохранена"); await renderQueue(); } catch (err) { notify(err.message, "error"); }
   });
   document.querySelectorAll("[data-archive-queue]").forEach(button => button.addEventListener("click", async () => {
     if (!confirm("Архивировать очередь? Сначала снимите назначения с тасок и настроек.")) return;
-    try { await api(`/api/admin/queues/${encodeURIComponent(button.dataset.archiveQueue)}`, {method: "DELETE"}); notify("Очередь архивирована"); await renderQueue(); } catch (err) { notify(err.message); }
+    try { await api(`/api/admin/queues/${encodeURIComponent(button.dataset.archiveQueue)}`, {method: "DELETE"}); notify("Очередь архивирована"); await renderQueue(); } catch (err) { notify(err.message, "error"); }
   }));
 }
 
@@ -1367,11 +1445,11 @@ async function renderStatistics() {
   document.querySelector("#statistics-form").addEventListener("submit", async event => {
     event.preventDefault();
     state.statisticsDay = new FormData(event.currentTarget).get("day");
-    try { await renderStatistics(); } catch (err) { notify(err.message); }
+    try { await renderStatistics(); } catch (err) { notify(err.message, "error"); }
   });
   document.querySelector("#statistics-today").addEventListener("click", async () => {
     state.statisticsDay = null;
-    try { await renderStatistics(); } catch (err) { notify(err.message); }
+    try { await renderStatistics(); } catch (err) { notify(err.message, "error"); }
   });
 }
 
@@ -1384,11 +1462,11 @@ function scheduleLiveRefresh(event) {
   if (state.route === "statistics" && ["job.updated", "task.updated"].includes(event.type)) {
     clearTimeout(state.refreshTimer);
     state.refreshTimer = setTimeout(() => {
-      if (state.route === "statistics") void renderStatistics().catch(err => notify(err.message));
+      if (state.route === "statistics") void renderStatistics().catch(err => notify(err.message, "error"));
     }, 250);
   }
   if (event.type === "consultation.updated") {
-    void consultations.refresh().catch(err => notify(err.message));
+    void consultations.refresh().catch(err => notify(err.message, "error"));
     if (state.route === "queue") {
       clearTimeout(state.refreshTimer);
       state.refreshTimer = setTimeout(renderQueue, 250);
@@ -1479,12 +1557,23 @@ function startEvents() {
 
 async function boot() {
   try {
-    const result = await api("/api/auth/me"); state.me = result.user; state.csrf = result.csrf_token; startEvents(); await renderLocation();
+    const result = await api("/api/auth/me"); state.me = result.user; state.csrf = result.csrf_token; await loadPublicConfig(); startEvents(); await renderLocation();
   } catch (_) { renderLogin(); }
 }
 
 window.addEventListener("popstate", () => {
-  if (state.me) void renderLocation().catch(err => notify(err.message));
+  if (state.me) void renderLocation().catch(err => notify(err.message, "error"));
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
+  const shellElement = document.querySelector(".shell.menu-open");
+  const toggle = document.querySelector(".mobile-menu");
+  if (!shellElement || !toggle) return;
+  shellElement.classList.remove("menu-open");
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-label", "Открыть меню");
+  toggle.focus({preventScroll: true});
 });
 
 setInterval(() => {

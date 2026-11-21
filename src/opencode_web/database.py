@@ -173,6 +173,9 @@ CREATE TABLE IF NOT EXISTS queue_jobs (
     task_title TEXT,
     task_initial_title TEXT,
     user_input TEXT,
+    vflow_run_id TEXT,
+    vflow_point_id TEXT,
+    origin_node_id TEXT,
     session_creation_started INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN (
       'queued', 'dispatching', 'running', 'waiting_permission', 'waiting_question',
@@ -242,6 +245,215 @@ CREATE TABLE IF NOT EXISTS audit_log (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+
+-- VFlow: persistent graph definitions, immutable versions, runs and points.
+-- Table prefix vflow_ deliberately avoids the legacy task_successors "pipeline".
+CREATE TABLE IF NOT EXISTS vflow_definitions (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    description TEXT,
+    created_by TEXT NOT NULL REFERENCES users(id),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'archived')),
+    draft_version_id TEXT,
+    published_version_id TEXT,
+    audience_json TEXT NOT NULL DEFAULT '{"mode":"all"}',
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vflow_versions (
+    id TEXT PRIMARY KEY,
+    definition_id TEXT NOT NULL REFERENCES vflow_definitions(id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL CHECK (version_number >= 1),
+    status TEXT NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft', 'published', 'superseded')),
+    graph_ir_json TEXT NOT NULL,
+    vflow_source TEXT,
+    input_schema_json TEXT NOT NULL DEFAULT '{}',
+    public_output_schema_json TEXT,
+    required_handlers_json TEXT NOT NULL DEFAULT '[]',
+    graph_hash TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    UNIQUE (definition_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_versions_definition
+ON vflow_versions(definition_id, version_number DESC);
+
+CREATE TABLE IF NOT EXISTS vflow_runs (
+    id TEXT PRIMARY KEY,
+    definition_id TEXT NOT NULL REFERENCES vflow_definitions(id),
+    version_id TEXT NOT NULL REFERENCES vflow_versions(id),
+    started_by_user_id TEXT NOT NULL REFERENCES users(id),
+    workspace_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'created'
+        CHECK (status IN (
+            'created', 'running', 'succeeded', 'failed', 'cancelled',
+            'cancel_requested'
+        )),
+    input_json TEXT NOT NULL,
+    final_result_json TEXT,
+    public_result_json TEXT,
+    task_snapshots_json TEXT NOT NULL DEFAULT '{}',
+    limits_json TEXT,
+    idempotency_key TEXT,
+    request_hash TEXT,
+    transition_count INTEGER NOT NULL DEFAULT 0 CHECK (transition_count >= 0),
+    point_count_total INTEGER NOT NULL DEFAULT 0 CHECK (point_count_total >= 0),
+    error_code TEXT,
+    safe_error_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    UNIQUE (started_by_user_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_runs_user
+ON vflow_runs(started_by_user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_runs_status
+ON vflow_runs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS vflow_points (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES vflow_runs(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ready'
+        CHECK (status IN (
+            'ready', 'claimed', 'waiting_task', 'waiting_merge', 'forked',
+            'consumed', 'failed', 'cancelled'
+        )),
+    data_json TEXT NOT NULL,
+    fork_stack_json TEXT NOT NULL DEFAULT '[]',
+    parent_point_id TEXT REFERENCES vflow_points(id),
+    visit_seq INTEGER NOT NULL CHECK (visit_seq >= 1),
+    task_run_id TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+    next_check_at TEXT,
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_until TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (run_id, node_id, visit_seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_points_due
+ON vflow_points(status, next_check_at);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_points_run
+ON vflow_points(run_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_points_lease
+ON vflow_points(status, lease_until);
+
+CREATE TABLE IF NOT EXISTS vflow_fork_instances (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES vflow_runs(id) ON DELETE CASCADE,
+    fork_node_id TEXT NOT NULL,
+    merge_node_id TEXT NOT NULL,
+    parent_point_id TEXT NOT NULL REFERENCES vflow_points(id),
+    parent_visit_seq INTEGER NOT NULL CHECK (parent_visit_seq >= 1),
+    expected_count INTEGER NOT NULL CHECK (expected_count >= 2),
+    source_data_json TEXT NOT NULL,
+    parent_fork_stack_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'merged', 'cancelled')),
+    continuation_point_id TEXT,
+    created_at TEXT NOT NULL,
+    merged_at TEXT,
+    UNIQUE (run_id, parent_point_id, parent_visit_seq, fork_node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_forks_run
+ON vflow_fork_instances(run_id, status);
+
+CREATE TABLE IF NOT EXISTS vflow_merge_arrivals (
+    id TEXT PRIMARY KEY,
+    fork_instance_id TEXT NOT NULL
+        REFERENCES vflow_fork_instances(id) ON DELETE CASCADE,
+    merge_node_id TEXT NOT NULL,
+    branch_index INTEGER NOT NULL CHECK (branch_index >= 0),
+    point_id TEXT NOT NULL UNIQUE REFERENCES vflow_points(id),
+    data_json TEXT NOT NULL,
+    arrived_at TEXT NOT NULL,
+    UNIQUE (fork_instance_id, branch_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_merge_arrivals_fork
+ON vflow_merge_arrivals(fork_instance_id, branch_index);
+
+CREATE TABLE IF NOT EXISTS vflow_task_links (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES vflow_runs(id) ON DELETE CASCADE,
+    point_id TEXT NOT NULL REFERENCES vflow_points(id),
+    node_id TEXT NOT NULL,
+    visit_seq INTEGER NOT NULL CHECK (visit_seq >= 1),
+    attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+    task_id TEXT NOT NULL,
+    task_run_id TEXT NOT NULL UNIQUE,
+    enqueue_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'queued',
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_task_links_run
+ON vflow_task_links(run_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_task_links_point
+ON vflow_task_links(point_id);
+
+CREATE TABLE IF NOT EXISTS vflow_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES vflow_runs(id) ON DELETE CASCADE,
+    point_id TEXT,
+    node_id TEXT,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_events_run
+ON vflow_events(run_id, id);
+
+CREATE TABLE IF NOT EXISTS vflow_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_user_id TEXT REFERENCES users(id),
+    action TEXT NOT NULL,
+    object_type TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_audit_object
+ON vflow_audit_events(object_type, object_id, id);
+
+CREATE TABLE IF NOT EXISTS vflow_outbox (
+    id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL REFERENCES vflow_runs(id) ON DELETE CASCADE,
+    point_id TEXT NOT NULL REFERENCES vflow_points(id),
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'sent', 'dead')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    processed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vflow_outbox_due
+ON vflow_outbox(status, next_attempt_at, created_at);
 """
 
 
@@ -358,6 +570,9 @@ class Database:
                 ("resume_from_message_id", "TEXT"),
                 ("resume_monitor", "INTEGER NOT NULL DEFAULT 0"),
                 ("queue_id", "TEXT REFERENCES work_queues(id)"),
+                ("vflow_run_id", "TEXT"),
+                ("vflow_point_id", "TEXT"),
+                ("origin_node_id", "TEXT"),
             ):
                 if column not in job_columns:
                     self._connection.execute(
@@ -375,6 +590,26 @@ class Database:
                            ) WHERE task_id IS NOT NULL"""
                     )
             self._migrate_queue_job_status_constraint()
+            task_link_columns = {
+                row[1]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(vflow_task_links)"
+                ).fetchall()
+            }
+            if "started_at" not in task_link_columns:
+                self._connection.execute(
+                    "ALTER TABLE vflow_task_links ADD COLUMN started_at TEXT"
+                )
+            vflow_run_columns = {
+                row[1]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(vflow_runs)"
+                ).fetchall()
+            }
+            if "limits_json" not in vflow_run_columns:
+                self._connection.execute(
+                    "ALTER TABLE vflow_runs ADD COLUMN limits_json TEXT"
+                )
             for table in ("chats", "queue_jobs"):
                 columns = {row[1] for row in self._connection.execute(
                     f"PRAGMA table_info({table})"
@@ -438,7 +673,8 @@ class Database:
             "id", "sequence", "chat_id", "session_id", "effective_user_id",
             "actor_user_id", "workspace_snapshot", "message_id", "content", "agent",
             "provider_id", "model_id", "model_variant", "task_id", "task_title",
-            "task_initial_title", "user_input", "status", "created_at", "started_at",
+            "task_initial_title", "user_input", "vflow_run_id", "vflow_point_id",
+            "origin_node_id", "status", "created_at", "started_at",
             "finished_at", "error_code", "pipeline_json", "parent_job_id",
             "session_pending", "session_creation_started", "plan_first", "phase2_message_id",
             "resume_content", "resume_from_message_id", "resume_monitor",
@@ -468,6 +704,9 @@ class Database:
                         task_title TEXT,
                         task_initial_title TEXT,
                         user_input TEXT,
+                        vflow_run_id TEXT,
+                        vflow_point_id TEXT,
+                        origin_node_id TEXT,
                         status TEXT NOT NULL CHECK (status IN (
                           'queued', 'dispatching', 'running', 'waiting_permission',
                           'waiting_question', 'completed', 'failed', 'cancelling', 'cancelled'
@@ -1372,6 +1611,13 @@ class Database:
         user_input: str,
         max_queued: int,
         session_title: str | None = None,
+        require_published: bool = True,
+        allow_duplicate: bool = False,
+        pipeline_json: str | None = None,
+        message_id: str | None = None,
+        vflow_run_id: str | None = None,
+        vflow_point_id: str | None = None,
+        origin_node_id: str | None = None,
     ) -> dict[str, Any]:
         if not user.get("workspace_path"):
             raise ValueError("A task requires a workspace")
@@ -1385,6 +1631,7 @@ class Database:
         content = task["content"]
         if user_input.strip():
             content += "\n\n" + user_input
+        message_id_value = message_id or f"msg_{uuid.uuid4().hex}"
         with self.transaction() as connection:
             current_user = connection.execute(
                 "SELECT status, workspace_path, auth_version FROM users WHERE id = ?",
@@ -1398,17 +1645,28 @@ class Database:
             ):
                 raise ValueError("User or workspace changed")
             available = connection.execute(
-                """SELECT updated_at FROM tasks
-                   WHERE id = ? AND is_published = 1 AND deleted_at IS NULL""",
+                """SELECT updated_at, is_published FROM tasks
+                   WHERE id = ? AND deleted_at IS NULL""",
                 (task["id"],),
             ).fetchone()
-            if not available:
+            if not available or (require_published and not available["is_published"]):
                 raise ValueError("Task is unavailable")
             if available["updated_at"] != task["updated_at"]:
                 raise ValueError("Task changed")
+            if message_id:
+                existing = connection.execute(
+                    "SELECT id FROM queue_jobs WHERE message_id = ?",
+                    (message_id,),
+                ).fetchone()
+                if existing:
+                    return self.get_job(existing["id"])  # type: ignore[return-value]
             # The check and insertion share BEGIN IMMEDIATE so simultaneous
             # submissions cannot both enter the dispatcher's queue.
-            duplicate = self.has_pending_task(task["id"], user_input)
+            duplicate = (
+                False
+                if allow_duplicate
+                else self.has_pending_task(task["id"], user_input)
+            )
             queued = connection.execute(
                 "SELECT COUNT(*) FROM queue_jobs WHERE status = 'queued'"
             ).fetchone()[0]
@@ -1443,8 +1701,10 @@ class Database:
                    (id, sequence, chat_id, session_id, effective_user_id, actor_user_id,
                     workspace_snapshot, message_id, content, agent, provider_id, model_id,
                     model_variant, queue_id, task_id, task_title, task_initial_title, user_input,
+                    vflow_run_id, vflow_point_id, origin_node_id,
                     status, created_at, finished_at, error_code)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?)""",
                 (
                     job_id,
                     sequence,
@@ -1453,7 +1713,7 @@ class Database:
                     user["id"],
                     actor_user_id,
                     user["workspace_path"],
-                    f"msg_{uuid.uuid4().hex}",
+                    message_id_value,
                     content,
                     task["agent"],
                     task["provider_id"],
@@ -1464,6 +1724,9 @@ class Database:
                     task["title"],
                     initial_title,
                     user_input,
+                    vflow_run_id,
+                    vflow_point_id,
+                    origin_node_id,
                     "cancelled" if duplicate else "queued",
                     now,
                     now if duplicate else None,
@@ -1473,8 +1736,14 @@ class Database:
             connection.execute(
                 "UPDATE queue_jobs SET pipeline_json = ?, session_pending = ?, plan_first = ? "
                 "WHERE id = ?",
-                (self._pipeline_snapshot(task["id"]), int(session_pending),
-                 int(task.get("plan_first", False)), job_id),
+                (
+                    self._pipeline_snapshot(task["id"])
+                    if pipeline_json is None
+                    else pipeline_json,
+                    int(session_pending),
+                    int(task.get("plan_first", False)),
+                    job_id,
+                ),
             )
             connection.execute(
                 "UPDATE chats SET backend_version = ? WHERE id = ?",
