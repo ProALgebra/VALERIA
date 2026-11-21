@@ -13,6 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .artifacts import ConsultationArtifacts
+from .attachments import AttachmentError, ConsultationAttachments
 from .backend_switch import database_process_lock
 from .config import ConfigError, Settings
 from .consultations import public_job as public_consultation_job
@@ -437,9 +439,11 @@ def bootstrap_admin(database: Database, settings: Settings) -> None:
 def create_app(settings: Settings | None = None, *, start_dispatcher: bool = True) -> FastAPI:
     settings = settings or Settings.from_env()
     question_reply_lock = asyncio.Lock()
+    artifacts: ConsultationArtifacts | None = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        nonlocal artifacts
         with database_process_lock(settings.database_path):
             database = Database(settings.database_path, settings.session_secret)
             database.initialize()
@@ -459,18 +463,30 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                     await events.publish(safe_opencode_event(event))
 
             manager = OpenCodeManager(settings, publish_opencode)
+            artifacts = ConsultationArtifacts(settings, database, manager)
+            attachments = ConsultationAttachments(settings, database, artifacts)
+            try:
+                artifacts.initialize()
+                attachments.initialize()
+            except (AttachmentError, ConfigError, OSError):
+                database.close()
+                raise
             dispatcher = QueueDispatcher(
                 database,
                 manager,
                 events,
                 settings.max_active_sessions,
                 settings.max_active_sessions_per_user or None,
+                artifacts=artifacts,
+                attachments=attachments,
             )
             notification_dispatcher = NotificationDispatcher(database, settings)
             app.state.settings = settings
             app.state.database = database
             app.state.events = events
             app.state.manager = manager
+            app.state.artifacts = artifacts
+            app.state.attachments = attachments
             app.state.dispatcher = dispatcher
             app.state.notification_dispatcher = notification_dispatcher
             try:
@@ -2011,5 +2027,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     register_consultations(
         app, settings, database, current_principal, csrf_principal,
         admin_read_principal, admin_principal, validate_agent_model,
+        artifacts_getter=lambda: getattr(app.state, "artifacts", None),
+        attachments_getter=lambda: getattr(app.state, "attachments", None),
     )
     return app

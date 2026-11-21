@@ -8,12 +8,14 @@ from fastapi import HTTPException
 
 
 @contextmanager
-def submission(db, request, user, body):
+def submission(db, request, user, body, *, extra=None):
     """Never await inside this block: it holds a SQLite write transaction."""
     key = request.headers.get("idempotency-key")
     if key is not None and (not key.strip() or len(key) > 200):
         raise HTTPException(422, "Invalid Idempotency-Key")
     payload = [request.url.path, user.get("workspace_path"), body.model_dump()]
+    if extra is not None:
+        payload.append(extra)
     fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     with db.transaction() as connection:
         if key:

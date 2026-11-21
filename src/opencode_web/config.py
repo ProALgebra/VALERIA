@@ -90,10 +90,38 @@ class Settings:
     opencode_api_version: str = "v1"
     opencode_v2_state_root: Path = Path("./data/opencode-v2")
     opencode_v2_config_dir: Path | None = None
+    consultation_artifact_root: Path | None = None
+    consultation_staging_root: Path | None = None
+    consultation_artifact_token: str | None = None
+    consultation_artifact_token_file: Path | None = None
+    consultation_artifact_max_bytes: int = 20 * 1024 * 1024
+    consultation_artifact_max_files: int = 20
+    consultation_artifact_max_total_bytes: int = 100 * 1024 * 1024
+    consultation_artifact_text_max_bytes: int = 2 * 1024 * 1024
+    consultation_attachment_root: Path | None = None
+    consultation_upload_max_bytes: int = 20 * 1024 * 1024
+    consultation_upload_max_files: int = 10
+    consultation_upload_max_total_bytes: int = 50 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if self.opencode_api_version not in {"v1", "v2"}:
             raise ConfigError("OPENCODE_API_VERSION must be v1 or v2")
+        for name, value in (
+            ("CONSULTATION_ARTIFACT_MAX_BYTES", self.consultation_artifact_max_bytes),
+            ("CONSULTATION_ARTIFACT_MAX_FILES", self.consultation_artifact_max_files),
+            ("CONSULTATION_ARTIFACT_MAX_TOTAL_BYTES", self.consultation_artifact_max_total_bytes),
+            ("CONSULTATION_ARTIFACT_TEXT_MAX_BYTES", self.consultation_artifact_text_max_bytes),
+            ("CONSULTATION_UPLOAD_MAX_BYTES", self.consultation_upload_max_bytes),
+            ("CONSULTATION_UPLOAD_MAX_FILES", self.consultation_upload_max_files),
+            ("CONSULTATION_UPLOAD_MAX_TOTAL_BYTES", self.consultation_upload_max_total_bytes),
+        ):
+            if value < 1:
+                raise ConfigError(f"{name} must be greater than zero")
+        if (
+            self.consultation_artifact_token is not None
+            and len(self.consultation_artifact_token.strip()) < 32
+        ):
+            raise ConfigError("CONSULTATION_ARTIFACT_TOKEN must contain at least 32 characters")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -151,6 +179,11 @@ class Settings:
             raise ConfigError("MATTERMOST_URL must be an HTTP(S) URL")
         mattermost_token_file = os.getenv("MATTERMOST_TOKEN_FILE", "").strip()
         mattermost_ca_bundle = os.getenv("MATTERMOST_CA_BUNDLE", "").strip()
+        artifact_root = os.getenv("CONSULTATION_ARTIFACT_ROOT", "").strip()
+        staging_root = os.getenv("CONSULTATION_STAGING_ROOT", "").strip()
+        attachment_root = os.getenv("CONSULTATION_ATTACHMENT_ROOT", "").strip()
+        artifact_token = os.getenv("CONSULTATION_ARTIFACT_TOKEN", "").strip() or None
+        artifact_token_file = os.getenv("CONSULTATION_ARTIFACT_TOKEN_FILE", "").strip()
         return cls(
             host=host,
             port=_int("APP_PORT", 8080),
@@ -201,6 +234,32 @@ class Settings:
             opencode_api_version=api_version,
             opencode_v2_state_root=Path(os.getenv("OPENCODE_V2_STATE_ROOT", "./data/opencode-v2")),
             opencode_v2_config_dir=Path(v2_config) if v2_config else None,
+            consultation_artifact_root=Path(artifact_root) if artifact_root else None,
+            consultation_staging_root=Path(staging_root) if staging_root else None,
+            consultation_artifact_token=artifact_token,
+            consultation_artifact_token_file=(
+                Path(artifact_token_file) if artifact_token_file else None
+            ),
+            consultation_artifact_max_bytes=_int(
+                "CONSULTATION_ARTIFACT_MAX_BYTES", 20 * 1024 * 1024
+            ),
+            consultation_artifact_max_files=_int("CONSULTATION_ARTIFACT_MAX_FILES", 20),
+            consultation_artifact_max_total_bytes=_int(
+                "CONSULTATION_ARTIFACT_MAX_TOTAL_BYTES", 100 * 1024 * 1024
+            ),
+            consultation_artifact_text_max_bytes=_int(
+                "CONSULTATION_ARTIFACT_TEXT_MAX_BYTES", 2 * 1024 * 1024
+            ),
+            consultation_attachment_root=(
+                Path(attachment_root) if attachment_root else None
+            ),
+            consultation_upload_max_bytes=_int(
+                "CONSULTATION_UPLOAD_MAX_BYTES", 20 * 1024 * 1024
+            ),
+            consultation_upload_max_files=_int("CONSULTATION_UPLOAD_MAX_FILES", 10),
+            consultation_upload_max_total_bytes=_int(
+                "CONSULTATION_UPLOAD_MAX_TOTAL_BYTES", 50 * 1024 * 1024
+            ),
         )
 
     def resolve_workspace_path(self, raw_path: str | Path) -> Path:

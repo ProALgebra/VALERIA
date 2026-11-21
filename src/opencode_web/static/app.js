@@ -60,7 +60,10 @@ async function api(path, options = {}) {
     /^\/api\/(?:admin\/)?(?:chats|consultations)\/[^/]+\/messages$/.test(path)
   );
   if (!queued) return apiRequest(path, options);
-  const identity = JSON.stringify([state.me?.id, path, options.body]);
+  const body = options.body instanceof FormData
+    ? [options.body.get("message") ?? "", ...options.body.getAll("files").map(file => [file.name, file.size, file.lastModified, file.type])]
+    : options.body;
+  const identity = JSON.stringify([state.me?.id, path, body]);
   let pending = pendingSubmissions.get(identity);
   if (pending?.promise) return pending.promise;
   if (!pending) {
@@ -83,7 +86,7 @@ async function api(path, options = {}) {
 
 async function apiRequest(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  if (options.body && !headers.has("content-type")) headers.set("content-type", "application/json");
+  if (options.body && !(options.body instanceof FormData) && !headers.has("content-type")) headers.set("content-type", "application/json");
   if (state.csrf && !["GET", "HEAD"].includes((options.method || "GET").toUpperCase())) {
     headers.set("x-csrf-token", state.csrf);
   }

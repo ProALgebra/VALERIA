@@ -63,6 +63,7 @@ COPY src ./src
 COPY opencode/config/package.json opencode/config/package-lock.json /home/appuser/.config/opencode/
 COPY mcp/mcp-memory-server/requirements.txt /tmp/mcp-memory-requirements.txt
 COPY mcp/mcp-gitlab-readonly/requirements.txt /tmp/mcp-gitlab-requirements.txt
+COPY mcp/mcp-consultation-artifacts/requirements.txt /tmp/mcp-artifacts-requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir . \
     && /opt/venv/bin/pip install --no-cache-dir "conan==${CONAN_VERSION}" \
     && npm --prefix /home/appuser/.config/opencode ci --omit=dev \
@@ -72,6 +73,9 @@ RUN /opt/venv/bin/pip install --no-cache-dir . \
     && python3.12 -m venv /home/appuser/mcp/mcp-gitlab-readonly/venv \
     && /home/appuser/mcp/mcp-gitlab-readonly/venv/bin/pip install \
         --no-cache-dir -r /tmp/mcp-gitlab-requirements.txt \
+    && python3.12 -m venv /home/appuser/mcp/mcp-consultation-artifacts/venv \
+    && /home/appuser/mcp/mcp-consultation-artifacts/venv/bin/pip install \
+        --no-cache-dir -r /tmp/mcp-artifacts-requirements.txt \
     && mkdir -p \
         /app/data \
         /app/.secrets \
