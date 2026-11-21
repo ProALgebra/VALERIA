@@ -38,6 +38,14 @@ from .questions import question_event, session_questions, validate_answers
 from .security import new_token, verify_password
 from .submissions import submission
 from .task_results import task_final_answer
+from .vflow.api import register_vflow
+from .vflow.config import load_config
+from .vflow.gateway import ValeriaTaskGateway
+from .vflow.health import VFlowHealth
+from .vflow.recovery import VFlowRecovery
+from .vflow.retention import VFlowRetention, VFlowRetentionScheduler
+from .vflow.runtime import VFlowRuntime
+from .vflow.scheduler import VFlowScheduler
 
 logger = logging.getLogger(__name__)
 COOKIE_NAME = "ocw_session"
@@ -438,6 +446,7 @@ def bootstrap_admin(database: Database, settings: Settings) -> None:
 
 def create_app(settings: Settings | None = None, *, start_dispatcher: bool = True) -> FastAPI:
     settings = settings or Settings.from_env()
+    vflow_config = load_config()
     question_reply_lock = asyncio.Lock()
     artifacts: ConsultationArtifacts | None = None
 
@@ -481,6 +490,25 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 attachments=attachments,
             )
             notification_dispatcher = NotificationDispatcher(database, settings)
+            vflow_runtime = VFlowRuntime(
+                database,
+                ValeriaTaskGateway(database),
+                limits=vflow_config.limits,
+            )
+            vflow_scheduler = VFlowScheduler(vflow_runtime)
+            vflow_retention = VFlowRetention(database, vflow_config.retention_days)
+            vflow_retention_scheduler = VFlowRetentionScheduler(vflow_retention)
+
+            def wake_vflow_scheduler(event: dict[str, Any]) -> None:
+                if event.get("type") == "job.updated":
+                    vflow_scheduler.wake()
+
+            unsubscribe_vflow_events = (
+                events.add_listener(wake_vflow_scheduler)
+                if vflow_config.enabled
+                else None
+            )
+            vflow_recovery = VFlowRecovery(database)
             app.state.settings = settings
             app.state.database = database
             app.state.events = events
@@ -489,25 +517,58 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             app.state.attachments = attachments
             app.state.dispatcher = dispatcher
             app.state.notification_dispatcher = notification_dispatcher
+            app.state.vflow_runtime = vflow_runtime
+            app.state.vflow_scheduler = vflow_scheduler
+            app.state.vflow_recovery = vflow_recovery
+            app.state.vflow_retention = vflow_retention
+            app.state.vflow_retention_scheduler = vflow_retention_scheduler
+            if vflow_config.enabled:
+                try:
+                    vflow_health = VFlowHealth(database).snapshot()
+                except Exception:
+                    logger.exception("VFlow health check failed")
+                    vflow_health = {"status": "error"}
+                app.state.vflow_health = vflow_health
+                if vflow_health.get("status") != "ok":
+                    checks = vflow_health.get("checks") or {}
+                    logger.warning(
+                        "VFlow health check is %s: database=%s handlers=%s",
+                        vflow_health.get("status"),
+                        (checks.get("database") or {}).get("status"),
+                        (checks.get("handlers") or {}).get("status"),
+                    )
             try:
                 manager.start_idle_reaper(database.workspace_has_pending_jobs)
                 if start_dispatcher:
                     dispatcher.start()
                     notification_dispatcher.start()
+                    if vflow_config.enabled:
+                        await asyncio.to_thread(vflow_recovery.run_once)
+                        await vflow_scheduler.start()
+                        await vflow_retention_scheduler.start()
                 yield
             finally:
+                if unsubscribe_vflow_events is not None:
+                    unsubscribe_vflow_events()
                 try:
-                    await notification_dispatcher.stop()
+                    await vflow_retention_scheduler.stop()
                 finally:
                     try:
-                        await dispatcher.stop()
+                        await vflow_scheduler.stop()
                     finally:
                         try:
-                            await manager.close()
+                            await notification_dispatcher.stop()
                         finally:
-                            database.close()
+                            try:
+                                await dispatcher.stop()
+                            finally:
+                                try:
+                                    await manager.close()
+                                finally:
+                                    database.close()
 
     app = FastAPI(title="OpenCode Web", version="0.1.0", lifespan=lifespan)
+    app.state.vflow_config = vflow_config
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
 
     @app.exception_handler(BackendVersionChangedError)
@@ -538,6 +599,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             }
             or request.url.path.startswith((
                 "/api/tasks/", "/api/task-runs", "/api/consultations/",
+                "/api/pipelines", "/api/pipeline-runs",
             ))
         ):
             raise HTTPException(403, "This account can only use tasks and consultations")
@@ -831,6 +893,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             "agents": list(settings.allowed_agents),
             "default_agent": settings.default_agent,
             "default_model": settings.default_model,
+            "vflow_enabled": request.app.state.vflow_config.enabled,
         }
         if user["role"] == "admin":
             result["max_active_jobs_hard_limit"] = (
@@ -2030,4 +2093,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         artifacts_getter=lambda: getattr(app.state, "artifacts", None),
         attachments_getter=lambda: getattr(app.state, "attachments", None),
     )
+    if vflow_config.enabled:
+        register_vflow(
+            app, database, current_principal, csrf_principal,
+            admin_principal, admin_read_principal,
+            config=vflow_config,
+        )
     return app
