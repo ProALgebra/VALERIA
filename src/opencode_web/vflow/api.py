@@ -367,6 +367,9 @@ def _admin_run_view(
                     {
                         "repair_attempt": repair_attempt,
                         "parent_task_run_id": link.get("parent_task_run_id"),
+                        "repair_root_task_run_id": link.get(
+                            "repair_root_task_run_id"
+                        ),
                         "repair_error_code": link.get("repair_error_code"),
                         "repair_error_message": link.get("repair_error_message"),
                     }

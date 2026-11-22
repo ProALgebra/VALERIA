@@ -6,7 +6,11 @@ import pytest
 
 from opencode_web.database import Database, utcnow
 from opencode_web.vflow.api import _admin_run_view, _run_view
-from opencode_web.vflow.gateway import ValeriaTaskGateway, VFlowTaskError
+from opencode_web.vflow.gateway import (
+    ValeriaTaskGateway,
+    VFlowTaskError,
+    vflow_repair_identity,
+)
 from opencode_web.vflow.json_schema import (
     SchemaDefinitionError,
     build_correction_prompt,
@@ -45,6 +49,28 @@ workflow "repair-two" {{
     max_json_repairs: 1
   );
   step second = task.run(task_id: "{second}", input_path: "$");
+  start -> first -> second -> end
+}}
+"""
+
+TWO_BROKEN_TASKS_SOURCE = """\
+workflow "repair-two-broken" {{
+  version: 1;
+  input: json;
+  step first = task.run(
+    task_id: "{first}",
+    input_path: "$",
+    result_mode: "strict_json",
+    json_schema: {schema},
+    max_json_repairs: {max_repairs}
+  );
+  step second = task.run(
+    task_id: "{second}",
+    input_path: "$",
+    result_mode: "strict_json",
+    json_schema: {schema},
+    max_json_repairs: {max_repairs}
+  );
   start -> first -> second -> end
 }}
 """
@@ -160,6 +186,18 @@ class RepairGateway:
 
 def _point(database, run_id):
     return database._one("SELECT * FROM vflow_points WHERE run_id = ?", (run_id,))
+
+
+def _complete_current(database, run_id, text):
+    point = _point(database, run_id)
+    job_id = str(point["task_run_id"])
+    job = database.get_job(job_id)
+    answer = {"message_id": f"m-{job_id}", "text": text}
+    if job["job_kind"] == "vflow_repair":
+        database.complete_vflow_repair_run(job_id, answer)
+    else:
+        database.complete_task_run(job_id, answer)
+    return job_id
 
 
 def test_task_json_schema_is_validated_in_registry_and_compiler(tmp_path):
@@ -531,11 +569,52 @@ def test_json_repair_migrations_are_idempotent(tmp_path):
             ).fetchall()
         }
         assert "json_repair_attempt" in point_columns
-        assert {"repair_attempt", "parent_task_run_id"} <= link_columns
-        assert {"job_kind", "repair_attempt", "parent_task_run_id"} <= job_columns
+        assert {
+            "repair_attempt",
+            "parent_task_run_id",
+            "repair_root_task_run_id",
+        } <= link_columns
+        assert {
+            "job_kind",
+            "repair_attempt",
+            "parent_task_run_id",
+            "repair_root_task_run_id",
+        } <= job_columns
         assert database._one(
             "SELECT COUNT(*) AS c FROM sqlite_master WHERE name = 'consultation_artifacts'"
         )["c"] == 1
+    finally:
+        database.close()
+
+
+def test_repair_root_migration_backfills_legacy_repair_job(tmp_path):
+    database, admin, worker, _service = make_env(tmp_path)
+    try:
+        gateway = ValeriaTaskGateway(database)
+        _task, original_id = _completed_original(database, gateway, admin, worker)
+        repair_id = gateway.repair_output(
+            task_run_id=original_id,
+            run_id="run-1",
+            point_id="point-1",
+            repair_attempt=1,
+            prompt="fix JSON",
+            node_id="work",
+            visit_seq=1,
+            repair_root_task_run_id=original_id,
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE queue_jobs SET repair_root_task_run_id = NULL
+                   WHERE id = ?""",
+                (repair_id,),
+            )
+    finally:
+        database.close()
+
+    database = Database(tmp_path / "json-repair.sqlite3", "secret")
+    database.initialize()
+    try:
+        assert database.get_job(repair_id)["repair_root_task_run_id"] == original_id
     finally:
         database.close()
 
@@ -572,6 +651,289 @@ def test_sequential_tasks_still_enqueue_after_repair(tmp_path):
         assert json.loads(finished["final_result_json"])["task"]["output"]["json"] == {
             "done": True
         }
+    finally:
+        database.close()
+
+
+def test_two_task_nodes_repair_without_reusing_each_others_jobs(tmp_path):
+    database, admin, _worker, service = make_env(tmp_path)
+    try:
+        first = create_task(database, admin, "First")
+        second = create_task(database, admin, "Second")
+        source = TWO_BROKEN_TASKS_SOURCE.format(
+            first=first["id"],
+            second=second["id"],
+            schema=json.dumps(SCHEMA),
+            max_repairs=1,
+        )
+        definition, version = publish(
+            service, admin, first["id"], slug="repair-two-broken", source=source
+        )
+        gateway = ValeriaTaskGateway(database)
+        runtime = VFlowRuntime(database, gateway)
+        run = runtime.create_run(
+            definition_id=definition["id"],
+            version_id=version["id"],
+            user_id=admin["id"],
+            workspace_id=str(tmp_path),
+            input_data={},
+        )
+        runtime.run_until_idle(run["id"])
+        first_run = _complete_current(database, run["id"], "not json")
+        force_due(database)
+        runtime.run_until_idle(run["id"])
+        first_repair = str(_point(database, run["id"])["task_run_id"])
+        assert first_repair != first_run
+        assert database.get_job(first_repair)["repair_root_task_run_id"] == first_run
+        database.complete_vflow_repair_run(
+            first_repair, {"message_id": "m-first-repair", "text": '{"ok": true}'}
+        )
+        force_due(database)
+        runtime.run_until_idle(run["id"])
+
+        second_run = _complete_current(database, run["id"], "not json")
+        assert second_run not in {first_run, first_repair}
+        force_due(database)
+        runtime.run_until_idle(run["id"])
+        second_repair = str(_point(database, run["id"])["task_run_id"])
+        second_repair_job = database.get_job(second_repair)
+        assert second_repair not in {first_run, first_repair, second_run}
+        assert second_repair_job["parent_task_run_id"] == second_run
+        assert second_repair_job["repair_root_task_run_id"] == second_run
+        assert second_repair_job["message_id"] != database.get_job(first_repair)[
+            "message_id"
+        ]
+
+        database.complete_vflow_repair_run(
+            second_repair, {"message_id": "m-second-repair", "text": '{"ok": true}'}
+        )
+        finished = drain(runtime, run["id"], database)
+        assert finished["status"] == "succeeded", finished
+        assert json.loads(finished["final_result_json"])["task"]["output"]["json"] == {
+            "ok": True
+        }
+
+        jobs = database._all("SELECT * FROM queue_jobs ORDER BY sequence")
+        assert len(jobs) == 4
+        assert len({job["message_id"] for job in jobs}) == 4
+        first_original_job = database.get_job(first_run)
+        first_repair_job = database.get_job(first_repair)
+        second_original_job = database.get_job(second_run)
+        assert (first_repair_job["chat_id"], first_repair_job["session_id"]) == (
+            first_original_job["chat_id"],
+            first_original_job["session_id"],
+        )
+        assert (second_repair_job["chat_id"], second_repair_job["session_id"]) == (
+            second_original_job["chat_id"],
+            second_original_job["session_id"],
+        )
+        assert first_original_job["chat_id"] != second_original_job["chat_id"]
+        links = database._all("SELECT * FROM vflow_task_links ORDER BY queued_at, id")
+        assert len(links) == 4
+        assert len({link["enqueue_key"] for link in links}) == 4
+        repairs = [link for link in links if link["repair_attempt"]]
+        assert len(repairs) == 2
+        assert {repair["task_run_id"] for repair in repairs} == {
+            first_repair,
+            second_repair,
+        }
+        assert {repair["repair_root_task_run_id"] for repair in repairs} == {
+            first_run,
+            second_run,
+        }
+        outbox = database._all(
+            """SELECT * FROM vflow_outbox
+               WHERE kind = 'task_json_repair' ORDER BY created_at, id"""
+        )
+        assert len(outbox) == 2
+        assert len({row["dedupe_key"] for row in outbox}) == 2
+        assert {row["status"] for row in outbox} == {"sent"}
+    finally:
+        database.close()
+
+
+def test_two_repair_attempts_keep_one_root_task_run(tmp_path):
+    database, admin, _worker, service = make_env(tmp_path)
+    try:
+        task = create_task(database, admin)
+        definition, version = publish(
+            service,
+            admin,
+            task["id"],
+            slug="repair-two-attempts",
+            source=task_source(task["id"], max_repairs=2),
+        )
+        gateway = ValeriaTaskGateway(database)
+        runtime = VFlowRuntime(database, gateway)
+        run = runtime.create_run(
+            definition_id=definition["id"],
+            version_id=version["id"],
+            user_id=admin["id"],
+            workspace_id=str(tmp_path),
+            input_data={},
+        )
+        runtime.run_until_idle(run["id"])
+        original_run = _complete_current(database, run["id"], "not json")
+        force_due(database)
+        runtime.run_until_idle(run["id"])
+        first_repair = str(_point(database, run["id"])["task_run_id"])
+
+        _complete_current(database, run["id"], "still not json")
+        force_due(database)
+        runtime.run_until_idle(run["id"])
+        second_repair = str(_point(database, run["id"])["task_run_id"])
+        assert second_repair != first_repair
+        first_job = database.get_job(first_repair)
+        second_job = database.get_job(second_repair)
+        assert first_job["repair_attempt"] == 1
+        assert first_job["parent_task_run_id"] == original_run
+        assert first_job["repair_root_task_run_id"] == original_run
+        assert second_job["repair_attempt"] == 2
+        assert second_job["parent_task_run_id"] == first_repair
+        assert second_job["repair_root_task_run_id"] == original_run
+        assert first_job["chat_id"] == second_job["chat_id"]
+        assert first_job["session_id"] == second_job["session_id"]
+        assert first_job["message_id"] != second_job["message_id"]
+
+        database.complete_vflow_repair_run(
+            second_repair, {"message_id": "m-second", "text": '{"ok": true}'}
+        )
+        finished = drain(runtime, run["id"], database)
+        assert finished["status"] == "succeeded", finished
+        links = database._all(
+            """SELECT * FROM vflow_task_links
+               WHERE point_id = ? ORDER BY repair_attempt, queued_at""",
+            (_point(database, run["id"])["id"],),
+        )
+        assert [link["repair_attempt"] for link in links] == [0, 1, 2]
+        assert {link["repair_root_task_run_id"] for link in links} == {original_run}
+        assert [link["parent_task_run_id"] for link in links] == [
+            None,
+            original_run,
+            first_repair,
+        ]
+    finally:
+        database.close()
+
+
+def test_repair_limit_exhaustion_fails_safely_after_two_attempts(tmp_path):
+    database, admin, _worker, service = make_env(tmp_path)
+    try:
+        task = create_task(database, admin)
+        definition, version = publish(
+            service,
+            admin,
+            task["id"],
+            slug="repair-two-attempts-limit",
+            source=task_source(task["id"], max_repairs=2),
+        )
+        gateway = ValeriaTaskGateway(database)
+        runtime = VFlowRuntime(database, gateway)
+        run = runtime.create_run(
+            definition_id=definition["id"],
+            version_id=version["id"],
+            user_id=admin["id"],
+            workspace_id=str(tmp_path),
+            input_data={},
+        )
+        runtime.run_until_idle(run["id"])
+        _complete_current(database, run["id"], "not json")
+        force_due(database)
+        runtime.run_until_idle(run["id"])
+        _complete_current(database, run["id"], "still not json")
+        force_due(database)
+        runtime.run_until_idle(run["id"])
+        _complete_current(database, run["id"], "not json either")
+        finished = drain(runtime, run["id"], database)
+        assert finished["status"] == "failed"
+        assert finished["error_code"] == "TASK_OUTPUT_NOT_JSON"
+        jobs = database._all(
+            "SELECT * FROM queue_jobs WHERE job_kind = 'vflow_repair' ORDER BY sequence"
+        )
+        assert len(jobs) == 2
+        assert [job["repair_attempt"] for job in jobs] == [1, 2]
+        assert all(job["status"] == "completed" for job in jobs)
+    finally:
+        database.close()
+
+
+def test_gateway_accepts_chained_repair_without_task_id(tmp_path):
+    database, admin, worker, _service = make_env(tmp_path)
+    try:
+        gateway = ValeriaTaskGateway(database)
+        task, original_id = _completed_original(database, gateway, admin, worker)
+        original = database.get_job(original_id)
+        first_repair = gateway.repair_output(
+            task_run_id=original_id,
+            run_id="run-1",
+            point_id="point-1",
+            repair_attempt=1,
+            prompt="fix JSON",
+            node_id="work",
+            visit_seq=1,
+            repair_root_task_run_id=original_id,
+        )
+        first_job = database.get_job(first_repair)
+        assert first_job["task_id"] is None
+        assert first_job["repair_root_task_run_id"] == original_id
+        assert first_job["chat_id"] == original["chat_id"]
+        assert first_job["session_id"] == original["session_id"]
+        database.complete_vflow_repair_run(
+            first_repair, {"message_id": "m-1-repair", "text": "not json"}
+        )
+
+        second_repair = gateway.repair_output(
+            task_run_id=first_repair,
+            run_id="run-1",
+            point_id="point-1",
+            repair_attempt=2,
+            prompt="fix JSON again",
+            node_id="work",
+            visit_seq=1,
+            repair_root_task_run_id=original_id,
+        )
+        repeated = gateway.repair_output(
+            task_run_id=first_repair,
+            run_id="run-1",
+            point_id="point-1",
+            repair_attempt=2,
+            prompt="fix JSON again",
+            node_id="work",
+            visit_seq=1,
+            repair_root_task_run_id=original_id,
+        )
+        assert repeated == second_repair
+        second_job = database.get_job(second_repair)
+        assert second_job["task_id"] is None
+        assert second_job["parent_task_run_id"] == first_repair
+        assert second_job["repair_root_task_run_id"] == original_id
+        assert second_job["chat_id"] == first_job["chat_id"]
+        assert second_job["session_id"] == first_job["session_id"]
+        assert second_job["message_id"] != first_job["message_id"]
+        assert task["id"] == original["task_id"]
+
+        with pytest.raises(VFlowTaskError):
+            gateway.repair_output(
+                task_run_id=first_repair,
+                run_id="run-1",
+                point_id="point-1",
+                repair_attempt=3,
+                prompt="wrong node",
+                node_id="analysis",
+                visit_seq=1,
+                repair_root_task_run_id=original_id,
+            )
+        with pytest.raises(VFlowTaskError):
+            gateway.repair_output(
+                task_run_id=first_repair,
+                run_id="run-1",
+                point_id="point-1",
+                repair_attempt=3,
+                prompt="wrong root",
+                node_id="work",
+                visit_seq=1,
+                repair_root_task_run_id=first_repair,
+            )
     finally:
         database.close()
 
@@ -631,9 +993,18 @@ def test_gateway_repair_creates_one_same_chat_followup(tmp_path):
         assert job["model_variant"] == original["model_variant"]
         assert job["queue_id"] == original["queue_id"]
         assert job["message_id"].startswith("msg_vflow_repair_")
+        identity = vflow_repair_identity(
+            run_id="run-1",
+            point_id="point-1",
+            node_id=None,
+            visit_seq=None,
+            repair_root_task_run_id=original_id,
+            parent_task_run_id=original_id,
+            repair_attempt=1,
+        )
         assert job["message_id"] == (
             "msg_vflow_repair_"
-            + __import__("hashlib").sha256(b"run-1:point-1:1").hexdigest()[:40]
+            + __import__("hashlib").sha256(identity.encode()).hexdigest()[:40]
         )
         assert database._one("SELECT COUNT(*) AS c FROM queue_jobs")["c"] == 2
         assert task["id"] == original["task_id"]
@@ -814,6 +1185,7 @@ def test_admin_repair_diagnostics_do_not_leak_to_user_view(tmp_path):
         assert repair["repair_attempt"] == 1
         assert repair["repair_error_code"] == "TASK_OUTPUT_NOT_JSON"
         assert repair["parent_task_run_id"] == "job-1"
+        assert repair["repair_root_task_run_id"] == "job-1"
         assert repair["status"] == "completed"
 
         user_view = _run_view(database, saved_run)

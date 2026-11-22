@@ -179,6 +179,7 @@ CREATE TABLE IF NOT EXISTS queue_jobs (
     job_kind TEXT NOT NULL DEFAULT '',
     repair_attempt INTEGER NOT NULL DEFAULT 0,
     parent_task_run_id TEXT,
+    repair_root_task_run_id TEXT,
     session_creation_started INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN (
       'queued', 'dispatching', 'running', 'waiting_permission', 'waiting_question',
@@ -405,6 +406,7 @@ CREATE TABLE IF NOT EXISTS vflow_task_links (
     status TEXT NOT NULL DEFAULT 'queued',
     repair_attempt INTEGER NOT NULL DEFAULT 0,
     parent_task_run_id TEXT,
+    repair_root_task_run_id TEXT,
     repair_error_code TEXT,
     repair_error_message TEXT,
     queued_at TEXT NOT NULL,
@@ -584,6 +586,7 @@ class Database:
                 ("job_kind", "TEXT NOT NULL DEFAULT ''"),
                 ("repair_attempt", "INTEGER NOT NULL DEFAULT 0"),
                 ("parent_task_run_id", "TEXT"),
+                ("repair_root_task_run_id", "TEXT"),
             ):
                 if column not in job_columns:
                     self._connection.execute(
@@ -664,6 +667,7 @@ class Database:
             for column, definition in (
                 ("repair_attempt", "INTEGER NOT NULL DEFAULT 0"),
                 ("parent_task_run_id", "TEXT"),
+                ("repair_root_task_run_id", "TEXT"),
                 ("repair_error_code", "TEXT"),
                 ("repair_error_message", "TEXT"),
             ):
@@ -692,6 +696,7 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE vflow_runs ADD COLUMN limits_json TEXT"
                 )
+            self._backfill_vflow_repair_roots()
             for table in ("chats", "queue_jobs"):
                 columns = {row[1] for row in self._connection.execute(
                     f"PRAGMA table_info({table})"
@@ -757,7 +762,7 @@ class Database:
             "provider_id", "model_id", "model_variant", "task_id", "task_title",
             "task_initial_title", "user_input", "vflow_run_id", "vflow_point_id",
             "origin_node_id", "job_kind", "repair_attempt", "parent_task_run_id",
-            "status", "created_at", "started_at",
+            "repair_root_task_run_id", "status", "created_at", "started_at",
             "finished_at", "error_code", "pipeline_json", "parent_job_id",
             "session_pending", "session_creation_started", "plan_first", "phase2_message_id",
             "resume_content", "resume_from_message_id", "resume_monitor",
@@ -793,6 +798,7 @@ class Database:
                         job_kind TEXT NOT NULL DEFAULT '',
                         repair_attempt INTEGER NOT NULL DEFAULT 0,
                         parent_task_run_id TEXT,
+                        repair_root_task_run_id TEXT,
                         status TEXT NOT NULL CHECK (status IN (
                           'queued', 'dispatching', 'running', 'waiting_permission',
                           'waiting_question', 'completed', 'failed', 'cancelling', 'cancelled'
@@ -1841,6 +1847,77 @@ class Database:
             )
         return self.get_job(job_id)  # type: ignore[return-value]
 
+    @staticmethod
+    def _vflow_repair_chain_job(connection: sqlite3.Connection, job_id: str):
+        return connection.execute(
+            """SELECT id, task_id, job_kind, parent_task_run_id,
+                      repair_root_task_run_id, vflow_run_id, vflow_point_id,
+                      origin_node_id, status, chat_id, session_id,
+                      effective_user_id
+               FROM queue_jobs WHERE id = ?""",
+            (job_id,),
+        ).fetchone()
+
+    @classmethod
+    def _resolve_vflow_repair_root_on(
+        cls, connection: sqlite3.Connection, job_id: str
+    ) -> str | None:
+        """Walk a repair chain back to its original Task run."""
+        seen: set[str] = set()
+        current: str | None = job_id
+        while current and current not in seen and len(seen) < 64:
+            seen.add(current)
+            row = cls._vflow_repair_chain_job(connection, current)
+            if not row:
+                return None
+            hinted_root = row["repair_root_task_run_id"]
+            if hinted_root:
+                root = cls._vflow_repair_chain_job(connection, str(hinted_root))
+                if root and root["task_id"] is not None:
+                    return str(root["id"])
+                current = str(hinted_root)
+                continue
+            if row["task_id"] is not None:
+                return str(row["id"])
+            current = row["parent_task_run_id"]
+        return None
+
+    def resolve_vflow_repair_root(self, job_id: str) -> str | None:
+        """Return the original Task run behind a Task/repair job, if any."""
+        with self._lock:
+            return self._resolve_vflow_repair_root_on(self._connection, job_id)
+
+    def _backfill_vflow_repair_roots(self) -> None:
+        """Idempotently populate repair roots for databases from older builds."""
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """SELECT id FROM queue_jobs
+                   WHERE job_kind = 'vflow_repair'
+                     AND repair_root_task_run_id IS NULL"""
+            ).fetchall()
+            for row in rows:
+                root_id = self._resolve_vflow_repair_root_on(
+                    connection, str(row["id"])
+                )
+                if root_id:
+                    connection.execute(
+                        """UPDATE queue_jobs SET repair_root_task_run_id = ?
+                           WHERE id = ? AND repair_root_task_run_id IS NULL""",
+                        (root_id, row["id"]),
+                    )
+            connection.execute(
+                """UPDATE vflow_task_links
+                   SET repair_root_task_run_id = (
+                     SELECT repair_root_task_run_id FROM queue_jobs
+                     WHERE queue_jobs.id = vflow_task_links.task_run_id
+                   )
+                   WHERE repair_root_task_run_id IS NULL AND repair_attempt > 0"""
+            )
+            connection.execute(
+                """UPDATE vflow_task_links SET repair_root_task_run_id = task_run_id
+                   WHERE repair_root_task_run_id IS NULL"""
+            )
+
     def create_vflow_repair_job(
         self,
         *,
@@ -1850,6 +1927,9 @@ class Database:
         repair_attempt: int,
         prompt: str,
         message_id: str,
+        repair_root_task_run_id: str | None = None,
+        node_id: str | None = None,
+        visit_seq: int | None = None,
     ) -> dict[str, Any]:
         """Create a normal chat continuation in the same Task chat/session.
 
@@ -1857,69 +1937,159 @@ class Database:
         endpoint rejects Task chats.  The new job has ``task_id = NULL`` so the
         dispatcher treats it as an ordinary same-session turn, while the VFlow
         correlation columns keep it traceable.
+
+        ``original_job_id`` is the immediate run being corrected and may itself
+        be a repair turn.  ``repair_root_task_run_id`` is the first Task run of
+        this node visit: it remains stable for the whole repair chain and owns
+        the chat/session that every repair must reuse.
         """
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("Repair prompt is required")
-        if not isinstance(repair_attempt, int) or repair_attempt < 1:
+        if (
+            not isinstance(repair_attempt, int)
+            or isinstance(repair_attempt, bool)
+            or repair_attempt < 1
+        ):
             raise ValueError("Repair attempt is invalid")
         if not isinstance(message_id, str) or not message_id.startswith("msg_"):
             raise ValueError("Repair message id is invalid")
+        if node_id is not None and (
+            not isinstance(node_id, str) or not node_id.strip()
+        ):
+            raise ValueError("Repair node is invalid")
+        if visit_seq is not None and (
+            not isinstance(visit_seq, int)
+            or isinstance(visit_seq, bool)
+            or visit_seq < 1
+        ):
+            raise ValueError("Repair visit is invalid")
+        if repair_root_task_run_id is not None and (
+            not isinstance(repair_root_task_run_id, str)
+            or not repair_root_task_run_id
+        ):
+            raise ValueError("Repair root is invalid")
         with self.transaction() as connection:
+            resolved_root_id = self._resolve_vflow_repair_root_on(
+                connection, original_job_id
+            )
+            if not resolved_root_id:
+                raise ValueError("Original job is not a task run")
+            if (
+                repair_root_task_run_id is not None
+                and str(repair_root_task_run_id) != resolved_root_id
+            ):
+                raise ValueError("Repair root does not match the original task run")
+
             existing = connection.execute(
-                "SELECT id, vflow_run_id, vflow_point_id FROM queue_jobs WHERE message_id = ?",
+                "SELECT * FROM queue_jobs WHERE message_id = ?",
                 (message_id,),
             ).fetchone()
             if existing:
                 if (
-                    existing["vflow_run_id"] != run_id
+                    existing["job_kind"] != "vflow_repair"
+                    or existing["vflow_run_id"] != run_id
                     or existing["vflow_point_id"] != point_id
+                    or existing["parent_task_run_id"] != original_job_id
+                    or int(existing["repair_attempt"] or 0) != repair_attempt
+                    or existing["repair_root_task_run_id"]
+                    not in (None, resolved_root_id)
+                    or (
+                        node_id is not None
+                        and existing["origin_node_id"] not in (None, node_id)
+                    )
                 ):
                     raise ValueError("Repair message id is already in use")
                 return self.get_job(existing["id"])  # type: ignore[return-value]
+
+            context_query = """SELECT q.*, c.owner_user_id AS chat_owner_user_id,
+                                      c.workspace_snapshot AS chat_workspace_snapshot,
+                                      c.opencode_session_id AS chat_session_id,
+                                      c.kind AS chat_kind,
+                                      c.backend_version AS chat_backend_version,
+                                      c.archived_reason AS chat_archived_reason,
+                                      u.status AS user_status,
+                                      u.workspace_path AS user_workspace
+                               FROM queue_jobs q
+                               JOIN chats c ON c.id = q.chat_id
+                               JOIN users u ON u.id = q.effective_user_id
+                               WHERE q.id = ?"""
             original = connection.execute(
-                """SELECT q.*, c.owner_user_id AS chat_owner_user_id,
-                          c.workspace_snapshot AS chat_workspace_snapshot,
-                          c.opencode_session_id AS chat_session_id,
-                          c.kind AS chat_kind,
-                          c.backend_version AS chat_backend_version,
-                          c.archived_reason AS chat_archived_reason,
-                          u.status AS user_status,
-                          u.workspace_path AS user_workspace
-                   FROM queue_jobs q
-                   JOIN chats c ON c.id = q.chat_id
-                   JOIN users u ON u.id = q.effective_user_id
-                   WHERE q.id = ?""",
-                (original_job_id,),
+                context_query, (original_job_id,)
             ).fetchone()
             if not original:
                 raise ValueError("Original task run is unavailable")
-            if original["task_id"] is None:
+            root = (
+                original
+                if resolved_root_id == original_job_id
+                else connection.execute(context_query, (resolved_root_id,)).fetchone()
+            )
+            if not root or root["task_id"] is None:
+                raise ValueError("Original job is not a task run")
+            if original["task_id"] is None and original["job_kind"] != "vflow_repair":
                 raise ValueError("Original job is not a task run")
             if original["status"] != "completed":
+                raise ValueError("Original task run is not completed")
+            if root["status"] != "completed":
                 raise ValueError("Original task run is not completed")
             if (
                 original["vflow_run_id"] != run_id
                 or original["vflow_point_id"] != point_id
+                or root["vflow_run_id"] != run_id
+                or root["vflow_point_id"] != point_id
             ):
                 raise ValueError("VFlow correlation does not match the original run")
-            if original["chat_kind"] != "task":
-                raise ValueError("Task chat is unavailable")
-            if original["chat_owner_user_id"] != original["effective_user_id"]:
-                raise ValueError("Task chat owner does not match")
-            if original["chat_workspace_snapshot"] != original["workspace_snapshot"]:
-                raise ValueError("Task chat workspace changed")
-            if original["chat_session_id"] != original["session_id"]:
-                raise ValueError("Task chat session changed")
-            if original["user_status"] != "active":
-                raise ValueError("Task owner is unavailable")
-            if original["user_workspace"] != original["workspace_snapshot"]:
-                raise ValueError("Task workspace changed")
             if (
-                (original["backend_version"] or "v1") != self.backend_version()
-                or original["chat_backend_version"] != self.backend_version()
-                or original["chat_archived_reason"] == "backend_version_changed"
+                original["chat_id"] != root["chat_id"]
+                or original["session_id"] != root["session_id"]
+                or original["effective_user_id"] != root["effective_user_id"]
             ):
-                raise ValueError("Task chat backend changed")
+                raise ValueError("Repair chat or session changed")
+            if node_id is not None:
+                for context in (original, root):
+                    origin = context["origin_node_id"]
+                    if origin is not None and origin != node_id:
+                        raise ValueError("Repair node does not match the original run")
+            for task_run_id in (original_job_id, resolved_root_id):
+                link = connection.execute(
+                    """SELECT node_id, visit_seq, repair_root_task_run_id
+                       FROM vflow_task_links WHERE task_run_id = ?""",
+                    (task_run_id,),
+                ).fetchone()
+                if not link:
+                    continue
+                link_root = link["repair_root_task_run_id"]
+                if link_root is not None and link_root != resolved_root_id:
+                    raise ValueError("Repair root does not match the task link")
+                if node_id is not None and link["node_id"] != node_id:
+                    raise ValueError("Repair node does not match the task link")
+                if (
+                    visit_seq is not None
+                    and int(link["visit_seq"]) != int(visit_seq)
+                ):
+                    raise ValueError("Repair visit does not match the task link")
+            for context in (original, root):
+                if context["chat_kind"] != "task":
+                    raise ValueError("Task chat is unavailable")
+                if context["chat_owner_user_id"] != context["effective_user_id"]:
+                    raise ValueError("Task chat owner does not match")
+                if (
+                    context["chat_workspace_snapshot"]
+                    != context["workspace_snapshot"]
+                ):
+                    raise ValueError("Task chat workspace changed")
+                if context["chat_session_id"] != context["session_id"]:
+                    raise ValueError("Task chat session changed")
+                if context["user_status"] != "active":
+                    raise ValueError("Task owner is unavailable")
+                if context["user_workspace"] != context["workspace_snapshot"]:
+                    raise ValueError("Task workspace changed")
+                if (
+                    (context["backend_version"] or "v1")
+                    != self.backend_version()
+                    or context["chat_backend_version"] != self.backend_version()
+                    or context["chat_archived_reason"] == "backend_version_changed"
+                ):
+                    raise ValueError("Task chat backend changed")
 
             job_id = str(uuid.uuid4())
             now = utcnow()
@@ -1932,40 +2102,41 @@ class Database:
                     workspace_snapshot, message_id, content, agent, provider_id, model_id,
                     model_variant, queue_id, task_id, user_input, vflow_run_id,
                     vflow_point_id, origin_node_id, job_kind, repair_attempt,
-                    parent_task_run_id, status, created_at, pipeline_json,
-                    session_pending, plan_first)
+                    parent_task_run_id, repair_root_task_run_id, status, created_at,
+                    pipeline_json, session_pending, plan_first)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?,
-                           ?, 'vflow_repair', ?, ?, 'queued', ?, '', 0, 0)""",
+                           ?, 'vflow_repair', ?, ?, ?, 'queued', ?, '', 0, 0)""",
                 (
                     job_id,
                     sequence,
-                    original["chat_id"],
-                    original["session_id"],
-                    original["effective_user_id"],
-                    original["actor_user_id"],
-                    original["workspace_snapshot"],
+                    root["chat_id"],
+                    root["session_id"],
+                    root["effective_user_id"],
+                    root["actor_user_id"],
+                    root["workspace_snapshot"],
                     message_id,
                     prompt.strip(),
-                    original["agent"],
-                    original["provider_id"],
-                    original["model_id"],
-                    original["model_variant"],
-                    original["queue_id"],
+                    root["agent"],
+                    root["provider_id"],
+                    root["model_id"],
+                    root["model_variant"],
+                    root["queue_id"],
                     run_id,
                     point_id,
-                    original["origin_node_id"],
+                    node_id or root["origin_node_id"],
                     repair_attempt,
                     original_job_id,
+                    resolved_root_id,
                     now,
                 ),
             )
             connection.execute(
                 "UPDATE chats SET status = 'queued', updated_at = ? WHERE id = ?",
-                (now, original["chat_id"]),
+                (now, root["chat_id"]),
             )
             connection.execute(
                 "UPDATE queue_jobs SET backend_version = ? WHERE id = ?",
-                (original["chat_backend_version"], job_id),
+                (root["chat_backend_version"], job_id),
             )
         return self.get_job(job_id)  # type: ignore[return-value]
 

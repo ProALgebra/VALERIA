@@ -15,6 +15,36 @@ class VFlowTaskError(RuntimeError):
         super().__init__(message or code)
 
 
+def vflow_repair_identity(
+    *,
+    run_id: str,
+    point_id: str,
+    node_id: str | None,
+    visit_seq: int | None,
+    repair_root_task_run_id: str,
+    parent_task_run_id: str,
+    repair_attempt: int,
+) -> str:
+    """Canonical identity of one repair request.
+
+    A VFlow point row is reused while it traverses the graph, so ``point_id``
+    alone cannot identify a Task node.  The root Task run and the immediate
+    parent run pin the repair to one concrete node visit, while the node/visit
+    components keep loop iterations and retries distinct.
+    """
+    return ":".join(
+        (
+            run_id,
+            point_id,
+            node_id or "",
+            str(visit_seq or 0),
+            repair_root_task_run_id,
+            parent_task_run_id,
+            str(repair_attempt),
+        )
+    )
+
+
 class ValeriaTaskGateway:
     """Thin adapter between VFlow task points and the existing VALERIA queue.
 
@@ -132,6 +162,9 @@ class ValeriaTaskGateway:
         prompt: str,
         error_code: str | None = None,
         error_message: str | None = None,
+        node_id: str | None = None,
+        visit_seq: int | None = None,
+        repair_root_task_run_id: str | None = None,
     ) -> str:
         """Send one bounded correction turn into the original Task chat.
 
@@ -139,6 +172,10 @@ class ValeriaTaskGateway:
         chat continuation in the same session, not a second Task Run.  A
         deterministic message id makes repeated polling/crash recovery
         idempotent.
+
+        ``task_run_id`` is the immediate run being corrected (a Task run or a
+        previous repair turn).  ``repair_root_task_run_id`` is the original
+        Task run of that node visit and stays stable across a repair chain.
         """
         del error_code, error_message
         if not isinstance(prompt, str) or not prompt.strip():
@@ -149,15 +186,50 @@ class ValeriaTaskGateway:
             or repair_attempt < 1
         ):
             raise VFlowTaskError("TASK_REPAIR_UNAVAILABLE", "Repair attempt is invalid")
-        seed = f"{run_id}:{point_id}:{repair_attempt}"
+        if node_id is not None and (
+            not isinstance(node_id, str) or not node_id.strip()
+        ):
+            raise VFlowTaskError("TASK_REPAIR_UNAVAILABLE", "Repair node is invalid")
+        if visit_seq is not None and (
+            not isinstance(visit_seq, int)
+            or isinstance(visit_seq, bool)
+            or visit_seq < 1
+        ):
+            raise VFlowTaskError("TASK_REPAIR_UNAVAILABLE", "Repair visit is invalid")
+        if repair_root_task_run_id is not None and (
+            not isinstance(repair_root_task_run_id, str)
+            or not repair_root_task_run_id
+        ):
+            raise VFlowTaskError("TASK_REPAIR_UNAVAILABLE", "Repair root is invalid")
+
+        root_task_run_id = (
+            repair_root_task_run_id
+            or self.database.resolve_vflow_repair_root(task_run_id)
+        )
+        if not root_task_run_id:
+            raise VFlowTaskError(
+                "TASK_REPAIR_UNAVAILABLE", "Original job is not a task run"
+            )
+        seed = vflow_repair_identity(
+            run_id=run_id,
+            point_id=point_id,
+            node_id=node_id,
+            visit_seq=visit_seq,
+            repair_root_task_run_id=root_task_run_id,
+            parent_task_run_id=task_run_id,
+            repair_attempt=repair_attempt,
+        )
         message_id = "msg_vflow_repair_" + hashlib.sha256(
             seed.encode()
         ).hexdigest()[:40]
         try:
             job = self.database.create_vflow_repair_job(
                 original_job_id=task_run_id,
+                repair_root_task_run_id=root_task_run_id,
                 run_id=run_id,
                 point_id=point_id,
+                node_id=node_id,
+                visit_seq=visit_seq,
                 repair_attempt=repair_attempt,
                 prompt=prompt,
                 message_id=message_id,

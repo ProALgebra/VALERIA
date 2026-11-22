@@ -28,7 +28,7 @@ from .actions import (
     Suspend,
 )
 from .capabilities import validate_handler_capabilities
-from .gateway import VFlowTaskError
+from .gateway import VFlowTaskError, vflow_repair_identity
 from .handlers import (
     DEFAULT_HANDLERS,
     TASK_POLL_SECONDS,
@@ -117,6 +117,9 @@ class TaskGateway(Protocol):
         prompt: str,
         error_code: str | None = None,
         error_message: str | None = None,
+        node_id: str | None = None,
+        visit_seq: int | None = None,
+        repair_root_task_run_id: str | None = None,
     ) -> str: ...
 
     def cancel(self, task_run_id: str) -> None: ...
@@ -1302,11 +1305,58 @@ class VFlowRuntime:
             return 1
 
     @staticmethod
-    def _repair_dedupe_key(point: _Point, repair_attempt: int) -> str:
-        return (
-            f"vflow-repair:{point.run_id}:{point.id}:"
-            f"{point.visit_seq}:{point.attempt}:{repair_attempt}"
+    def _resolve_repair_root(connection: Any, job_id: str) -> str | None:
+        """Resolve the original Task run of the current point visit.
+
+        The Task link is authoritative because it also exists for test gateways
+        that return synthetic job ids; queue job rows are the fallback for
+        outbox payloads created by older builds.
+        """
+        link = connection.execute(
+            """SELECT repair_root_task_run_id FROM vflow_task_links
+               WHERE task_run_id = ?""",
+            (job_id,),
+        ).fetchone()
+        if link and link["repair_root_task_run_id"]:
+            return str(link["repair_root_task_run_id"])
+        seen: set[str] = set()
+        current: str | None = job_id
+        while current and current not in seen and len(seen) < 64:
+            seen.add(current)
+            row = connection.execute(
+                """SELECT id, task_id, parent_task_run_id,
+                          repair_root_task_run_id
+                   FROM queue_jobs WHERE id = ?""",
+                (current,),
+            ).fetchone()
+            if not row:
+                return None
+            root_hint = row["repair_root_task_run_id"]
+            if root_hint:
+                current = str(root_hint)
+                continue
+            if row["task_id"] is not None:
+                return str(row["id"])
+            current = row["parent_task_run_id"]
+        return None
+
+    @staticmethod
+    def _repair_dedupe_key(
+        point: _Point,
+        repair_attempt: int,
+        parent_task_run_id: str,
+        root_task_run_id: str,
+    ) -> str:
+        identity = vflow_repair_identity(
+            run_id=point.run_id,
+            point_id=point.id,
+            node_id=point.node_id,
+            visit_seq=point.visit_seq,
+            repair_root_task_run_id=root_task_run_id,
+            parent_task_run_id=parent_task_run_id,
+            repair_attempt=repair_attempt,
         )
+        return f"vflow-repair:{identity}"
 
     def _handle_task_json_repair(
         self,
@@ -1350,11 +1400,25 @@ class VFlowRuntime:
         if repair_attempt > self._repair_limit(config) or not callable(repair_method):
             self._fail(connection, point.run_id, failure.code, failure.message)
             return True
+        parent_task_run_id = str(point.task_run_id)
+        root_task_run_id = self._resolve_repair_root(connection, parent_task_run_id)
+        if not root_task_run_id:
+            self._fail(
+                connection,
+                point.run_id,
+                "TASK_REPAIR_UNAVAILABLE",
+                "Original job is not a task run",
+            )
+            return True
         prompt = build_correction_prompt(failure, schema)
-        dedupe_key = self._repair_dedupe_key(point, repair_attempt)
+        dedupe_key = self._repair_dedupe_key(
+            point, repair_attempt, parent_task_run_id, root_task_run_id
+        )
         now = utcnow()
         payload = {
-            "task_run_id": point.task_run_id,
+            "task_run_id": parent_task_run_id,
+            "parent_task_run_id": parent_task_run_id,
+            "repair_root_task_run_id": root_task_run_id,
             "task_id": str(task_link["task_id"]),
             "run_id": point.run_id,
             "point_id": point.id,
@@ -1413,6 +1477,17 @@ class VFlowRuntime:
                 "TASK_REPAIR_UNAVAILABLE", "Task gateway cannot repair output"
             )
         old_job_id = str(payload["task_run_id"])
+        root_task_run_id = str(payload.get("repair_root_task_run_id") or "")
+        if not root_task_run_id:
+            root_task_run_id = self._resolve_repair_root(connection, old_job_id) or ""
+        if not root_task_run_id:
+            raise VFlowTaskError(
+                "TASK_REPAIR_UNAVAILABLE", "Original job is not a task run"
+            )
+        node_id = str(payload.get("node_id") or "") or None
+        visit_seq = (
+            int(payload["visit_seq"]) if payload.get("visit_seq") is not None else None
+        )
         new_job_id = repair_method(
             task_run_id=old_job_id,
             run_id=str(payload["run_id"]),
@@ -1421,18 +1496,26 @@ class VFlowRuntime:
             prompt=str(payload["prompt"]),
             error_code=payload.get("error_code"),
             error_message=payload.get("error_message"),
+            node_id=node_id,
+            visit_seq=visit_seq,
+            repair_root_task_run_id=root_task_run_id,
         )
         if not new_job_id:
             raise VFlowTaskError(
                 "TASK_REPAIR_UNAVAILABLE", "Task gateway returned no repair job"
             )
         connection.execute(
+            """UPDATE vflow_task_links SET repair_root_task_run_id = ?
+               WHERE task_run_id = ?""",
+            (root_task_run_id, old_job_id),
+        )
+        connection.execute(
             """INSERT OR IGNORE INTO vflow_task_links
                (id, run_id, point_id, node_id, visit_seq, attempt, task_id,
                 task_run_id, enqueue_key, status, repair_attempt,
-                parent_task_run_id, repair_error_code, repair_error_message,
-                queued_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
+                parent_task_run_id, repair_root_task_run_id, repair_error_code,
+                repair_error_message, queued_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
             (
                 str(uuid.uuid4()),
                 payload["run_id"],
@@ -1445,6 +1528,7 @@ class VFlowRuntime:
                 dedupe_key,
                 int(payload["repair_attempt"]),
                 old_job_id,
+                root_task_run_id,
                 payload.get("error_code"),
                 payload.get("error_message"),
                 now,
@@ -1492,6 +1576,7 @@ class VFlowRuntime:
                 "repair_attempt": int(payload["repair_attempt"]),
                 "task_run_id": new_job_id,
                 "parent_task_run_id": old_job_id,
+                "repair_root_task_run_id": root_task_run_id,
                 "error_code": payload.get("error_code"),
                 "path": payload.get("error_path"),
             },
@@ -1685,8 +1770,9 @@ class VFlowRuntime:
         connection.execute(
             """INSERT OR IGNORE INTO vflow_task_links
                (id, run_id, point_id, node_id, visit_seq, attempt, task_id,
-                task_run_id, enqueue_key, status, queued_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+                task_run_id, enqueue_key, repair_root_task_run_id, status,
+                queued_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
             (
                 str(uuid.uuid4()),
                 point.run_id,
@@ -1697,6 +1783,7 @@ class VFlowRuntime:
                 action.task_id,
                 task_run_id,
                 enqueue_key,
+                task_run_id,
                 now,
             ),
         )
