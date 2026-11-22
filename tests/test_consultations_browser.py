@@ -1,7 +1,39 @@
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
+
+
+def multipart_form(request):
+    """Parse a multipart form the same way the consultation server does."""
+    content_type = request.headers.get("content-type", "")
+    if not content_type.startswith("multipart/form-data"):
+        return request.post_data_json
+    raw = f"Content-Type: {content_type}\r\n\r\n".encode() + (request.post_data_buffer or b"")
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    fields = {}
+    files = []
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name is None:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        filename = part.get_filename()
+        if filename is None:
+            fields[name] = payload.decode(part.get_content_charset() or "utf-8")
+        elif filename:
+            files.append(
+                {
+                    "filename": filename,
+                    "content_type": part.get_content_type(),
+                    "data": payload,
+                }
+            )
+    if files:
+        fields["files"] = files
+    return fields
 
 
 def test_consultation_deep_link_survives_login_and_back_navigation():
@@ -131,14 +163,14 @@ def test_consultation_ui_and_live_draft(admin, tasks_only):
             payload = settings
         elif path.endswith("/consultations"):
             if route.request.method == "POST":
-                sent.append(route.request.post_data_json)
+                sent.append(multipart_form(route.request))
                 payload = chat
             else:
                 payload = [chat]
         elif path.endswith("/consultation-1"):
             payload = chat
         elif path.endswith("/messages"):
-            sent.append(route.request.post_data_json)
+            sent.append(multipart_form(route.request))
             payload = {"id": "job", "status": "queued"}
         route.fulfill(json=payload)
 
@@ -182,9 +214,23 @@ def test_consultation_ui_and_live_draft(admin, tasks_only):
         else:
             playwright.expect(page.locator("#consultation-model")).to_have_count(0)
             page.locator("#consultation-question").fill("Первый вопрос")
+            page.locator("#consultation-new-files").set_input_files(
+                {"name": "question.txt", "mimeType": "text/plain", "buffer": b"details"}
+            )
             page.locator("#consultation-new button").click()
             playwright.expect(page.locator("#consultation-send")).to_be_visible()
-            assert sent == [{"message": "Первый вопрос"}]
+            assert sent == [
+                {
+                    "message": "Первый вопрос",
+                    "files": [
+                        {
+                            "filename": "question.txt",
+                            "content_type": "text/plain",
+                            "data": b"details",
+                        }
+                    ],
+                }
+            ]
             page.locator("#consultation-send textarea").fill("Черновик")
             page.evaluate(
                 """consultationEvents.onmessage({data: JSON.stringify({
