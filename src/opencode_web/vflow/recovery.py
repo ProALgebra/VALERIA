@@ -8,7 +8,13 @@ from ..database import Database, utcnow
 from .models import Graph
 from .redaction import redact_metadata
 
-ACTIVE_POINT_STATUSES = ("ready", "claimed", "waiting_task", "waiting_merge")
+ACTIVE_POINT_STATUSES = (
+    "ready",
+    "claimed",
+    "waiting_task",
+    "processing_output",
+    "waiting_merge",
+)
 
 
 def _dump(value: Any) -> str:
@@ -104,6 +110,13 @@ class VFlowRecovery:
                      )""",
                 (now, now),
             ).rowcount
+            recovered_waits += connection.execute(
+                """UPDATE vflow_points
+                   SET next_check_at = ?, updated_at = ?
+                   WHERE status = 'processing_output'
+                     AND json_processor_job_id IS NOT NULL""",
+                (now, now),
+            ).rowcount
 
             recovered_merges = self._recover_completed_merges(connection, now)
 
@@ -123,7 +136,8 @@ class VFlowRecovery:
                      AND NOT EXISTS (
                        SELECT 1 FROM vflow_points p
                        WHERE p.run_id = r.id
-                         AND p.status IN ('ready', 'claimed', 'waiting_task', 'waiting_merge')
+                         AND p.status IN ('ready', 'claimed', 'waiting_task',
+                                          'processing_output', 'waiting_merge')
                      )
                      AND NOT EXISTS (
                        SELECT 1 FROM vflow_fork_instances f
@@ -300,7 +314,8 @@ class VFlowRecovery:
         active = connection.execute(
             """SELECT COUNT(*) FROM vflow_points
                WHERE run_id = ? AND status IN
-                 ('ready', 'claimed', 'waiting_task', 'waiting_merge')""",
+                 ('ready', 'claimed', 'waiting_task', 'processing_output',
+                  'waiting_merge')""",
             (run_id,),
         ).fetchone()[0]
         open_forks = connection.execute(
@@ -352,7 +367,8 @@ class VFlowRecovery:
             """UPDATE vflow_points
                SET status = 'cancelled', updated_at = ?
                WHERE run_id = ?
-                 AND status IN ('ready', 'claimed', 'waiting_task', 'waiting_merge')""",
+                 AND status IN ('ready', 'claimed', 'waiting_task',
+                                'processing_output', 'waiting_merge')""",
             (now, run_id),
         )
         connection.execute(

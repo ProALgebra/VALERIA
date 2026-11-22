@@ -15,7 +15,13 @@ from ..database import Database, utcnow
 from .registry import DEFAULT_REGISTRY, NodeRegistry
 
 ACTIVE_RUN_STATUSES = ("running", "cancel_requested")
-ACTIVE_POINT_STATUSES = ("ready", "claimed", "waiting_task", "waiting_merge")
+ACTIVE_POINT_STATUSES = (
+    "ready",
+    "claimed",
+    "waiting_task",
+    "processing_output",
+    "waiting_merge",
+)
 REQUIRED_TABLES = (
     "vflow_definitions",
     "vflow_versions",
@@ -206,7 +212,7 @@ class VFlowHealth:
                       WHERE status IN (?, ?))
                        AS active_runs,
                      (SELECT COUNT(*) FROM vflow_points
-                      WHERE status IN (?, ?, ?, ?))
+                      WHERE status IN (?, ?, ?, ?, ?))
                        AS active_points,
                      (SELECT COUNT(*) FROM vflow_fork_instances
                       WHERE status = 'open')

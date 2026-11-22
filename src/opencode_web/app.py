@@ -28,6 +28,14 @@ from .database import (
 )
 from .dispatcher import QueueDispatcher
 from .events import EventBroker
+from .json_processor.api import register_json_processor
+from .json_processor.integration import (
+    JsonProcessorIntegrationError,
+    JsonProcessorVFlowAdapter,
+    build_worker,
+    resolve_env_api_key_ref,
+)
+from .json_processor.repository import JsonProcessorRepository
 from .notifications import (
     MattermostNotificationError,
     NotificationDispatcher,
@@ -119,6 +127,10 @@ class TaskBody(BaseModel):
     user_ids: list[str] | None = None
     next_task_ids: list[str] = Field(default_factory=list)
     queue_id: str = DEFAULT_QUEUE_ID
+    output_mode: str = "text"
+    output_schema: dict[str, Any] | None = None
+    on_json_error: str = "fail"
+    repair_trigger: str = "invalid_json"
 
 
 class TaskPatchBody(BaseModel):
@@ -134,6 +146,10 @@ class TaskPatchBody(BaseModel):
     user_ids: list[str] | None = None
     next_task_ids: list[str] = Field(default_factory=list)
     queue_id: str | None = None
+    output_mode: str | None = None
+    output_schema: dict[str, Any] | None = None
+    on_json_error: str | None = None
+    repair_trigger: str | None = None
 
 
 class TaskAudienceBody(BaseModel):
@@ -261,7 +277,16 @@ def public_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def admin_task(task: dict[str, Any]) -> dict[str, Any]:
-    return {**task, "model": f"{task['provider_id']}/{task['model_id']}"}
+    result = {**task, "model": f"{task['provider_id']}/{task['model_id']}"}
+    schema = task.get("output_schema_json")
+    if isinstance(schema, str):
+        try:
+            result["output_schema"] = json.loads(schema)
+        except (TypeError, ValueError):
+            result["output_schema"] = None
+    else:
+        result.setdefault("output_schema", None)
+    return result
 
 
 def task_run_title(task: dict[str, Any], user_input: str) -> str:
@@ -490,10 +515,39 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 attachments=attachments,
             )
             notification_dispatcher = NotificationDispatcher(database, settings)
+            json_processor_repository = JsonProcessorRepository(database)
+            json_processor_service = None
+            json_processor_worker = None
+            json_processor_adapter = None
+            try:
+                processor_settings = json_processor_repository.get_settings_model()
+            except Exception:
+                logger.warning("JSON processor settings are invalid")
+                processor_settings = None
+            if processor_settings is not None and processor_settings.enabled:
+                try:
+                    (
+                        json_processor_repository,
+                        json_processor_service,
+                        json_processor_worker,
+                    ) = build_worker(
+                        database,
+                        allow_private_networks=(
+                            settings.json_processor_allow_private_networks
+                        ),
+                    )
+                    json_processor_adapter = JsonProcessorVFlowAdapter(
+                        json_processor_repository
+                    )
+                except JsonProcessorIntegrationError as exc:
+                    logger.warning(
+                        "JSON processor worker is not available: %s", exc.message
+                    )
             vflow_runtime = VFlowRuntime(
                 database,
                 ValeriaTaskGateway(database),
                 limits=vflow_config.limits,
+                json_processor=json_processor_adapter,
             )
             vflow_scheduler = VFlowScheduler(vflow_runtime)
             vflow_retention = VFlowRetention(database, vflow_config.retention_days)
@@ -517,6 +571,11 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             app.state.attachments = attachments
             app.state.dispatcher = dispatcher
             app.state.notification_dispatcher = notification_dispatcher
+            app.state.json_processor_repository = json_processor_repository
+            app.state.json_processor_service = json_processor_service
+            app.state.json_processor_worker = json_processor_worker
+            app.state.json_processor_vflow = json_processor_adapter
+            app.state.json_processor_api_key_resolver = resolve_env_api_key_ref
             app.state.vflow_runtime = vflow_runtime
             app.state.vflow_scheduler = vflow_scheduler
             app.state.vflow_recovery = vflow_recovery
@@ -539,6 +598,11 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                     )
             try:
                 manager.start_idle_reaper(database.workspace_has_pending_jobs)
+                if json_processor_worker is not None:
+                    await asyncio.to_thread(
+                        json_processor_repository.recover_expired_leases
+                    )
+                    await json_processor_worker.start()
                 if start_dispatcher:
                     dispatcher.start()
                     notification_dispatcher.start()
@@ -557,15 +621,19 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                         await vflow_scheduler.stop()
                     finally:
                         try:
-                            await notification_dispatcher.stop()
+                            if json_processor_worker is not None:
+                                await json_processor_worker.stop()
                         finally:
                             try:
-                                await dispatcher.stop()
+                                await notification_dispatcher.stop()
                             finally:
                                 try:
-                                    await manager.close()
+                                    await dispatcher.stop()
                                 finally:
-                                    database.close()
+                                    try:
+                                        await manager.close()
+                                    finally:
+                                        database.close()
 
     app = FastAPI(title="OpenCode Web", version="0.1.0", lifespan=lifespan)
     app.state.vflow_config = vflow_config
@@ -1126,7 +1194,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 principal["user"]["id"], body.title, body.description, body.content,
                 agent, provider_id, model_id, body.model_variant, body.is_published,
                 next_task_ids=body.next_task_ids, plan_first=body.plan_first,
-                queue_id=body.queue_id,
+                queue_id=body.queue_id, output_mode=body.output_mode,
+                output_schema=body.output_schema,
+                on_json_error=body.on_json_error,
+                repair_trigger=body.repair_trigger,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -1149,7 +1220,8 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             raise HTTPException(404, "Task not found")
         fields = body.model_dump(exclude_unset=True)
         for key in (
-            "title", "content", "agent", "model", "is_published", "plan_first", "queue_id"
+            "title", "content", "agent", "model", "is_published", "plan_first",
+            "queue_id", "output_mode", "on_json_error", "repair_trigger",
         ):
             if key in fields and fields[key] is None:
                 raise HTTPException(422, f"{key} cannot be null")
@@ -2105,6 +2177,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         admin_read_principal, admin_principal, validate_agent_model,
         artifacts_getter=lambda: getattr(app.state, "artifacts", None),
         attachments_getter=lambda: getattr(app.state, "attachments", None),
+    )
+    register_json_processor(
+        app, database, admin_principal, admin_read_principal,
+        allow_private_networks=settings.json_processor_allow_private_networks,
     )
     if vflow_config.enabled:
         register_vflow(

@@ -25,6 +25,12 @@ from .capabilities import Capability
 from .logic import MISSING, apply_transform, evaluate_if, get_path
 from .models import Graph, Node
 from .registry import FORK, IF, MERGE, TASK, TRANSFORM
+from .task_output import (
+    build_task_output,
+    check_json_output,
+    effective_output_schema,
+    output_mode,
+)
 
 TASK_POLL_SECONDS = 2
 TASK_WAIT_KIND = "task"
@@ -203,6 +209,20 @@ class TaskHandler:
 
         result_mode = str(config.get("result_mode", "auto"))
         text = status.get("text")
+        if output_mode(config) == "json":
+            check = check_json_output(text, effective_output_schema(config))
+            if not check.ok:
+                return Fail(check.error_code, check.message)
+            return Advance(
+                port="out",
+                data=build_task_output(
+                    input_data=context.point.data,
+                    task_id=str(config["task_id"]),
+                    task_run_id=context.point.task_run_id,
+                    text=text if isinstance(text, str) else "",
+                    value=check.value,
+                ),
+            )
         parsed: Any = None
         if result_mode == "strict_json":
             try:

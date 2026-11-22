@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from ..database import utcnow
+from ..json_processor.integration import JsonProcessorIntegrationError
 from .actions import (
     Action,
     Advance,
@@ -54,6 +55,14 @@ from .models import Graph
 from .policy import effective_limits
 from .redaction import redact_metadata
 from .registry import DEFAULT_REGISTRY, MERGE, TASK, NodeRegistry
+from .task_output import (
+    build_task_output,
+    check_json_output,
+    effective_output_schema,
+    on_json_error,
+    output_mode,
+    repair_trigger,
+)
 
 TERMINAL_RUN_STATUSES = {"succeeded", "failed", "cancelled"}
 # Fairness guard for one scheduler tick: a single Run may contribute at most
@@ -66,6 +75,7 @@ ACTIVE_POINT_STATUSES = {
     "ready",
     "claimed",
     "waiting_task",
+    "processing_output",
     "waiting_merge",
 }
 # A queue timeout only applies before the dispatcher starts the Task. Once a
@@ -138,6 +148,7 @@ class _Point:
     attempt: int
     json_repair_attempt: int
     lease_token: str | None
+    json_processor_job_id: str | None = None
 
 
 def _dump(value: Any) -> str:
@@ -206,11 +217,13 @@ class VFlowRuntime:
         limits: VFlowLimits = DEFAULT_LIMITS,
         handlers: Mapping[str, NodeHandler] | None = None,
         per_run_claim_limit: int = DEFAULT_PER_RUN_CLAIM_LIMIT,
+        json_processor: Any | None = None,
     ):
         self.database = database
         self.gateway = gateway
         self.registry = registry
         self.limits = limits
+        self.json_processor = json_processor
         self.handlers = dict(DEFAULT_HANDLERS if handlers is None else handlers)
         # Handler declarations are part of the trusted code contract. Validate
         # them against the registry when a spec is available; handlers without
@@ -425,7 +438,8 @@ class VFlowRuntime:
         return self.database._all(
             """SELECT id, run_id, node_id, status, data_json, fork_stack_json,
                       parent_point_id, visit_seq, task_run_id, attempt,
-                      json_repair_attempt, next_check_at, created_at, updated_at
+                      json_repair_attempt, json_processor_job_id,
+                      next_check_at, created_at, updated_at
                FROM vflow_points WHERE run_id = ?
                ORDER BY created_at, id""",
             (run_id,),
@@ -485,7 +499,7 @@ class VFlowRuntime:
                        WHERE r.status = 'running'
                          AND (
                            p.status = 'ready'
-                           OR (p.status = 'waiting_task'
+                           OR (p.status IN ('waiting_task', 'processing_output')
                                AND p.next_check_at IS NOT NULL
                                AND p.next_check_at <= ?)
                          )
@@ -529,7 +543,7 @@ class VFlowRuntime:
                        SET status = 'claimed', lease_owner = 'runtime',
                            lease_token = ?, lease_until = ?, updated_at = ?
                        WHERE id = ?
-                         AND status IN ('ready', 'waiting_task')
+                         AND status IN ('ready', 'waiting_task', 'processing_output')
                          AND (lease_until IS NULL OR lease_until <= ?)""",
                     (token, _lease_until(lease_seconds), now, point_id, now),
                 )
@@ -587,6 +601,7 @@ class VFlowRuntime:
                 attempt=int(row["attempt"]),
                 json_repair_attempt=int(row["json_repair_attempt"] or 0),
                 lease_token=row["lease_token"],
+                json_processor_job_id=row["json_processor_job_id"],
             )
             try:
                 node = next((item for item in graph.nodes if item.id == point.node_id), None)
@@ -610,8 +625,8 @@ class VFlowRuntime:
                             connection, point, node, task_link, task_status
                         ):
                             return True
-                        if self._handle_task_json_repair(
-                            connection, point, node, task_link, task_status
+                        if self._handle_task_output(
+                            connection, point, node, task_link, task_status, graph, limits
                         ):
                             return True
                 handler = self.handlers.get(node.type)
@@ -724,9 +739,10 @@ class VFlowRuntime:
             connection.execute(
                 """UPDATE vflow_points
                    SET status = 'ready', attempt = ?, task_run_id = NULL,
-                       json_repair_attempt = 0, next_check_at = NULL,
-                       lease_owner = NULL, lease_token = NULL,
-                       lease_until = NULL, updated_at = ? WHERE id = ?""",
+                       json_repair_attempt = 0, json_processor_job_id = NULL,
+                       next_check_at = NULL, lease_owner = NULL,
+                       lease_token = NULL, lease_until = NULL, updated_at = ?
+                   WHERE id = ?""",
                 (attempt, now, point.id),
             )
             self._event(
@@ -805,6 +821,7 @@ class VFlowRuntime:
             """UPDATE vflow_points
                SET node_id = ?, status = 'ready', data_json = ?, visit_seq = ?,
                    attempt = 1, task_run_id = NULL, json_repair_attempt = 0,
+                   json_processor_job_id = NULL,
                    lease_owner = NULL, lease_token = NULL, lease_until = NULL,
                    next_check_at = NULL, updated_at = ?
                WHERE id = ?""",
@@ -838,7 +855,8 @@ class VFlowRuntime:
         active_points = connection.execute(
             """SELECT COUNT(*) FROM vflow_points
                WHERE run_id = ?
-                 AND status IN ('ready', 'claimed', 'waiting_task', 'waiting_merge')""",
+                 AND status IN ('ready', 'claimed', 'waiting_task',
+                                'processing_output', 'waiting_merge')""",
             (point.run_id,),
         ).fetchone()[0]
         total_points = connection.execute(
@@ -1147,7 +1165,8 @@ class VFlowRuntime:
         active = connection.execute(
             """SELECT COUNT(*) FROM vflow_points
                WHERE run_id = ? AND status IN
-                 ('ready', 'claimed', 'waiting_task', 'waiting_merge')""",
+                 ('ready', 'claimed', 'waiting_task', 'processing_output',
+                  'waiting_merge')""",
             (run_id,),
         ).fetchone()[0]
         open_forks = connection.execute(
@@ -1358,6 +1377,281 @@ class VFlowRuntime:
         )
         return f"vflow-repair:{identity}"
 
+    # ------------------------------------------------------------------
+    # Processor-backed Task JSON output
+    # ------------------------------------------------------------------
+    def _handle_task_output(
+        self,
+        connection: Any,
+        point: _Point,
+        node: Any,
+        task_link: Any,
+        task_status: dict[str, Any] | None,
+        graph: Graph,
+        limits: VFlowLimits,
+    ) -> bool:
+        if output_mode(node.config) != "json":
+            return self._handle_task_json_repair(
+                connection, point, node, task_link, task_status
+            )
+        if point.json_processor_job_id:
+            return self._handle_json_processor_job(
+                connection, point, node, task_status, graph, limits
+            )
+        if task_link is None or not task_status:
+            return False
+        if str(task_status.get("status") or "") != "completed":
+            return False
+        return self._start_json_output_processing(
+            connection, point, node, task_status, graph, limits
+        )
+
+    def _start_json_output_processing(
+        self,
+        connection: Any,
+        point: _Point,
+        node: Any,
+        task_status: dict[str, Any],
+        graph: Graph,
+        limits: VFlowLimits,
+    ) -> bool:
+        text = task_status.get("text")
+        schema = effective_output_schema(node.config)
+        syntax = check_json_output(text, None)
+        checked = (
+            check_json_output(text, schema)
+            if syntax.ok and schema is not None
+            else syntax
+        )
+        if checked.ok:
+            data = build_task_output(
+                input_data=point.data,
+                task_id=str(node.config["task_id"]),
+                task_run_id=point.task_run_id,
+                text=text if isinstance(text, str) else "",
+                value=checked.value,
+            )
+            self._apply_advance(
+                connection,
+                point,
+                graph,
+                Advance(port="out", data=data),
+                limits,
+            )
+            self._event(
+                connection,
+                point.run_id,
+                point.id,
+                point.node_id,
+                "TASK_OUTPUT_READY",
+                {"mode": "json"},
+            )
+            return True
+        if checked.error_code == "OUTPUT_CONFIG_INVALID":
+            raise VFlowRuntimeError("OUTPUT_CONFIG_INVALID", checked.message)
+
+        can_repair = on_json_error(node.config) == "repair"
+        trigger_matches = (
+            not syntax.ok
+            or repair_trigger(node.config) == "invalid_json_or_schema"
+        )
+        if not can_repair or not trigger_matches:
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID", self._output_failure_message(checked)
+            )
+
+        job = self._create_json_processor_job(point, node, text)
+        now = utcnow()
+        next_check = (
+            datetime.now(UTC) + timedelta(seconds=TASK_POLL_SECONDS)
+        ).isoformat()
+        cursor = connection.execute(
+            """UPDATE vflow_points
+               SET status = 'processing_output', json_processor_job_id = ?,
+                   next_check_at = ?, lease_owner = NULL, lease_token = NULL,
+                   lease_until = NULL, updated_at = ?
+               WHERE id = ? AND status = 'claimed'""",
+            (str(job["id"]), next_check, now, point.id),
+        )
+        if cursor.rowcount != 1:
+            raise VFlowRuntimeError(
+                "OUTPUT_REPAIR_STALE",
+                "Task output point changed before repair was enqueued",
+            )
+        self._event(
+            connection,
+            point.run_id,
+            point.id,
+            point.node_id,
+            "TASK_OUTPUT_PROCESSING",
+            {
+                "job_id": str(job["id"]),
+                "repair_trigger": repair_trigger(node.config),
+                "error_code": checked.error_code,
+            },
+        )
+        return True
+
+    def _create_json_processor_job(
+        self,
+        point: _Point,
+        node: Any,
+        text: Any,
+    ) -> dict[str, Any]:
+        if self.json_processor is None:
+            raise VFlowRuntimeError(
+                "JSON_PROCESSOR_NOT_CONFIGURED",
+                "JSON repair processor is not configured",
+            )
+        raw_text = text if isinstance(text, str) else ""
+        raw_ref = point.task_run_id or point.id
+        try:
+            job = self.json_processor.create_repair_job(
+                raw_output=raw_text,
+                raw_output_ref=str(raw_ref),
+                schema=effective_output_schema(node.config),
+                task_run_id=point.task_run_id,
+                vflow_run_id=point.run_id,
+                point_id=point.id,
+            )
+        except JsonProcessorIntegrationError as exc:
+            code_value = getattr(exc.code, "value", str(exc.code))
+            code = (
+                "JSON_PROCESSOR_NOT_CONFIGURED"
+                if code_value == "NOT_CONFIGURED"
+                else "OUTPUT_INVALID"
+            )
+            raise VFlowRuntimeError(code, exc.message) from None
+        except Exception:
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID", "JSON repair job could not be created"
+            ) from None
+        if not isinstance(job, dict) or not job.get("id"):
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID", "JSON repair job could not be created"
+            )
+        return job
+
+    def _handle_json_processor_job(
+        self,
+        connection: Any,
+        point: _Point,
+        node: Any,
+        task_status: dict[str, Any] | None,
+        graph: Graph,
+        limits: VFlowLimits,
+    ) -> bool:
+        if self.json_processor is None:
+            raise VFlowRuntimeError(
+                "JSON_PROCESSOR_NOT_CONFIGURED",
+                "JSON repair processor is not configured",
+            )
+        job = self.json_processor.get_job(str(point.json_processor_job_id))
+        if not isinstance(job, dict):
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID", "JSON repair job is unavailable"
+            )
+        status = str(job.get("status") or "")
+        if status in {"queued", "processing"}:
+            next_check = (
+                datetime.now(UTC) + timedelta(seconds=TASK_POLL_SECONDS)
+            ).isoformat()
+            connection.execute(
+                """UPDATE vflow_points
+                   SET status = 'processing_output', next_check_at = ?,
+                       lease_owner = NULL, lease_token = NULL,
+                       lease_until = NULL, updated_at = ?
+                   WHERE id = ? AND status IN ('claimed', 'processing_output')""",
+                (next_check, utcnow(), point.id),
+            )
+            self._event(
+                connection,
+                point.run_id,
+                point.id,
+                point.node_id,
+                "TASK_OUTPUT_WAITING",
+                {
+                    "job_id": str(job.get("id")),
+                    "status": status,
+                },
+            )
+            return True
+        if status != "succeeded":
+            code = str(job.get("error_code") or status or "OUTPUT_INVALID")
+            message = str(
+                job.get("error_message")
+                or "JSON repair failed"
+            )[:500]
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID",
+                f"JSON repair failed ({code}): {message}",
+            )
+        if not job.get("has_result"):
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID", "JSON repair job has no valid result"
+            )
+        value = job.get("result")
+        try:
+            canonical = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID", "JSON repair result is not valid JSON"
+            ) from None
+        checked = check_json_output(
+            canonical, effective_output_schema(node.config)
+        )
+        if not checked.ok:
+            raise VFlowRuntimeError(
+                "OUTPUT_INVALID", self._output_failure_message(checked)
+            )
+        text = task_status.get("text") if task_status else ""
+        data = build_task_output(
+            input_data=point.data,
+            task_id=str(node.config["task_id"]),
+            task_run_id=point.task_run_id,
+            text=text if isinstance(text, str) else "",
+            value=checked.value,
+        )
+        self._apply_advance(
+            connection,
+            point,
+            graph,
+            Advance(port="out", data=data),
+            limits,
+        )
+        self._event(
+            connection,
+            point.run_id,
+            point.id,
+            point.node_id,
+            "TASK_OUTPUT_REPAIRED",
+            {
+                "job_id": str(job.get("id")),
+                "method": str(job.get("method") or "none"),
+            },
+        )
+        return True
+
+    @staticmethod
+    def _output_failure_message(check: Any) -> str:
+        message = str(getattr(check, "message", "") or "Task output is invalid")
+        path = str(getattr(check, "path", "") or "$")
+        return f"{message} ({path})" if path and path != "$" else message
+
+    def _cancel_json_processor_jobs(self, run_id: str) -> int:
+        if self.json_processor is None:
+            return 0
+        try:
+            return int(self.json_processor.cancel_run_jobs(run_id))
+        except Exception:
+            return 0
+
     def _handle_task_json_repair(
         self,
         connection: Any,
@@ -1377,6 +1671,10 @@ class VFlowRuntime:
         if str(task_status.get("status") or "") != "completed":
             return False
         config = node.config
+        if output_mode(config) == "json":
+            # The processor path owns output_mode=json.  Never run both repair
+            # engines for one Task answer.
+            return False
         if str(config.get("result_mode", "auto")) != "strict_json":
             return False
         schema = config.get("json_schema")
@@ -1797,7 +2095,7 @@ class VFlowRuntime:
         connection.execute(
             """UPDATE vflow_points
                SET status = 'waiting_task', task_run_id = ?, next_check_at = ?,
-                   json_repair_attempt = 0,
+                   json_repair_attempt = 0, json_processor_job_id = NULL,
                    lease_owner = NULL, lease_token = NULL, lease_until = NULL,
                    updated_at = ?
                WHERE id = ?""",
@@ -1837,7 +2135,8 @@ class VFlowRuntime:
         connection.execute(
             """UPDATE vflow_points SET status = 'cancelled', updated_at = ?
                WHERE run_id = ? AND status IN
-                 ('ready', 'claimed', 'waiting_task', 'waiting_merge')""",
+                 ('ready', 'claimed', 'waiting_task', 'processing_output',
+                  'waiting_merge')""",
             (now, run_id),
         )
         connection.execute(
@@ -1845,6 +2144,7 @@ class VFlowRuntime:
                WHERE run_id = ? AND status = 'open'""",
             (run_id,),
         )
+        self._cancel_json_processor_jobs(run_id)
         connection.execute(
             """UPDATE vflow_task_links SET status = 'failed', finished_at = ?
                WHERE run_id = ? AND finished_at IS NULL""",
@@ -1875,7 +2175,8 @@ class VFlowRuntime:
             connection.execute(
                 """UPDATE vflow_points SET status = 'cancelled', updated_at = ?
                    WHERE run_id = ? AND status IN
-                     ('ready', 'claimed', 'waiting_task', 'waiting_merge')""",
+                     ('ready', 'claimed', 'waiting_task', 'processing_output',
+                      'waiting_merge')""",
                 (now, run_id),
             )
             connection.execute(
@@ -1883,6 +2184,7 @@ class VFlowRuntime:
                 "WHERE run_id = ? AND status = 'open'",
                 (run_id,),
             )
+            self._cancel_json_processor_jobs(run_id)
             connection.execute(
                 """UPDATE vflow_task_links SET status = 'cancelled', finished_at = ?
                    WHERE run_id = ? AND finished_at IS NULL""",

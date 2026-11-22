@@ -1,6 +1,6 @@
 # VALERIA VFlow — эксплуатационная и разработческая документация
 
-**Статус:** описывает фактическую реализацию в текущем рабочем дереве (21.11.2026).
+**Статус:** описывает фактическую реализацию в текущем рабочем дереве (22.11.2026, включая JSON Processor M8–M11).
 **Аудитория:** администраторы VALERIA, DevOps/сопровождение, разработчики модуля.
 **Границы:** это практическое руководство, а не замена технической спецификации. Там, где спецификация описывает целевое поведение, а код реализует подмножество, это явно отмечено.
 
@@ -88,7 +88,7 @@ VFlow HTTP API (vflow/api.py)
 | **Outbox** | Запись намерения постановки задачи (`task_enqueue`), используемая как диагностический/durable intent и учитываемая health/metrics. Отдельного фонового отправителя outbox в текущей реализации нет. |
 
 Статусы Run: `created`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`.
-Статусы точки: `ready`, `claimed`, `waiting_task`, `waiting_merge`, `forked`, `consumed`, `failed`, `cancelled`.
+Статусы точки: `ready`, `claimed`, `waiting_task`, `processing_output`, `waiting_merge`, `forked`, `consumed`, `failed`, `cancelled`.
 
 ### 1.4. IR и версионирование
 
@@ -129,7 +129,7 @@ Registry — code-only. Администратор не добавляет ти�
 
 | DSL-вызов | IR type | Порты | Основные параметры |
 |---|---|---|---|
-| `task.run(...)` | `valeria.task@1.0` | `out` | `task_id`, `input`/`input_path`, `result_mode`, `json_schema`, `max_json_repairs`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
+| `task.run(...)` | `valeria.task@1.0` | `out` | `task_id`, `input`/`input_path`, `result_mode`, `output_mode`, `output_schema`, `on_json_error`, `repair_trigger`, `json_schema`, `max_json_repairs`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
 | `transform(...)` | `core.transform@1.0` | `out` | `operations`, `create_missing` |
 | `if(...)` | `core.if@1.0` | `true`, `false` | `path`, `operator`, `value`, `missing` |
 | `fork(...)` | `core.fork@1.0` | `branch[0..N-1]` или `all` | `count`, `join` |
@@ -142,6 +142,8 @@ Registry — code-only. Администратор не добавляет ти�
 `ValeriaTaskGateway` — тонкий адаптер между точкой VFlow и существующей очередью VALERIA. Он создаёт обычные `queue_jobs` и `chats`; исполняет их существующий `QueueDispatcher`. VFlow не вызывает OpenCode, не управляет сессиями и не создаёт второй механизм очереди.
 
 Для `strict_json` runtime проверяет весь финальный текст: сначала синтаксис JSON, затем необязательную `json_schema`. При ошибке и остатке `max_json_repairs` Gateway создаёт follow-up `queue_jobs` в **том же** `chat_id`/`session_id` с `task_id = NULL`, `job_kind = 'vflow_repair'`, `pipeline_json = ''` и детерминированным `message_id` (`msg_vflow_repair_<sha256(run:point:attempt)>`). Это обычное продолжение чата, а не новый Task Run и не legacy-потомок pipeline. Повторный вызов идемпотентен. Ответ follow-up сохраняется в `task_run_results` и читается Gateway как финальный текст. Очередь исправлений восстанавливается из `vflow_outbox.kind = 'task_json_repair'`; отмена Run отменяет ещё не запущенные repair-jobs.
+
+Для `output_mode: "json"` используется отдельный JSON Processor. Валидный JSON не создаёт job. Невалидный JSON (или несоответствие схеме при `repair_trigger: "invalid_json_or_schema"` и `on_json_error: "repair"`) создаёт запись `json_repair_jobs` с корреляцией `vflow_run_id`/`point_id`/`task_run_id`; точка переходит в `processing_output` и ждёт отдельный worker. LLM-вызов никогда не выполняется внутри транзакции VFlow. При успехе значение попадает в `output.json` и `task.output.json`; при ошибке Run падает `OUTPUT_INVALID`. Выключенный процессор даёт `JSON_PROCESSOR_NOT_CONFIGURED`. Legacy same-chat repair и новый processor path взаимоисключающие: компилятор отклоняет `max_json_repairs > 0` вместе с `on_json_error: "repair"` (`COMPILE_REPAIR_ENGINE_CONFLICT`).
 
 Подробности — в разделе 7.
 
@@ -474,10 +476,16 @@ workflow "name" {
 |---|---|---|
 | `task_id` | Да | ID существующей, не удалённой задачи VALERIA. |
 | `input` или `input_path` | Нет | JSONPath к фрагменту входного JSON. Default `$`. `input` — alias. |
-| `result_mode` | Нет | `auto` (default), `strict_json`, `none`. |
+| `result_mode` | Нет | **Legacy**: `auto` (default), `strict_json`, `none`. |
+| `output_mode` | Нет | `text` (default) или `json`; включает контракт `output.json`. |
+| `output_schema` | Нет | JSON Schema для `output_mode=json`; приоритетнее legacy `json_schema`. |
+| `on_json_error` | Нет | `fail` (default) или `repair`; `repair` требует `output_mode=json`. |
+| `repair_trigger` | Нет | `invalid_json` (default) или `invalid_json_or_schema`; только с `on_json_error=repair`. |
 | `queue_timeout_seconds` | Нет | Неотрицательное целое; время ожидания до старта задачи. |
 | `execution_timeout_seconds` | Нет | Неотрицательное целое; время выполнения после старта. |
 | `retries` | Нет | Неотрицательное целое; число дополнительных попыток. UI-схема рекомендует максимум 10. |
+
+`output_mode: "json"` включает JSON Repair Processor: процессор проверяет JSON/схему, при `on_json_error: "repair"` создаёт отдельный `json_repair_jobs` и возвращает `output.text`/`output.json`. Полный эксплуатационный контракт — в [VALERIA_JSON_Processor_Operations_RU.md](VALERIA_JSON_Processor_Operations_RU.md). Legacy `result_mode`/`json_schema`/`max_json_repairs` — отдельный same-chat путь; не смешивайте его с `on_json_error: "repair"`.
 
 Неизвестные аргументы отклоняются компилятором.
 
@@ -640,6 +648,25 @@ workflow "review_changes" {
 - `strict_json` требует валидный JSON; при заданной `json_schema` значение также проверяется по схеме. С учётом `max_json_repairs` runtime может сначала попросить исправление в том же чате; после исчерпания — `TASK_OUTPUT_NOT_JSON` или `TASK_SCHEMA_INVALID`.
 - `none` не требует JSON и не парсит его; текст всё равно остаётся в конверте.
 - Prompt-ы, reasoning и tool-сообщения в результат не входят.
+
+Успешный Task в режиме `output_mode: "json"` дополнительно содержит верхнеуровневый `output`:
+
+```json
+{
+  "input": {"repository": "example/repo", "pr": 24},
+  "output": {"text": "{\"ok\":true}", "json": {"ok": true}},
+  "task": {
+    "task_id": "code.review",
+    "run_id": "task-run-id",
+    "status": "completed",
+    "output": {"text": "{\"ok\":true}", "json": {"ok": true}}
+  }
+}
+```
+
+- `$.output.json...` — новый предпочтительный путь для If/Transform.
+- `$.task.output.json...` сохранён для старых пайплайнов.
+- `output.json` всегда валиден по JSON и схеме; ошибка repair не подменяет его `null`/`{}`.
 
 После Merge:
 
@@ -1108,7 +1135,8 @@ Gateway читает существующий `queue_jobs`:
 | `queue_timeout_seconds` | Job ещё `queued`, не начал выполняться | Отменяет job. Если `attempt <= retries` и это не repair-job, создаёт новую попытку; иначе Run падает `TASK_QUEUE_TIMEOUT`. |
 | `execution_timeout_seconds` | Job уже в `dispatching/running/waiting_permission/waiting_question` | Отменяет job, закрывает link, Run падает `TASK_EXECUTION_TIMEOUT`. Автоматического retry нет. |
 | `retries` при ошибке Task | Task завершился неуспешно, код не входит в non-retryable | Новая попытка, новый Task Run. Исчерпание → `TASK_FAILED`. |
-| `max_json_repairs` | Завершённый `strict_json` вернул невалидный JSON/схему | Follow-up в тот же чат, пока есть бюджет. Ошибки исполнения/таймауты/отмена не repair-ятся. Исчерпание → `TASK_OUTPUT_NOT_JSON`/`TASK_SCHEMA_INVALID`. |
+| `max_json_repairs` | Завершённый `strict_json` вернул невалидный JSON/схему | Legacy follow-up в тот же чат, пока есть бюджет. Ошибки исполнения/таймауты/отмена не repair-ятся. Исчерпание → `TASK_OUTPUT_NOT_JSON`/`TASK_SCHEMA_INVALID`. |
+| `on_json_error: "repair"` | Завершённый `output_mode=json` вернул невалидный JSON (или схему при `invalid_json_or_schema`) | Создаёт один `json_repair_jobs` job, точка `processing_output`; worker JSON Processor выполняет repair. Успех → `output.json`; ошибка → `OUTPUT_INVALID`. |
 | `TASK_CHANGED`, `TASK_UNAVAILABLE`, `TASK_CANCELLED` | Явные terminal-коды | Без retry. |
 
 Гонка queue timeout: если dispatcher успел забрать job между опросом и отменой, gateway возвращает `False`; runtime фиксирует `started_at` и не создаёт дубль, после чего действует execution deadline.
@@ -1118,7 +1146,7 @@ Gateway читает существующий `queue_jobs`:
 ### 7.6. Отмена
 
 - При queue/execution timeout runtime вызывает `gateway.cancel(task_run_id)`.
-- `POST /api/pipeline-runs/{id}/cancel` и админ-отмена переводят VFlow Run в `cancelled`, активные точки и открытые forks — в `cancelled`, закрывают незавершённые `vflow_task_links` как `cancelled`, отменяют ещё `queued` Task/repair-jobs этого Run и пишут `RUN_CANCELLED`. Уже выполняющаяся внешняя задача может продолжить side effects — для остановки агента используйте существующие средства очереди/админки VALERIA.
+- `POST /api/pipeline-runs/{id}/cancel` и админ-отмена переводят VFlow Run в `cancelled`, активные точки и открытые forks — в `cancelled`, закрывают незавершённые `vflow_task_links` как `cancelled`, отменяют ещё `queued` Task/repair-jobs этого Run, включая незавершённые `json_repair_jobs` (`status → cancelled`), и пишут `RUN_CANCELLED`. Уже выполняющаяся внешняя задача может продолжить side effects — для остановки агента используйте существующие средства очереди/админки VALERIA.
 - При fail-fast (`_fail`) runtime переводит активные точки/forks в `cancelled`, task links — в `failed`; уже выполняющаяся внешняя задача также может продолжить side effects.
 
 ### 7.7. Repair невалидного JSON
@@ -1134,6 +1162,24 @@ Gateway читает существующий `queue_jobs`:
 - сохраняются `vflow_run_id`, `vflow_point_id`, `origin_node_id`, agent/model/queue/workspace исходного job.
 
 Повторный вызов с теми же параметрами возвращает тот же job. Намерение постановки сначала пишется в `vflow_outbox` (`kind='task_json_repair'`); `VFlowRuntime.reconcile_repair_outbox()` завершает прерванную постановку идемпотентно. Ответ follow-up сохраняется в `task_run_results`, поэтому `gateway.status()` возвращает его как `text`, и runtime продолжает обычную проверку. История видна администратору в `point.json_repair_attempt`, `task_correlations`/`task_repairs` и событиях `TASK_JSON_REPAIR_REQUESTED`/`TASK_JSON_REPAIR_COMPLETED`.
+
+#### 7.7.1. JSON Processor (M8–M11)
+
+Полное руководство по настройке, provider-у, безопасности, метрикам, retention и rollout: [VALERIA_JSON_Processor_Operations_RU.md](VALERIA_JSON_Processor_Operations_RU.md). Ниже — только VFlow-часть контракта.
+
+Для `output_mode: "json"` действует отдельный контракт:
+
+- runtime сначала строго парсит весь финальный текст; валидный JSON сразу продвигает точку и job не создаётся;
+- при `on_json_error: "repair"` невалидный JSON — или несоответствие `output_schema` при `repair_trigger: "invalid_json_or_schema"` — создаёт `json_repair_jobs` (`source_type='vflow'`, `raw_output_ref = task_run_id`) через `JsonProcessorRepository`; канонический idempotency key включает run/point/task-run, raw hash, schema hash, версию настроек и `prompt_version`;
+- точка получает `status = processing_output`, `json_processor_job_id` и `next_check_at`; повторное событие завершения возвращает тот же job, дублей нет;
+- job выполняет отдельный `JsonRepairWorker` в lifespan приложения. Provider/LLM не вызывается в транзакции или потоке VFlow scheduler;
+- при успехе runtime читает `result_json`, повторно проверяет схему и продвигает точку по `out` с конвертом `input` + `output` + `task.output`;
+- при ошибке/отмене job Run падает с `OUTPUT_INVALID`, downstream-узлы не запускаются. Выключенный/ненастроенный процессор даёт `JSON_PROCESSOR_NOT_CONFIGURED`;
+- отмена Run отменяет незавершённые `json_repair_jobs` этого Run; worker при старте возвращает просроченные lease в очередь.
+
+`api_key_ref` — только имя переменной окружения (`NAME` или `env:NAME`), не секрет. Ключ читается в память на один provider-вызов и не попадает в ответы, события или логи. Worker запускается в lifespan только при `enabled=true`; после включения/изменения настроек процессора перезапустите приложение, чтобы применить worker.
+
+Task Run при этом остаётся `completed`: процессор не перезапускает задачу и не меняет `task_run_results.text`; VFlow-точка ждёт отдельный job в `processing_output`. Успешный конверт содержит верхнеуровневый `output` и совместимый `task.output` (`text` — исходный финальный текст, `json` — проверенное значение). При ошибке repair Run падает `OUTPUT_INVALID`; `output.json` не подменяется `null`/`{}`.
 
 ### 7.8. Legacy `task_successors` — предупреждение
 
@@ -1424,6 +1470,7 @@ node --check src/opencode_web/static/app.js
 
 ## 10. Связанные документы
 
+- [JSON Repair Processor — эксплуатация](VALERIA_JSON_Processor_Operations_RU.md) — настройки, provider, admin API/UI, Task/VFlow-контракт, безопасность, retention, rollout и troubleshooting.
 - [Техническая спецификация VFlow](VALERIA_VFlow_Technical_Specification_RU.md) — полная модель, сценарии, требования и архитектурные обоснования.
 - [ADR-001…004](VALERIA_VFlow_ADR_RU.md) — принятые решения по границам модуля, Task Gateway, ролям и версиям IR.
 - [Implementation Backlog](VALERIA_VFlow_Implementation_Backlog_RU.md) — задачи, приоритеты и критерии готовности.

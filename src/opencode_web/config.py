@@ -102,6 +102,7 @@ class Settings:
     consultation_upload_max_bytes: int = 20 * 1024 * 1024
     consultation_upload_max_files: int = 10
     consultation_upload_max_total_bytes: int = 50 * 1024 * 1024
+    json_processor_allow_private_networks: bool = False
 
     def __post_init__(self) -> None:
         if self.opencode_api_version not in {"v1", "v2"}:
@@ -259,6 +260,9 @@ class Settings:
             consultation_upload_max_files=_int("CONSULTATION_UPLOAD_MAX_FILES", 10),
             consultation_upload_max_total_bytes=_int(
                 "CONSULTATION_UPLOAD_MAX_TOTAL_BYTES", 50 * 1024 * 1024
+            ),
+            json_processor_allow_private_networks=_bool(
+                "JSON_PROCESSOR_ALLOW_PRIVATE_NETWORKS", False
             ),
         )
 

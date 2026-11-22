@@ -4,7 +4,13 @@ from typing import Any
 
 from ..database import Database, utcnow
 
-ACTIVE_POINT_STATUSES = ("ready", "claimed", "waiting_task", "waiting_merge")
+ACTIVE_POINT_STATUSES = (
+    "ready",
+    "claimed",
+    "waiting_task",
+    "processing_output",
+    "waiting_merge",
+)
 
 
 class VFlowMetrics:

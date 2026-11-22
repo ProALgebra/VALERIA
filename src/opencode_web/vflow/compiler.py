@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from ..json_processor.models import SchemaDefinitionError as ProcessorSchemaError
+from ..json_processor.schema import validate_schema as validate_processor_schema
 from .json_schema import SchemaDefinitionError, validate_schema
 from .models import (
     CompileError,
@@ -33,6 +35,9 @@ IF_OPERATORS = {
 }
 MISSING_MODES = {"error", "false", "true"}
 RESULT_MODES = {"auto", "strict_json", "none"}
+OUTPUT_MODES = {"text", "json"}
+ON_JSON_ERROR_MODES = {"fail", "repair"}
+REPAIR_TRIGGERS = {"invalid_json", "invalid_json_or_schema"}
 MAX_FORK_N = 32
 
 
@@ -173,6 +178,7 @@ def _compile_config(
             "task_id", "input", "input_path", "result_mode",
             "queue_timeout_seconds", "execution_timeout_seconds", "retries",
             "json_schema", "max_json_repairs",
+            "output_mode", "output_schema", "on_json_error", "repair_trigger",
         }
         if unknown:
             error("COMPILE_UNKNOWN_ARGUMENT", f"Unknown task argument(s): {sorted(unknown)}")
@@ -185,11 +191,48 @@ def _compile_config(
         if result_mode not in RESULT_MODES:
             error("COMPILE_INVALID_RESULT_MODE", f"Invalid result_mode: {result_mode!r}")
             return None
+        output_mode = args.get("output_mode", "text")
+        if output_mode not in OUTPUT_MODES:
+            error(
+                "COMPILE_INVALID_OUTPUT_MODE",
+                f"Invalid output_mode: {output_mode!r}",
+            )
+            return None
+        on_json_error = args.get("on_json_error", "fail")
+        if on_json_error not in ON_JSON_ERROR_MODES:
+            error(
+                "COMPILE_INVALID_ON_JSON_ERROR",
+                f"Invalid on_json_error: {on_json_error!r}",
+            )
+            return None
+        repair_trigger = args.get("repair_trigger", "invalid_json")
+        if repair_trigger not in REPAIR_TRIGGERS:
+            error(
+                "COMPILE_INVALID_REPAIR_TRIGGER",
+                f"Invalid repair_trigger: {repair_trigger!r}",
+            )
+            return None
+        if "repair_trigger" in args and on_json_error != "repair":
+            error(
+                "COMPILE_INVALID_REPAIR_TRIGGER",
+                "repair_trigger requires on_json_error: \"repair\"",
+            )
+            return None
+        if on_json_error == "repair" and output_mode != "json":
+            error(
+                "COMPILE_INVALID_OUTPUT_MODE",
+                "on_json_error: \"repair\" requires output_mode: \"json\"",
+            )
+            return None
         config: dict[str, Any] = {
             "task_id": task_id,
             "input_path": str(args.get("input_path", args.get("input", "$"))),
             "result_mode": result_mode,
+            "output_mode": output_mode,
+            "on_json_error": on_json_error,
         }
+        if on_json_error == "repair":
+            config["repair_trigger"] = repair_trigger
         for key in ("queue_timeout_seconds", "execution_timeout_seconds", "retries"):
             if key in args:
                 value = args[key]
@@ -212,6 +255,23 @@ def _compile_config(
                 return None
             if json_schema:
                 config["json_schema"] = json_schema
+        output_schema = args.get("output_schema")
+        if output_schema is not None:
+            if not isinstance(output_schema, dict):
+                error(
+                    "COMPILE_INVALID_JSON_SCHEMA",
+                    "output_schema must be a JSON object",
+                )
+                return None
+            try:
+                validate_processor_schema(output_schema)
+            except ProcessorSchemaError as exc:
+                error(
+                    "COMPILE_INVALID_JSON_SCHEMA",
+                    f"Invalid output_schema: {exc}",
+                )
+                return None
+            config["output_schema"] = output_schema
         max_json_repairs = args.get("max_json_repairs")
         if max_json_repairs is not None:
             if (
@@ -222,6 +282,13 @@ def _compile_config(
                 error(
                     "COMPILE_INVALID_MAX_JSON_REPAIRS",
                     "max_json_repairs must be an integer between 0 and 3",
+                )
+                return None
+            if on_json_error == "repair" and max_json_repairs > 0:
+                error(
+                    "COMPILE_REPAIR_ENGINE_CONFLICT",
+                    "max_json_repairs and on_json_error: \"repair\" cannot be used "
+                    "together",
                 )
                 return None
             config["max_json_repairs"] = max_json_repairs

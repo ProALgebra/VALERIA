@@ -11,6 +11,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .json_processor.models import SchemaDefinitionError
+from .json_processor.schema import validate_schema as validate_output_schema
+from .json_processor.settings import default_settings_json
 from .security import hash_password, normalize_login, token_digest
 
 
@@ -20,6 +23,52 @@ def utcnow() -> str:
 
 UNSET = object()
 DEFAULT_QUEUE_ID = "default"
+TASK_OUTPUT_MODES = {"text", "json"}
+TASK_ON_JSON_ERROR_MODES = {"fail", "repair"}
+TASK_REPAIR_TRIGGERS = {"invalid_json", "invalid_json_or_schema"}
+
+
+def validate_task_output_fields(
+    *,
+    output_mode: str,
+    output_schema: Any,
+    on_json_error: str,
+    repair_trigger: str,
+) -> tuple[str, str | None, str, str]:
+    """Validate Task JSON-output configuration and canonicalize the schema."""
+
+    if output_mode not in TASK_OUTPUT_MODES:
+        raise ValueError("output_mode must be 'text' or 'json'")
+    if on_json_error not in TASK_ON_JSON_ERROR_MODES:
+        raise ValueError("on_json_error must be 'fail' or 'repair'")
+    if repair_trigger not in TASK_REPAIR_TRIGGERS:
+        raise ValueError(
+            "repair_trigger must be 'invalid_json' or 'invalid_json_or_schema'"
+        )
+    if on_json_error != "repair" and repair_trigger != "invalid_json":
+        raise ValueError("repair_trigger requires on_json_error='repair'")
+    if on_json_error == "repair" and output_mode != "json":
+        raise ValueError("on_json_error='repair' requires output_mode='json'")
+    if output_schema is not None:
+        if not isinstance(output_schema, dict):
+            raise ValueError("output_schema must be a JSON object")
+        try:
+            validate_output_schema(output_schema)
+        except SchemaDefinitionError as exc:
+            raise ValueError(f"output_schema is invalid: {exc}") from exc
+    schema_json = (
+        None
+        if output_schema is None
+        else json.dumps(
+            output_schema,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+    return output_mode, schema_json, on_json_error, repair_trigger
+
 
 
 class BackendVersionChangedError(RuntimeError):
@@ -115,6 +164,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     queue_id TEXT NOT NULL DEFAULT 'default' REFERENCES work_queues(id),
     is_published INTEGER NOT NULL DEFAULT 0,
     visibility TEXT NOT NULL DEFAULT 'all',
+    output_mode TEXT NOT NULL DEFAULT 'text'
+        CHECK (output_mode IN ('text', 'json')),
+    output_schema_json TEXT,
+    on_json_error TEXT NOT NULL DEFAULT 'fail'
+        CHECK (on_json_error IN ('fail', 'repair')),
+    repair_trigger TEXT NOT NULL DEFAULT 'invalid_json'
+        CHECK (repair_trigger IN ('invalid_json', 'invalid_json_or_schema')),
     created_by_admin_id TEXT NOT NULL REFERENCES users(id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -329,8 +385,8 @@ CREATE TABLE IF NOT EXISTS vflow_points (
     node_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'ready'
         CHECK (status IN (
-            'ready', 'claimed', 'waiting_task', 'waiting_merge', 'forked',
-            'consumed', 'failed', 'cancelled'
+            'ready', 'claimed', 'waiting_task', 'processing_output', 'waiting_merge',
+            'forked', 'consumed', 'failed', 'cancelled'
         )),
     data_json TEXT NOT NULL,
     fork_stack_json TEXT NOT NULL DEFAULT '[]',
@@ -339,6 +395,7 @@ CREATE TABLE IF NOT EXISTS vflow_points (
     task_run_id TEXT,
     attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
     json_repair_attempt INTEGER NOT NULL DEFAULT 0,
+    json_processor_job_id TEXT,
     next_check_at TEXT,
     lease_owner TEXT,
     lease_token TEXT,
@@ -464,6 +521,99 @@ CREATE TABLE IF NOT EXISTS vflow_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_vflow_outbox_due
 ON vflow_outbox(status, next_attempt_at, created_at);
+
+-- VALERIA JSON Repair Processor: singleton settings, jobs, and attempts.
+-- Source run identifiers are correlation columns, not foreign keys, so the
+-- processor remains usable independently of Task/VFlow retention.
+CREATE TABLE IF NOT EXISTS json_processor_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    settings_json TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    updated_by TEXT REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS json_repair_jobs (
+    id TEXT PRIMARY KEY,
+    source_type TEXT NOT NULL
+        CHECK (source_type IN ('task', 'vflow', 'standalone')),
+    task_run_id TEXT,
+    vflow_run_id TEXT,
+    point_id TEXT,
+    raw_output_ref TEXT NOT NULL,
+    raw_hash TEXT NOT NULL,
+    schema_json TEXT NOT NULL,
+    schema_hash TEXT NOT NULL,
+    settings_version INTEGER NOT NULL CHECK (settings_version >= 1),
+    prompt_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'processing', 'succeeded', 'failed', 'cancelled')),
+    method TEXT NOT NULL DEFAULT 'none'
+        CHECK (method IN ('none', 'local', 'llm')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    result_json TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    lease_owner TEXT,
+    lease_until TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_json_repair_jobs_queue
+ON json_repair_jobs(status, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_json_repair_jobs_lease
+ON json_repair_jobs(status, lease_until);
+
+CREATE INDEX IF NOT EXISTS idx_json_repair_jobs_status
+ON json_repair_jobs(status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_json_repair_jobs_task
+ON json_repair_jobs(task_run_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_json_repair_jobs_vflow
+ON json_repair_jobs(vflow_run_id, point_id, status);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_json_repair_jobs_canonical
+ON json_repair_jobs(
+    source_type,
+    COALESCE(task_run_id, ''),
+    COALESCE(vflow_run_id, ''),
+    COALESCE(point_id, ''),
+    raw_hash,
+    schema_hash,
+    settings_version,
+    prompt_version
+);
+
+CREATE TABLE IF NOT EXISTS json_repair_attempts (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES json_repair_jobs(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+    method TEXT NOT NULL CHECK (method IN ('none', 'local', 'llm')),
+    provider TEXT,
+    model TEXT,
+    request_meta_json TEXT NOT NULL DEFAULT '{}',
+    validation_error TEXT,
+    status TEXT NOT NULL
+        CHECK (status IN ('succeeded', 'failed', 'cancelled')),
+    latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+    token_usage_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, attempt_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_json_repair_attempts_job
+ON json_repair_attempts(job_id, attempt_no);
+
+CREATE INDEX IF NOT EXISTS idx_json_repair_attempts_created
+ON json_repair_attempts(created_at);
 """
 
 
@@ -485,6 +635,12 @@ class Database:
                    (id, name, priority, max_workers, status, is_system, created_at, updated_at)
                    VALUES (?, 'Основная', 0, NULL, 'active', 1, ?, ?)""",
                 (DEFAULT_QUEUE_ID, now, now),
+            )
+            self._connection.execute(
+                """INSERT OR IGNORE INTO json_processor_settings
+                   (id, settings_json, version, updated_by, created_at, updated_at)
+                   VALUES (1, ?, 1, NULL, ?, ?)""",
+                (default_settings_json(), now, now),
             )
             user_columns = {
                 row[1] for row in self._connection.execute("PRAGMA table_info(users)").fetchall()
@@ -530,6 +686,16 @@ class Database:
                 self._connection.execute(
                     "UPDATE tasks SET queue_id = ? WHERE queue_id IS NULL", (DEFAULT_QUEUE_ID,)
                 )
+            for column, definition in (
+                ("output_mode", "TEXT NOT NULL DEFAULT 'text'"),
+                ("output_schema_json", "TEXT"),
+                ("on_json_error", "TEXT NOT NULL DEFAULT 'fail'"),
+                ("repair_trigger", "TEXT NOT NULL DEFAULT 'invalid_json'"),
+            ):
+                if column not in task_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE tasks ADD COLUMN {column} {definition}"
+                    )
             chat_columns = {
                 row[1] for row in self._connection.execute("PRAGMA table_info(chats)").fetchall()
             }
@@ -686,6 +852,11 @@ class Database:
                     "ALTER TABLE vflow_points ADD COLUMN "
                     "json_repair_attempt INTEGER NOT NULL DEFAULT 0"
                 )
+            if "json_processor_job_id" not in vflow_point_columns:
+                self._connection.execute(
+                    "ALTER TABLE vflow_points ADD COLUMN json_processor_job_id TEXT"
+                )
+            self._migrate_vflow_point_status_constraint()
             vflow_run_columns = {
                 row[1]
                 for row in self._connection.execute(
@@ -829,6 +1000,75 @@ class Database:
         violations = self._connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
             raise RuntimeError("queue_jobs status migration broke foreign keys")
+
+    def _migrate_vflow_point_status_constraint(self) -> None:
+        """Add processing_output to SQLite's immutable vflow_points status CHECK."""
+        schema = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vflow_points'"
+        ).fetchone()[0]
+        if "processing_output" in schema:
+            return
+        columns = (
+            "id", "run_id", "node_id", "status", "data_json", "fork_stack_json",
+            "parent_point_id", "visit_seq", "task_run_id", "attempt",
+            "json_repair_attempt", "json_processor_job_id", "next_check_at",
+            "lease_owner", "lease_token", "lease_until", "created_at", "updated_at",
+        )
+        names = ", ".join(columns)
+        self._connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.transaction() as connection:
+                connection.execute("DROP TABLE IF EXISTS vflow_points_new")
+                connection.execute(
+                    """CREATE TABLE vflow_points_new (
+                        id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL REFERENCES vflow_runs(id) ON DELETE CASCADE,
+                        node_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'ready'
+                            CHECK (status IN (
+                                'ready', 'claimed', 'waiting_task', 'processing_output',
+                                'waiting_merge', 'forked', 'consumed', 'failed', 'cancelled'
+                            )),
+                        data_json TEXT NOT NULL,
+                        fork_stack_json TEXT NOT NULL DEFAULT '[]',
+                        parent_point_id TEXT REFERENCES vflow_points(id),
+                        visit_seq INTEGER NOT NULL CHECK (visit_seq >= 1),
+                        task_run_id TEXT,
+                        attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+                        json_repair_attempt INTEGER NOT NULL DEFAULT 0,
+                        json_processor_job_id TEXT,
+                        next_check_at TEXT,
+                        lease_owner TEXT,
+                        lease_token TEXT,
+                        lease_until TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE (run_id, node_id, visit_seq)
+                    )"""
+                )
+                connection.execute(
+                    f"INSERT INTO vflow_points_new ({names}) "
+                    f"SELECT {names} FROM vflow_points"
+                )
+                connection.execute("DROP TABLE vflow_points")
+                connection.execute("ALTER TABLE vflow_points_new RENAME TO vflow_points")
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_vflow_points_due "
+                    "ON vflow_points(status, next_check_at)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_vflow_points_run "
+                    "ON vflow_points(run_id, status)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_vflow_points_lease "
+                    "ON vflow_points(status, lease_until)"
+                )
+        finally:
+            self._connection.execute("PRAGMA foreign_keys=ON")
+        violations = self._connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("vflow_points status migration broke foreign keys")
 
     def close(self) -> None:
         with self._lock:
@@ -1235,6 +1475,11 @@ class Database:
         next_task_ids: list[str] | None = None,
         plan_first: bool = False,
         queue_id: str = DEFAULT_QUEUE_ID,
+        *,
+        output_mode: str = "text",
+        output_schema: dict[str, Any] | None = None,
+        on_json_error: str = "fail",
+        repair_trigger: str = "invalid_json",
     ) -> dict[str, Any]:
         if not title.strip() or not content.strip() or not agent.strip():
             raise ValueError("Title, content and agent are required")
@@ -1242,6 +1487,17 @@ class Database:
             raise ValueError("Provider and model must be specified together")
         if plan_first and agent.strip() != "build":
             raise ValueError("Plan-first tasks require the build agent")
+        (
+            output_mode,
+            output_schema_json,
+            on_json_error,
+            repair_trigger,
+        ) = validate_task_output_fields(
+            output_mode=output_mode,
+            output_schema=output_schema,
+            on_json_error=on_json_error,
+            repair_trigger=repair_trigger,
+        )
         self._active_queue(queue_id)
         task_id = str(uuid.uuid4())
         now = utcnow()
@@ -1249,9 +1505,10 @@ class Database:
             connection.execute(
                 """INSERT INTO tasks
                    (id, title, description, content, agent, provider_id, model_id,
-                    model_variant, queue_id, is_published, created_by_admin_id,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    model_variant, queue_id, is_published, output_mode,
+                    output_schema_json, on_json_error, repair_trigger,
+                    created_by_admin_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_id,
                     title.strip(),
@@ -1263,6 +1520,10 @@ class Database:
                     model_variant,
                     queue_id,
                     int(published),
+                    output_mode,
+                    output_schema_json,
+                    on_json_error,
+                    repair_trigger,
                     admin_id,
                     now,
                     now,
@@ -1439,6 +1700,41 @@ class Database:
                 raise ValueError("Title, content and agent are required")
         if bool(updated["provider_id"]) != bool(updated["model_id"]):
             raise ValueError("Provider and model must be specified together")
+        if "output_schema" in fields:
+            existing_schema = fields["output_schema"]
+        else:
+            existing_schema = None
+            if current.get("output_schema_json"):
+                try:
+                    existing_schema = json.loads(current["output_schema_json"])
+                except (TypeError, ValueError):
+                    existing_schema = None
+        target_output_mode = fields.get(
+            "output_mode", current.get("output_mode") or "text"
+        )
+        target_on_json_error = fields.get(
+            "on_json_error", current.get("on_json_error") or "fail"
+        )
+        target_repair_trigger = fields.get(
+            "repair_trigger", current.get("repair_trigger") or "invalid_json"
+        )
+        if target_output_mode != "json":
+            if "on_json_error" not in fields:
+                target_on_json_error = "fail"
+            target_repair_trigger = "invalid_json"
+        elif target_on_json_error != "repair" and "repair_trigger" not in fields:
+            target_repair_trigger = "invalid_json"
+        (
+            output_mode,
+            output_schema_json,
+            on_json_error,
+            repair_trigger,
+        ) = validate_task_output_fields(
+            output_mode=target_output_mode,
+            output_schema=existing_schema,
+            on_json_error=target_on_json_error,
+            repair_trigger=target_repair_trigger,
+        )
         self._active_queue(updated.get("queue_id") or DEFAULT_QUEUE_ID)
         with self.transaction() as connection:
             if "next_task_ids" in fields:
@@ -1446,7 +1742,9 @@ class Database:
             connection.execute(
                 """UPDATE tasks SET title = ?, description = ?, content = ?, agent = ?,
                    provider_id = ?, model_id = ?, model_variant = ?, queue_id = ?,
-                   is_published = ?, plan_first = ?, updated_at = ?
+                   is_published = ?, plan_first = ?, output_mode = ?,
+                   output_schema_json = ?, on_json_error = ?, repair_trigger = ?,
+                   updated_at = ?
                    WHERE id = ? AND deleted_at IS NULL""",
                 (
                     updated["title"].strip(),
@@ -1459,6 +1757,10 @@ class Database:
                     updated.get("queue_id") or DEFAULT_QUEUE_ID,
                     int(updated["is_published"]),
                     int(updated["plan_first"]),
+                    output_mode,
+                    output_schema_json,
+                    on_json_error,
+                    repair_trigger,
                     utcnow(),
                     task_id,
                 ),

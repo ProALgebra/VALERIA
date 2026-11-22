@@ -202,8 +202,8 @@ def _run_view(db: Database, run: dict[str, Any]) -> dict[str, Any]:
         """SELECT COUNT(*) AS total,
                   SUM(CASE WHEN status IN ('consumed', 'failed', 'cancelled')
                            THEN 1 ELSE 0 END) AS done,
-                  SUM(CASE WHEN status = 'waiting_task' THEN 1 ELSE 0 END)
-                      AS waiting_tasks,
+                  SUM(CASE WHEN status IN ('waiting_task', 'processing_output')
+                           THEN 1 ELSE 0 END) AS waiting_tasks,
                   SUM(CASE WHEN status = 'waiting_merge' THEN 1 ELSE 0 END)
                       AS waiting_merges
            FROM vflow_points WHERE run_id = ?""",

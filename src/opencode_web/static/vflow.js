@@ -1515,7 +1515,7 @@ export function vflowUI({api, shell, bindShell, state, app, esc, notify, navigat
                 field.setAttribute("aria-invalid", "true");
                 throw {field, cause: error};
               }
-              if (key === "json_schema" && (
+              if (["json_schema", "output_schema"].includes(key) && (
                 !config[key] || typeof config[key] !== "object" || Array.isArray(config[key])
               )) {
                 field.setAttribute("aria-invalid", "true");

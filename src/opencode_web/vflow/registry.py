@@ -77,6 +77,49 @@ BUILTIN_SPECS = (
                     "type": "string",
                     "enum": ["auto", "strict_json", "none"],
                     "default": "auto",
+                    "title": "Режим результата (legacy)",
+                    "description": (
+                        "Legacy-контракт task.output.json: auto, strict_json или none. "
+                        "Не смешивается с output_mode=json."
+                    ),
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["text", "json"],
+                    "default": "text",
+                    "title": "Формат вывода",
+                    "description": (
+                        "text — прежний конверт Task; json — контракт output.json с "
+                        "проверкой и исправлением JSON."
+                    ),
+                },
+                "output_schema": {
+                    "type": "object",
+                    "title": "JSON Schema вывода",
+                    "description": (
+                        "Схема для output_mode=json. Имеет приоритет над legacy "
+                        "json_schema. Поддерживается безопасное подмножество JSON Schema."
+                    ),
+                },
+                "on_json_error": {
+                    "type": "string",
+                    "enum": ["fail", "repair"],
+                    "default": "fail",
+                    "title": "При ошибке JSON",
+                    "description": (
+                        "fail — завершить Run безопасной ошибкой OUTPUT_INVALID; "
+                        "repair — отправить raw-текст в JSON Processor."
+                    ),
+                },
+                "repair_trigger": {
+                    "type": "string",
+                    "enum": ["invalid_json", "invalid_json_or_schema"],
+                    "default": "invalid_json",
+                    "title": "Когда запускать исправление",
+                    "description": (
+                        "Допустимо только с on_json_error=repair. invalid_json — "
+                        "только синтаксис; invalid_json_or_schema — также несоответствие схеме."
+                    ),
                 },
                 "queue_timeout_seconds": {"type": "integer", "minimum": 1},
                 "execution_timeout_seconds": {"type": "integer", "minimum": 1},
@@ -85,7 +128,7 @@ BUILTIN_SPECS = (
                     "type": "object",
                     "title": "Требуемый JSON",
                     "description": (
-                        "JSON Schema для ответа при result_mode=strict_json. "
+                        "Legacy JSON Schema для ответа при result_mode=strict_json. "
                         "Поддерживаются type, required, properties, items, enum, "
                         "minimum, maximum, minLength, maxLength, pattern и "
                         "additionalProperties: false."
@@ -98,8 +141,9 @@ BUILTIN_SPECS = (
                     "default": 1,
                     "title": "Попыток исправления",
                     "description": (
-                        "Сколько раз попросить задачу исправить невалидный JSON "
-                        "в том же чате (0–3)."
+                        "Legacy: сколько раз попросить задачу исправить невалидный "
+                        "JSON в том же чате (0–3). Нельзя сочетать с "
+                        "on_json_error=repair."
                     ),
                 },
             },

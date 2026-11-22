@@ -322,14 +322,18 @@ step review = task.run(
 | `task_id` | Да | ID существующей задачи VALERIA. Проверяется при validate/publish и при создании Run. |
 | `input_path` | Нет | Ограниченный JSONPath к фрагменту входного JSON. По умолчанию `$`. |
 | `input` | Нет | Исторический alias для `input_path`. Предпочитайте `input_path`; если заданы оба, побеждает `input_path`. |
-| `result_mode` | Нет | `auto` (по умолчанию), `strict_json`, `none`. |
-| `json_schema` | Нет | Необязательная JSON-схема для `strict_json`. Поддерживаются `type`, `required`, `properties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `minItems`, `maxItems`, `additionalProperties: false`. |
-| `max_json_repairs` | Нет | Целое `0..3`, по умолчанию `1`: сколько исправлений можно попросить в том же чате Task при невалидном `strict_json`. |
+| `result_mode` | Нет | **Legacy**-режим: `auto` (по умолчанию), `strict_json`, `none`. Игнорируется при `output_mode=json`. |
+| `json_schema` | Нет | **Legacy** JSON-схема для `strict_json`. Поддерживаются `type`, `required`, `properties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `minItems`, `maxItems`, `additionalProperties: false`. |
+| `max_json_repairs` | Нет | **Legacy** целое `0..3`, по умолчанию `1`: сколько исправлений можно попросить в том же чате Task при невалидном `strict_json`. Нельзя сочетать с `on_json_error: "repair"`. |
+| `output_mode` | Нет | `text` (по умолчанию) или `json`. `json` включает контракт и проверку JSON Processor. |
+| `output_schema` | Нет | Необязательная JSON Schema для `output_mode=json`. Приоритетнее legacy `json_schema`; принимается только безопасное подмножество процессора. |
+| `on_json_error` | Нет | `fail` (по умолчанию) или `repair`. `repair` отправляет raw-текст завершённой задачи в JSON Processor вместо немедленной ошибки. Требует `output_mode: "json"`. |
+| `repair_trigger` | Нет | `invalid_json` (по умолчанию) или `invalid_json_or_schema`. Допустим только с `on_json_error: "repair"`. |
 | `queue_timeout_seconds` | Нет | Неотрицательное целое: сколько ждать старта задачи. Отсутствие — без отдельного лимита. |
 | `execution_timeout_seconds` | Нет | Неотрицательное целое: сколько задача может выполняться после старта. |
 | `retries` | Нет | Неотрицательное целое: число **дополнительных** попыток. По умолчанию `0`. UI-схема рекомендует не более 10. |
 
-Неизвестные аргументы отклоняются компилятором. `task_id` должен быть непустой строкой. Некорректная `json_schema` и `max_json_repairs` вне `0..3` отклоняются с `COMPILE_INVALID_JSON_SCHEMA` / `COMPILE_INVALID_MAX_JSON_REPAIRS`.
+Неизвестные аргументы отклоняются компилятором. `task_id` должен быть непустой строкой. Некорректная `json_schema`/`output_schema` и `max_json_repairs` вне `0..3` отклоняются с `COMPILE_INVALID_JSON_SCHEMA` / `COMPILE_INVALID_MAX_JSON_REPAIRS`. `repair_trigger` без `on_json_error: "repair"` отклоняется, а `max_json_repairs > 0` вместе с `on_json_error: "repair"` — с `COMPILE_REPAIR_ENGINE_CONFLICT`, чтобы для одного ответа никогда не запускались два repair-движка.
 
 **Что происходит:**
 
@@ -342,6 +346,15 @@ step review = task.run(
 7. Если ответ невалиден и `max_json_repairs` разрешает ещё попытку, VFlow отправляет ограниченное исправление в **тот же чат/сессию Task**. Сообщение содержит безопасную ошибку, схему/пример и требование вернуть только валидный JSON. Точка ждёт новый финальный ответ; счётчик `repair_attempt` не смешивается с `attempt`/`retries` задачи.
 8. Исправление применяется только к ошибкам синтаксиса/схемы JSON у завершённой задачи. Таймауты, отмена, `TASK_CHANGED`, `TASK_UNAVAILABLE` и ошибки исполнения не исправляются. После исчерпания бюджета Run падает с `TASK_OUTPUT_NOT_JSON` или `TASK_SCHEMA_INVALID`.
 9. Follow-up исправления — обычное продолжение чата (`task_id = NULL`) в том же чате, а не новая задача и не legacy-потомок pipeline. Оно идемпотентно по детерминированному message id и сохраняет корреляцию VFlow Run/точки.
+
+**Режим JSON Processor (`output_mode: "json"`):**
+
+1. Строго валидный JSON, удовлетворяющий `output_schema` (если задана), сразу продвигает точку; job процессора не создаётся.
+2. Невалидный синтаксис — или несоответствие схеме при `repair_trigger: "invalid_json_or_schema"` — создаёт один repair-job JSON Processor с корреляцией `vflow_run_id`/`point_id`/`task_run_id`.
+3. Точка ждёт в `status = "processing_output"`; `next_check_at` и id job сохраняются. VFlow scheduler не вызывает LLM внутри своей транзакции — repair выполняет отдельный worker JSON Processor.
+4. При успехе процессора исправленное значение становится `output.json`. При ошибке Run падает с безопасным кодом `OUTPUT_INVALID`, downstream-узлы не запускаются.
+5. Выключенный или ненастроенный процессор даёт явную ошибку `JSON_PROCESSOR_NOT_CONFIGURED`, а не тихий обход проверки.
+6. `on_json_error: "fail"` и legacy-поведение `result_mode` сохраняются для существующих пайплайнов. Legacy same-chat repair (`strict_json` + `max_json_repairs`) никогда не смешивается с процессором.
 
 **Конверт успешного Task (`result_mode=auto` или `strict_json`):**
 
@@ -365,6 +378,31 @@ step review = task.run(
 - `task.output.json` — JSON, если весь текст разобрался; при `auto` и ошибке разбора — `null`; при `none` — `null`.
 - `task.run_id` — ID существующего Task Run в очереди VALERIA.
 - Prompt-ы, reasoning и tool-сообщения в конверт не входят.
+
+**Конверт успешного JSON Processor Task (`output_mode: "json"`):**
+
+```json
+{
+  "input": {"repository": "example/repo", "pr": 24},
+  "output": {
+    "text": "{\"ok\":true,\"issues\":[]}",
+    "json": {"ok": true, "issues": []}
+  },
+  "task": {
+    "task_id": "code.review",
+    "run_id": "task-run-701",
+    "status": "completed",
+    "output": {
+      "text": "{\"ok\":true,\"issues\":[]}",
+      "json": {"ok": true, "issues": []}
+    }
+  }
+}
+```
+
+- `output` — новый предпочтительный путь (`$.output.json...`); `task.output` сохранён для обратной совместимости (`$.task.output.json...`).
+- `output.json` всегда содержит декодированное JSON-значение, прошедшее схему. Неуспешный repair никогда не записывает туда `null`, `{}` или error envelope.
+- `input` — полный JSON точки до Task.
 
 Снимок Task фиксируется при создании Run. Если задача изменилась после старта, enqueue завершается `TASK_CHANGED`; VFlow не подставляет новую версию молча. Новый Run увидит новую версию задачи.
 
@@ -990,6 +1028,8 @@ x-csrf-token: <csrf-token>
 
 `strict_json` не извлекает JSON из markdown-блока или произвольного текста: разбирается весь финальный ответ. `none` полезен, когда downstream-узлу нужен только текст.
 
+`output_mode: "json"` имеет приоритет над этими legacy-режимами и создаёт одновременно `$.output.json` и обратно совместимый `$.task.output.json`. При `on_json_error: "repair"` невалидный JSON (или несоответствие схеме для `invalid_json_or_schema`) уходит в worker JSON Processor; при его ошибке Run падает с `OUTPUT_INVALID`. Для новых пайплайнов используйте `output_mode: "json"` + `output_schema`, legacy `result_mode`/`max_json_repairs` оставляйте существующим.
+
 ### 11.4. Повторы и таймауты Task
 
 - `retries` — число **дополнительных** попыток. Каждая попытка — новый Task Run, новый `attempt`, новый `vflow_task_links`.
@@ -1161,7 +1201,7 @@ Idempotency-Key: <uuid>
 
 | DSL-вызов | IR type | Вход | Выходы | Обязательные аргументы | Основные необязательные |
 |---|---|---|---|---|---|
-| `task.run(...)` | `valeria.task@1.0` | `in` | `out` | `task_id` | `input_path`, `input`, `result_mode`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
+| `task.run(...)` | `valeria.task@1.0` | `in` | `out` | `task_id` | `input_path`, `input`, `result_mode`, `output_mode`, `output_schema`, `on_json_error`, `repair_trigger`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
 | `transform(...)` | `core.transform@1.0` | `in` | `out` | `operations` | `create_missing` |
 | `if(...)` | `core.if@1.0` | `in` | `true`, `false` | `path`, `operator` | `value`, `missing` |
 | `fork(...)` | `core.fork@1.0` | `in` | `branch[0..N-1]` или `all` | `count`, `join` | — |
@@ -1185,7 +1225,7 @@ Idempotency-Key: <uuid>
 
 | После узла | Форма данных |
 |---|---|
-| `Task` | `{"input": <полный вход>, "task": {"task_id", "run_id", "status", "output": {"text", "json"}}}` |
+| `Task` | `{"input": <полный вход>, "output": {"text", "json"}, "task": {"task_id", "run_id", "status", "output": {"text", "json"}}}` (`output` есть при `output_mode=json`; `task.output` сохраняется во всех режимах) |
 | `Transform` | Результат последней операции (новая копия). |
 | `If` | Тот же JSON без изменений. |
 | `Fork` | N независимых копий входного JSON. |

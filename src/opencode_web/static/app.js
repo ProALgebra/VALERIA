@@ -1,6 +1,7 @@
 import {consultationUI} from "./consultations.js?v=10";
 import {questionPanel} from "./questions.js?v=1";
 import {renderMarkdown} from "./markdown.js?v=1";
+import {jsonProcessorUI} from "./json_processor.js?v=1";
 import {vflowUI} from "./vflow.js?v=7";
 
 const app = document.querySelector("#app");
@@ -77,6 +78,7 @@ const esc = (value = "") => String(value).replace(/[&<>'"]/g, char => ({
 
 const consultations = consultationUI({api, shell, bindShell, state, app, esc, notify, navigate});
 const vflow = vflowUI({api, shell, bindShell, state, app, esc, notify, navigate});
+const jsonProcessor = jsonProcessorUI({api, shell, bindShell, state, app, esc, notify});
 
 function notify(message, kind = "status") {
   const text = String(message ?? "");
@@ -205,7 +207,7 @@ function defaultRoute() {
   return state.me?.tasks_only ? "tasks" : "dialogs";
 }
 
-const routeNames = new Set(["dialogs", "consultations", "templates", "tasks", "pipelines", "profile", "statistics", "admin-consultations", "admin-tasks", "admin-pipelines", "admin-pipeline-editor", "task-access", "users", "queue", "audit"]);
+const routeNames = new Set(["dialogs", "consultations", "templates", "tasks", "pipelines", "profile", "statistics", "admin-consultations", "admin-tasks", "admin-pipelines", "admin-pipeline-editor", "admin-json-processor", "task-access", "users", "queue", "audit"]);
 
 function locationTarget() {
   const raw = location.hash.replace(/^#\/?/, "");
@@ -249,7 +251,7 @@ function shell(content, title = "V.A.L.E.R.I.A.") {
         ${navButton("tasks", "✓ Таски")}
         ${state.vflowEnabled ? navButton("pipelines", "▤ Пайплайны") : ""}
         ${admin ? navButton("statistics", "▥ Статистика") : ""}
-        ${admin ? `<div class="hint" style="padding:12px 12px 3px">АДМИНИСТРИРОВАНИЕ</div>${navButton("admin-consultations", "◌ Консультации")}${navButton("admin-tasks", "⚙ Настройка тасок")}${state.vflowEnabled ? navButton("admin-pipelines", "⚙ Пайплайны") : ""}${navButton("task-access", "⊞ Доступ к таскам")}${navButton("users", "♙ Пользователи")}${navButton("queue", "≡ Очередь")}${navButton("audit", "⌁ Аудит")}` : ""}
+        ${admin ? `<div class="hint" style="padding:12px 12px 3px">АДМИНИСТРИРОВАНИЕ</div>${navButton("admin-consultations", "◌ Консультации")}${navButton("admin-tasks", "⚙ Настройка тасок")}${state.vflowEnabled ? navButton("admin-pipelines", "⚙ Пайплайны") : ""}${navButton("task-access", "⊞ Доступ к таскам")}${navButton("admin-json-processor", "⌘ JSON-процессор")}${navButton("users", "♙ Пользователи")}${navButton("queue", "≡ Очередь")}${navButton("audit", "⌁ Аудит")}` : ""}
       </nav>
       <div class="sidebar-user">
         <div class="user-row"><span class="avatar">${esc(state.me.login[0]?.toUpperCase())}</span><div><strong>${esc(state.me.login)}</strong><div class="meta">${esc(state.me.role)}</div></div></div>
@@ -299,6 +301,7 @@ async function renderShell(route) {
     history.replaceState(null, "", `#/${route}`);
   }
   if (state.me.tasks_only && !["tasks", "pipelines", "consultations", "profile"].includes(route)) route = "tasks";
+  if (route === "admin-json-processor" && state.me.role !== "admin") route = defaultRoute();
   state.route = route;
   try {
     if (route === "dialogs") {
@@ -313,6 +316,7 @@ async function renderShell(route) {
     if (route === "pipelines") return await vflow.renderPipelines();
     if (route === "admin-pipelines" && state.me.role === "admin") return await vflow.renderAdminPipelines();
     if (route === "admin-pipeline-editor" && state.me.role === "admin") return await vflow.renderAdminPipelineEditor();
+    if (route === "admin-json-processor" && state.me.role === "admin") return await jsonProcessor.render();
     if (route === "profile") return await renderProfile();
     if (route === "statistics" && state.me.role === "admin") return await renderStatistics();
     if (route === "admin-tasks" && state.me.role === "admin") return await renderAdminTasks();
@@ -976,9 +980,15 @@ async function renderAdminTasks(selectedId = state.selectedAdminTask) {
   const queues = (queueItems || []).filter(queue => queue.status !== "archived");
   if (!queues.length) queues.push({id: "default", name: "Основная"});
   const selectedQueue = selected?.queue_id || "default";
+  const outputMode = selected?.output_mode === "json" ? "json" : "text";
+  const onJsonError = selected?.on_json_error === "repair" ? "repair" : "fail";
+  const repairTrigger = selected?.repair_trigger === "invalid_json_or_schema"
+    ? "invalid_json_or_schema" : "invalid_json";
+  const outputSchema = selected?.output_schema
+    ? JSON.stringify(selected.output_schema, null, 2) : "";
   const pipelineField = `<div class="field"><label>Запустить после успешного завершения</label><div id="task-successors">${tasks.filter(task => task.id !== selected?.id).map(task => `<label class="toolbar"><input type="checkbox" value="${esc(task.id)}" ${successors.has(task.id) ? "checked" : ""}> ${esc(task.title)}${task.is_published ? "" : " (черновик)"}</label>`).join("") || `<span class="hint">Нет других тасок</span>`}</div><span class="hint">Можно выбрать несколько. Все выбранные таски запускаются от лица исходного пользователя с копией его ввода, независимо от их доступности пользователю. При ошибке или отмене продолжение этой ветки не запускается. Изменения пайплайна действуют для новых запусков.</span></div>`;
   const list = tasks.map(task => `<button class="list-item ${selected?.id === task.id ? "selected" : ""}" data-admin-task="${esc(task.id)}"><div class="list-item-head"><strong>${esc(task.title)}</strong><span class="badge ${task.is_published ? "green" : "amber"}">${task.is_published ? "Опубликована" : "Черновик"}</span></div><div class="meta">${esc(task.description)}</div></button>`).join("");
-  const editor = `<form class="card" id="admin-task-form"><div class="page-head"><h3>${selected ? "Настройка таски" : "Новая таска"}</h3><span class="spacer"></span><button class="btn" id="new-task" type="button">+ Новая</button></div><div class="unsaved" id="task-unsaved" hidden>Есть несохранённые изменения</div><div class="field"><label for="task-title">Название</label><input class="input" id="task-title" name="title" value="${esc(selected?.title || "")}" maxlength="120" required></div><div class="field"><label for="task-description">Описание для пользователей</label><textarea class="input" id="task-description" name="description" maxlength="1000">${esc(selected?.description || "")}</textarea></div><div class="field"><label for="task-content">Промпт администратора</label><textarea class="input template-content" id="task-content" name="content" maxlength="100000" required>${esc(selected?.content || "")}</textarea><span class="hint">Скрыт от пользователя. Его дополнение добавляется после этого текста.</span></div><div class="field"><label for="task-agent">Режим</label><select class="input" id="task-agent" name="agent">${agents.map(item => `<option value="${esc(item)}" ${item === agent ? "selected" : ""}>${esc(item)}</option>`).join("")}</select></div><div class="field"><label for="task-model">Модель</label><div id="task-model-field">${taskModelField(model)}</div><span class="hint" id="task-model-hint">Загружаем доступные модели OpenCode…</span><button class="btn" id="retry-task-models" type="button" disabled>Обновить список моделей</button></div><div class="field"><label for="task-variant">Вариант модели (необязательно)</label><input class="input" id="task-variant" name="model_variant" maxlength="100" value="${esc(selected?.model_variant || "")}" placeholder="Например: high"><span class="hint">Идентификатор варианта из конфигурации выбранной модели.</span></div><div class="field"><label for="task-queue">Очередь</label><select class="input" id="task-queue" name="queue_id" required>${queues.map(queue => `<option value="${esc(queue.id)}" ${queue.id === selectedQueue ? "selected" : ""}>${esc(queue.name)}</option>`).join("")}</select><span class="hint">Изменение действует только для новых запусков.</span></div><label class="toolbar"><input type="checkbox" name="plan_first" ${selected?.plan_first ? "checked" : ""} ${agent !== "build" ? "disabled" : ""}> Сначала план, затем автоматическое выполнение</label><label class="toolbar"><input type="checkbox" name="is_published" ${selected?.is_published ? "checked" : ""}> Доступна пользователям</label><div class="field"><label for="task-visibility">Кто видит таску</label><select class="input" id="task-visibility" name="visibility"><option value="all" ${visibility === "all" ? "selected" : ""}>Все пользователи</option><option value="selected" ${visibility === "selected" ? "selected" : ""}>Выбранные пользователи</option></select></div><div class="field" id="task-audience-field" ${visibility === "selected" ? "" : "hidden"}><label>Пользователи с доступом</label><div id="task-audience">${assignableUsers.map(user => `<label class="toolbar"><input type="checkbox" value="${esc(user.id)}" ${audience.has(user.id) ? "checked" : ""}> ${esc(user.login)}</label>`).join("") || `<span class="hint">Нет пользователей</span>`}</div></div>${pipelineField}<div class="actions"><button class="btn btn-primary" type="submit">Сохранить</button>${selected ? `<button class="btn btn-danger" id="delete-task" type="button">Удалить таску</button>` : ""}</div></form>`;
+  const editor = `<form class="card" id="admin-task-form"><div class="page-head"><h3>${selected ? "Настройка таски" : "Новая таска"}</h3><span class="spacer"></span><button class="btn" id="new-task" type="button">+ Новая</button></div><div class="unsaved" id="task-unsaved" hidden>Есть несохранённые изменения</div><div class="field"><label for="task-title">Название</label><input class="input" id="task-title" name="title" value="${esc(selected?.title || "")}" maxlength="120" required></div><div class="field"><label for="task-description">Описание для пользователей</label><textarea class="input" id="task-description" name="description" maxlength="1000">${esc(selected?.description || "")}</textarea></div><div class="field"><label for="task-content">Промпт администратора</label><textarea class="input template-content" id="task-content" name="content" maxlength="100000" required>${esc(selected?.content || "")}</textarea><span class="hint">Скрыт от пользователя. Его дополнение добавляется после этого текста.</span></div><div class="field"><label for="task-agent">Режим</label><select class="input" id="task-agent" name="agent">${agents.map(item => `<option value="${esc(item)}" ${item === agent ? "selected" : ""}>${esc(item)}</option>`).join("")}</select></div><div class="field"><label for="task-model">Модель</label><div id="task-model-field">${taskModelField(model)}</div><span class="hint" id="task-model-hint">Загружаем доступные модели OpenCode…</span><button class="btn" id="retry-task-models" type="button" disabled>Обновить список моделей</button></div><div class="field"><label for="task-variant">Вариант модели (необязательно)</label><input class="input" id="task-variant" name="model_variant" maxlength="100" value="${esc(selected?.model_variant || "")}" placeholder="Например: high"><span class="hint">Идентификатор варианта из конфигурации выбранной модели.</span></div><div class="field"><label for="task-queue">Очередь</label><select class="input" id="task-queue" name="queue_id" required>${queues.map(queue => `<option value="${esc(queue.id)}" ${queue.id === selectedQueue ? "selected" : ""}>${esc(queue.name)}</option>`).join("")}</select><span class="hint">Изменение действует только для новых запусков.</span></div><div class="field"><label for="task-output-mode">Формат результата</label><select class="input" id="task-output-mode" name="output_mode"><option value="text" ${outputMode === "text" ? "selected" : ""}>text — обычный ответ</option><option value="json" ${outputMode === "json" ? "selected" : ""}>json — проверять и исправлять JSON</option></select><span class="hint">json включает контракт output.json и JSON Processor для новых запусков.</span></div><div class="field"><label for="task-output-schema">JSON Schema результата (необязательно)</label><textarea class="input template-content" id="task-output-schema" name="output_schema" maxlength="16384" placeholder='{"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}'>${esc(outputSchema)}</textarea><span class="hint">Безопасное подмножество JSON Schema. Пусто — только проверка синтаксиса JSON.</span></div><div class="field"><label for="task-on-json-error">При ошибке JSON</label><select class="input" id="task-on-json-error" name="on_json_error"><option value="fail" ${onJsonError === "fail" ? "selected" : ""}>fail — завершить с ошибкой</option><option value="repair" ${onJsonError === "repair" ? "selected" : ""}>repair — отправить в JSON Processor</option></select><span class="hint">repair требует output_mode=json и включённый JSON Processor.</span></div><div class="field"><label for="task-repair-trigger">Когда запускать исправление</label><select class="input" id="task-repair-trigger" name="repair_trigger" ${onJsonError !== "repair" ? "disabled" : ""}><option value="invalid_json" ${repairTrigger === "invalid_json" ? "selected" : ""}>invalid_json — только синтаксис</option><option value="invalid_json_or_schema" ${repairTrigger === "invalid_json_or_schema" ? "selected" : ""}>invalid_json_or_schema — синтаксис или схема</option></select><span class="hint">Доступно только при on_json_error=repair.</span></div><label class="toolbar"><input type="checkbox" name="plan_first" ${selected?.plan_first ? "checked" : ""} ${agent !== "build" ? "disabled" : ""}> Сначала план, затем автоматическое выполнение</label><label class="toolbar"><input type="checkbox" name="is_published" ${selected?.is_published ? "checked" : ""}> Доступна пользователям</label><div class="field"><label for="task-visibility">Кто видит таску</label><select class="input" id="task-visibility" name="visibility"><option value="all" ${visibility === "all" ? "selected" : ""}>Все пользователи</option><option value="selected" ${visibility === "selected" ? "selected" : ""}>Выбранные пользователи</option></select></div><div class="field" id="task-audience-field" ${visibility === "selected" ? "" : "hidden"}><label>Пользователи с доступом</label><div id="task-audience">${assignableUsers.map(user => `<label class="toolbar"><input type="checkbox" value="${esc(user.id)}" ${audience.has(user.id) ? "checked" : ""}> ${esc(user.login)}</label>`).join("") || `<span class="hint">Нет пользователей</span>`}</div></div>${pipelineField}<div class="actions"><button class="btn btn-primary" type="submit">Сохранить</button>${selected ? `<button class="btn btn-danger" id="delete-task" type="button">Удалить таску</button>` : ""}</div></form>`;
   app.innerHTML = shell(`<div class="page"><div class="page-head"><h2>Настройка тасок</h2></div><div class="grid task-admin-grid"><div class="list">${list || `<div class="empty">Создайте первую таску</div>`}</div>${editor}</div><section class="task-history"><div class="page-head"><h2>Все запуски</h2><span class="spacer"></span><button class="btn" id="refresh-task-runs" type="button">Обновить</button></div><div class="list" id="task-runs">${taskRunList(runs, true)}</div></section></div>`, "Админка · Таски");
   bindShell();
   const changeSelection = id => {
@@ -1003,6 +1013,19 @@ async function renderAdminTasks(selectedId = state.selectedAdminTask) {
     if (field) field.hidden = event.target.value !== "selected";
   });
   const form = document.querySelector("#admin-task-form");
+  const syncRepairTrigger = () => {
+    const select = form.elements.repair_trigger;
+    const enabled = form.elements.on_json_error.value === "repair";
+    select.disabled = !enabled;
+    if (!enabled) select.value = "invalid_json";
+  };
+  form.elements.on_json_error.addEventListener("change", syncRepairTrigger);
+  form.elements.output_mode.addEventListener("change", () => {
+    if (form.elements.output_mode.value !== "json") {
+      form.elements.on_json_error.value = "fail";
+      syncRepairTrigger();
+    }
+  });
   form.elements.agent.addEventListener("change", () => {
     form.elements.plan_first.disabled = form.elements.agent.value !== "build";
     if (form.elements.plan_first.disabled) form.elements.plan_first.checked = false;
@@ -1020,6 +1043,22 @@ async function renderAdminTasks(selectedId = state.selectedAdminTask) {
     const data = Object.fromEntries(new FormData(form));
     data.is_published = data.is_published === "on";
     data.plan_first = data.plan_first === "on";
+    const rawSchema = String(data.output_schema || "").trim();
+    if (rawSchema) {
+      try {
+        const parsed = JSON.parse(rawSchema);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not object");
+        data.output_schema = parsed;
+      } catch {
+        notify("JSON Schema результата должен быть JSON-объектом", "error");
+        form.elements.output_schema.focus();
+        return;
+      }
+    } else {
+      data.output_schema = null;
+    }
+    if (data.output_mode !== "json") data.on_json_error = "fail";
+    if (data.on_json_error !== "repair") data.repair_trigger = "invalid_json";
     data.model_variant = data.model_variant.trim() || null;
     data.model = data.model.trim();
     data.next_task_ids = [...form.querySelectorAll("#task-successors input:checked")].map(input => input.value);

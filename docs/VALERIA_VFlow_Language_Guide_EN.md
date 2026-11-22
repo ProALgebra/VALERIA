@@ -322,14 +322,18 @@ step review = task.run(
 | `task_id` | Yes | ID of an existing VALERIA task. Checked at validate/publish and again when a Run is created. |
 | `input_path` | No | Limited JSONPath to a fragment of the input JSON. Defaults to `$`. |
 | `input` | No | Historical alias for `input_path`. Prefer `input_path`; if both are given, `input_path` wins. |
-| `result_mode` | No | `auto` (default), `strict_json`, `none`. |
-| `json_schema` | No | Optional JSON Schema subset for `strict_json`. Supported: `type`, `required`, `properties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `minItems`, `maxItems`, `additionalProperties: false`. |
-| `max_json_repairs` | No | Integer `0..3`, default `1`: how many correction turns may be sent into the same Task chat when `strict_json` output is invalid. |
+| `result_mode` | No | **Legacy** mode: `auto` (default), `strict_json`, `none`. Ignored by `output_mode=json`. |
+| `json_schema` | No | **Legacy** optional JSON Schema subset for `strict_json`. Supported: `type`, `required`, `properties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `minItems`, `maxItems`, `additionalProperties: false`. |
+| `max_json_repairs` | No | **Legacy** integer `0..3`, default `1`: how many correction turns may be sent into the same Task chat when `strict_json` output is invalid. Cannot be combined with `on_json_error: "repair"`. |
+| `output_mode` | No | `text` (default) or `json`. `json` enables the JSON Processor output contract and validation. |
+| `output_schema` | No | Optional JSON Schema for `output_mode=json`. Preferred over legacy `json_schema`; only the safe processor subset is accepted. |
+| `on_json_error` | No | `fail` (default) or `repair`. `repair` sends the raw completed Task text to the JSON Processor instead of failing immediately. Requires `output_mode: "json"`. |
+| `repair_trigger` | No | `invalid_json` (default) or `invalid_json_or_schema`. Valid only together with `on_json_error: "repair"`. |
 | `queue_timeout_seconds` | No | Non-negative integer: how long to wait for the task to start. Omit for no separate limit. |
 | `execution_timeout_seconds` | No | Non-negative integer: how long the task may run after starting. |
 | `retries` | No | Non-negative integer: number of **additional** attempts. Default `0`. The UI schema recommends at most 10. |
 
-Unknown arguments are rejected by the compiler. `task_id` must be a non-empty string. Malformed `json_schema` and `max_json_repairs` outside `0..3` are rejected with `COMPILE_INVALID_JSON_SCHEMA` / `COMPILE_INVALID_MAX_JSON_REPAIRS`.
+Unknown arguments are rejected by the compiler. `task_id` must be a non-empty string. Malformed `json_schema`/`output_schema` and `max_json_repairs` outside `0..3` are rejected with `COMPILE_INVALID_JSON_SCHEMA` / `COMPILE_INVALID_MAX_JSON_REPAIRS`. `repair_trigger` without `on_json_error: "repair"` is rejected, and `max_json_repairs > 0` with `on_json_error: "repair"` is rejected with `COMPILE_REPAIR_ENGINE_CONFLICT` so two repair engines never run for one answer.
 
 **What happens:**
 
@@ -342,6 +346,15 @@ Unknown arguments are rejected by the compiler. `task_id` must be a non-empty st
 7. When the output is invalid and `max_json_repairs` allows another attempt, VFlow sends a bounded correction into the **same Task chat/session**. The correction contains the safe validation error, the schema/example and the instruction to return only valid JSON. The Task point waits for that follow-up answer; its `repair_attempt` count is separate from Task `attempt`/`retries`.
 8. Repair applies only to JSON syntax/schema failures of a completed Task. Timeouts, cancellation, `TASK_CHANGED`, `TASK_UNAVAILABLE` and execution failures are never repaired. After the repair budget is exhausted the Run fails with `TASK_OUTPUT_NOT_JSON` or `TASK_SCHEMA_INVALID`.
 9. A repair follow-up is a normal chat continuation (`task_id = NULL`) in the same chat, not a new Task or a legacy pipeline child. It is idempotent by a deterministic message id and preserves the VFlow run/point correlation.
+
+**JSON Processor mode (`output_mode: "json"`):**
+
+1. A strictly valid JSON answer that satisfies `output_schema` (when configured) advances immediately; no processor job is created.
+2. A syntactically invalid answer, or a schema mismatch when `repair_trigger: "invalid_json_or_schema"`, creates one JSON Processor repair job correlated by `vflow_run_id`/`point_id`/`task_run_id`.
+3. The point waits in `status = "processing_output"`; `next_check_at` and the processor job id are persisted. The VFlow scheduler never calls an LLM inside its transaction; the separate JSON Processor worker does the repair.
+4. On processor success, the repaired decoded value becomes `output.json`. On failure the Run fails with the safe `OUTPUT_INVALID` code and no downstream node runs.
+5. A disabled or unconfigured processor is an explicit `JSON_PROCESSOR_NOT_CONFIGURED` error, never a silent bypass.
+6. `on_json_error: "fail"` and legacy `result_mode` behaviour remain available for existing pipelines. The legacy same-chat repair (`strict_json` + `max_json_repairs`) is never combined with the processor engine.
 
 **Successful Task envelope (`result_mode=auto` or `strict_json`):**
 
@@ -365,6 +378,31 @@ Unknown arguments are rejected by the compiler. `task_id` must be a non-empty st
 - `task.output.json` is the parsed JSON if the entire text parsed; with `auto` and a parse failure it is `null`; with `none` it is `null`.
 - `task.run_id` is the existing VALERIA Task Run ID in the queue.
 - Prompts, reasoning and tool messages are never included in the envelope.
+
+**Successful JSON Processor Task envelope (`output_mode: "json"`):**
+
+```json
+{
+  "input": {"repository": "example/repo", "pr": 24},
+  "output": {
+    "text": "{\"ok\":true,\"issues\":[]}",
+    "json": {"ok": true, "issues": []}
+  },
+  "task": {
+    "task_id": "code.review",
+    "run_id": "task-run-701",
+    "status": "completed",
+    "output": {
+      "text": "{\"ok\":true,\"issues\":[]}",
+      "json": {"ok": true, "issues": []}
+    }
+  }
+}
+```
+
+- `output` is the new preferred path (`$.output.json...`); `task.output` is retained for backward compatibility (`$.task.output.json...`).
+- `output.json` always contains a decoded, schema-valid JSON value. A failed repair never writes `null`, `{}` or an error envelope into it.
+- `input` is the full point JSON before the Task.
 
 The Task snapshot is captured when the Run is created. If the task changes after the Run starts, enqueue fails with `TASK_CHANGED`; VFlow does not silently substitute the newer task version. A new Run sees the new task version.
 
@@ -990,6 +1028,8 @@ Internal tracebacks, prompts and intermediate JSON are not exposed to users. Adm
 
 `strict_json` does not extract JSON from a Markdown block or arbitrary prose: it parses the entire final answer. `none` is useful when a downstream node needs only text.
 
+`output_mode: "json"` takes precedence over these legacy modes. It produces both `$.output.json` and the backward-compatible `$.task.output.json`. With `on_json_error: "repair"`, invalid JSON (or a schema mismatch for `invalid_json_or_schema`) goes through the JSON Processor worker; on failure the Run fails with `OUTPUT_INVALID`. Use `output_mode: "json"` plus `output_schema` for new pipelines; keep `result_mode`/`max_json_repairs` only for existing ones.
+
 ### 11.4. Task retries and timeouts
 
 - `retries` is the number of **additional** attempts. Each attempt is a new Task Run, a new `attempt` and a new `vflow_task_links` row.
@@ -1161,7 +1201,7 @@ The `202` response contains `id`, `status`, `pipeline` and `progress`. Repeating
 
 | DSL call | IR type | Input | Outputs | Required arguments | Main optional arguments |
 |---|---|---|---|---|---|
-| `task.run(...)` | `valeria.task@1.0` | `in` | `out` | `task_id` | `input_path`, `input`, `result_mode`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
+| `task.run(...)` | `valeria.task@1.0` | `in` | `out` | `task_id` | `input_path`, `input`, `result_mode`, `output_mode`, `output_schema`, `on_json_error`, `repair_trigger`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
 | `transform(...)` | `core.transform@1.0` | `in` | `out` | `operations` | `create_missing` |
 | `if(...)` | `core.if@1.0` | `in` | `true`, `false` | `path`, `operator` | `value`, `missing` |
 | `fork(...)` | `core.fork@1.0` | `in` | `branch[0..N-1]` or `all` | `count`, `join` | — |
@@ -1185,7 +1225,7 @@ The `202` response contains `id`, `status`, `pipeline` and `progress`. Repeating
 
 | After node | Data shape |
 |---|---|
-| `Task` | `{"input": <full input>, "task": {"task_id", "run_id", "status", "output": {"text", "json"}}}` |
+| `Task` | `{"input": <full input>, "output": {"text", "json"}, "task": {"task_id", "run_id", "status", "output": {"text", "json"}}}` (`output` exists for `output_mode=json`; `task.output` remains for all modes) |
 | `Transform` | Result of the last operation (a new copy). |
 | `If` | The same JSON, unchanged. |
 | `Fork` | N independent copies of the input JSON. |
