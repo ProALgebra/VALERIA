@@ -122,12 +122,61 @@ class ValeriaTaskGateway:
             )
         return str(job["id"])
 
+    def repair_output(
+        self,
+        *,
+        task_run_id: str,
+        run_id: str,
+        point_id: str,
+        repair_attempt: int,
+        prompt: str,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> str:
+        """Send one bounded correction turn into the original Task chat.
+
+        The new queue job deliberately has ``task_id = NULL``: it is a normal
+        chat continuation in the same session, not a second Task Run.  A
+        deterministic message id makes repeated polling/crash recovery
+        idempotent.
+        """
+        del error_code, error_message
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise VFlowTaskError("TASK_REPAIR_UNAVAILABLE", "Repair prompt is empty")
+        if (
+            not isinstance(repair_attempt, int)
+            or isinstance(repair_attempt, bool)
+            or repair_attempt < 1
+        ):
+            raise VFlowTaskError("TASK_REPAIR_UNAVAILABLE", "Repair attempt is invalid")
+        seed = f"{run_id}:{point_id}:{repair_attempt}"
+        message_id = "msg_vflow_repair_" + hashlib.sha256(
+            seed.encode()
+        ).hexdigest()[:40]
+        try:
+            job = self.database.create_vflow_repair_job(
+                original_job_id=task_run_id,
+                run_id=run_id,
+                point_id=point_id,
+                repair_attempt=repair_attempt,
+                prompt=prompt,
+                message_id=message_id,
+            )
+        except ValueError as exc:
+            raise VFlowTaskError(
+                "TASK_REPAIR_UNAVAILABLE",
+                f"Task output cannot be repaired: {exc}",
+            ) from exc
+        return str(job["id"])
+
     def status(self, task_run_id: str) -> dict[str, Any]:
         job = self.database.get_job(task_run_id)
         if not job:
             return {"status": "failed", "safe_error": "Task run not found"}
         status = str(job["status"])
         if status == "completed":
+            # Both Task runs and same-chat repair turns persist their final
+            # assistant text in task_run_results.
             result = self.database.get_task_result(task_run_id)
             text = result["text"] if result else None
             return {"status": "completed", "text": text}

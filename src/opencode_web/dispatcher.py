@@ -358,7 +358,8 @@ class QueueDispatcher:
                     user_found, result = self._message_result(
                         messages,
                         job.get("phase2_message_id") or job["message_id"],
-                        task_session=bool(job.get("task_id")),
+                        task_session=bool(job.get("task_id"))
+                        or job.get("job_kind") == "vflow_repair",
                     )
                     if job.get("consultation") and final_answer(messages, job["message_id"]):
                         result = "completed"
@@ -413,6 +414,14 @@ class QueueDispatcher:
                                     messages, job.get("phase2_message_id") or job["message_id"]
                                 ),
                             )
+                        elif job.get("job_kind") == "vflow_repair":
+                            answer = task_final_answer(messages, job["message_id"])
+                            if answer:
+                                self.database.complete_vflow_repair_run(job["id"], answer)
+                            else:
+                                self.database.set_job_status(
+                                    job["id"], "failed", "incomplete_response"
+                                )
                         else:
                             self.database.set_job_status(job["id"], "completed")
                     elif result == "failed":
@@ -779,8 +788,13 @@ class QueueDispatcher:
                 self.database.set_job_status(job_id, "failed", "internal_error")
         finally:
             current = self.database.get_job(job_id)
-            if (job.get("task_id") or job.get("consultation")) and (
-                client
+            if (
+                (
+                    job.get("task_id")
+                    or job.get("consultation")
+                    or job.get("job_kind") == "vflow_repair"
+                )
+                and client
                 and current
                 and current["status"] == "failed"
                 and not current.get("session_pending")
@@ -837,6 +851,7 @@ class QueueDispatcher:
         idle_polls = 0
         live_status = "running"
         is_task = bool(job.get("task_id"))
+        is_repair = job.get("job_kind") == "vflow_repair"
         is_consultation = bool(job.get("consultation"))
         answered: set[str] = set()
         failures: dict[str, int] = {}
@@ -941,7 +956,9 @@ class QueueDispatcher:
                 )
                 if not is_task and not is_consultation:
                     # Correlate failure with this turn, not an earlier outcome.
-                    _, result = self._message_result(messages, job["message_id"])
+                    _, result = self._message_result(
+                        messages, job["message_id"], task_session=is_repair
+                    )
                     if result == "failed":
                         raise TaskExecutionError("assistant_error")
                 if is_consultation:
@@ -983,6 +1000,11 @@ class QueueDispatcher:
                             messages, job.get("phase2_message_id") or job["message_id"]
                         ),
                     )
+                elif is_repair:
+                    answer = task_final_answer(messages, job["message_id"])
+                    if not answer:
+                        raise TaskExecutionError("incomplete_response")
+                    self.database.complete_vflow_repair_run(job_id, answer)
                 elif not is_consultation:
                     self.database.set_job_status(job_id, "completed")
                 return

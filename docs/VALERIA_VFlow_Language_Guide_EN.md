@@ -304,6 +304,13 @@ step review = task.run(
     task_id: "code.review",
     input_path: "$.request",
     result_mode: "strict_json",
+    json_schema: {
+        type: "object",
+        required: ["ok"],
+        properties: {ok: {type: "boolean"}},
+        additionalProperties: false
+    },
+    max_json_repairs: 1,
     queue_timeout_seconds: 300,
     execution_timeout_seconds: 1800,
     retries: 1
@@ -316,11 +323,13 @@ step review = task.run(
 | `input_path` | No | Limited JSONPath to a fragment of the input JSON. Defaults to `$`. |
 | `input` | No | Historical alias for `input_path`. Prefer `input_path`; if both are given, `input_path` wins. |
 | `result_mode` | No | `auto` (default), `strict_json`, `none`. |
+| `json_schema` | No | Optional JSON Schema subset for `strict_json`. Supported: `type`, `required`, `properties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `minItems`, `maxItems`, `additionalProperties: false`. |
+| `max_json_repairs` | No | Integer `0..3`, default `1`: how many correction turns may be sent into the same Task chat when `strict_json` output is invalid. |
 | `queue_timeout_seconds` | No | Non-negative integer: how long to wait for the task to start. Omit for no separate limit. |
 | `execution_timeout_seconds` | No | Non-negative integer: how long the task may run after starting. |
 | `retries` | No | Non-negative integer: number of **additional** attempts. Default `0`. The UI schema recommends at most 10. |
 
-Unknown arguments are rejected by the compiler. `task_id` must be a non-empty string.
+Unknown arguments are rejected by the compiler. `task_id` must be a non-empty string. Malformed `json_schema` and `max_json_repairs` outside `0..3` are rejected with `COMPILE_INVALID_JSON_SCHEMA` / `COMPILE_INVALID_MAX_JSON_REPAIRS`.
 
 **What happens:**
 
@@ -329,7 +338,10 @@ Unknown arguments are rejected by the compiler. `task_id` must be a non-empty st
 3. The Gateway enqueues **one** ordinary Task Run in the existing queue with a deterministic `enqueue_key` and a Task snapshot.
 4. The point becomes `waiting_task`; waiting holds neither the HTTP request nor an OpenCode slot.
 5. After confirmed completion, runtime reads only the final answer text and builds an envelope.
-6. `strict_json` requires the entire final text to be valid JSON; otherwise the Run fails with `TASK_OUTPUT_NOT_JSON`.
+6. `strict_json` requires the entire final text to be valid JSON. If `json_schema` is configured, the parsed value must also satisfy it. A syntax failure uses `TASK_OUTPUT_NOT_JSON`; a schema mismatch uses `TASK_SCHEMA_INVALID` with a safe path such as `$.items[0].id`.
+7. When the output is invalid and `max_json_repairs` allows another attempt, VFlow sends a bounded correction into the **same Task chat/session**. The correction contains the safe validation error, the schema/example and the instruction to return only valid JSON. The Task point waits for that follow-up answer; its `repair_attempt` count is separate from Task `attempt`/`retries`.
+8. Repair applies only to JSON syntax/schema failures of a completed Task. Timeouts, cancellation, `TASK_CHANGED`, `TASK_UNAVAILABLE` and execution failures are never repaired. After the repair budget is exhausted the Run fails with `TASK_OUTPUT_NOT_JSON` or `TASK_SCHEMA_INVALID`.
+9. A repair follow-up is a normal chat continuation (`task_id = NULL`) in the same chat, not a new Task or a legacy pipeline child. It is idempotent by a deterministic message id and preserves the VFlow run/point correlation.
 
 **Successful Task envelope (`result_mode=auto` or `strict_json`):**
 

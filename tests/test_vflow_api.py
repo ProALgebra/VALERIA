@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from opencode_web.app import create_app
+from opencode_web.vflow.gateway import ValeriaTaskGateway
 
 
 @pytest.fixture
@@ -232,3 +233,106 @@ workflow "preview" {
     )
     assert invalid.status_code == 422, invalid.text
     assert invalid.json()["error"]["code"] == "VFLOW_VALIDATION_ERROR"
+
+
+async def test_task_json_schema_and_repair_limits_save_from_inspector(vflow_app):
+    t = vflow_app
+    await login(t.client)
+    task = await create_task(t.client)
+    created = await t.client.post(
+        "/api/admin/pipelines",
+        json={"slug": "task-json", "title": "Task JSON"},
+    )
+    assert created.status_code == 201, created.text
+    pipeline = created.json()
+    source = f'''workflow "task-json" {{
+  version: 1;
+  input: json;
+  step work = task.run(
+    task_id: "{task['id']}",
+    result_mode: "strict_json",
+    json_schema: {{
+      type: "object",
+      required: ["ok"],
+      properties: {{ok: {{type: "boolean"}}}},
+      additionalProperties: false
+    }},
+    max_json_repairs: 2
+  );
+  start -> work -> end
+}}'''
+    saved = await t.client.put(
+        f"/api/admin/pipelines/{pipeline['id']}/draft",
+        json={"source": source},
+    )
+    assert saved.status_code == 200, saved.text
+    node = next(
+        item for item in saved.json()["graph"]["nodes"] if item["type"] == "valeria.task"
+    )
+    assert node["config"]["max_json_repairs"] == 2
+    assert node["config"]["json_schema"]["additionalProperties"] is False
+
+    invalid_schema = await t.client.put(
+        f"/api/admin/pipelines/{pipeline['id']}/draft",
+        headers={"If-Match": saved.json()["etag"]},
+        json={"source": source.replace('"boolean"', '"not-a-type"')},
+    )
+    assert invalid_schema.status_code == 422, invalid_schema.text
+    codes = {
+        item["code"]
+        for item in invalid_schema.json()["error"]["details"]["diagnostics"]
+    }
+    assert "COMPILE_INVALID_JSON_SCHEMA" in codes
+
+    invalid_repairs = await t.client.put(
+        f"/api/admin/pipelines/{pipeline['id']}/draft",
+        headers={"If-Match": saved.json()["etag"]},
+        json={"source": source.replace("max_json_repairs: 2", "max_json_repairs: 4")},
+    )
+    assert invalid_repairs.status_code == 422, invalid_repairs.text
+    codes = {
+        item["code"]
+        for item in invalid_repairs.json()["error"]["details"]["diagnostics"]
+    }
+    assert "COMPILE_INVALID_MAX_JSON_REPAIRS" in codes
+
+
+async def test_user_queue_and_job_api_hide_vflow_repair_jobs(vflow_app):
+    t = vflow_app
+    await login(t.client)
+    task = await create_task(t.client)
+    worker = t.users["worker"]
+    gateway = ValeriaTaskGateway(t.db)
+    original_id = gateway.enqueue(
+        run_id="run-repair-api",
+        point_id="point-repair-api",
+        task_id=task["id"],
+        user_id=worker["id"],
+        workspace_id=worker["workspace_path"],
+        input_data={},
+        result_mode="strict_json",
+        node_id="work",
+    )
+    t.db.complete_task_run(original_id, {"message_id": "m-1", "text": "not json"})
+    repair_id = gateway.repair_output(
+        task_run_id=original_id,
+        run_id="run-repair-api",
+        point_id="point-repair-api",
+        repair_attempt=1,
+        prompt="Return only valid JSON",
+    )
+
+    await login(t.client, "worker")
+    queue = await t.client.get("/api/queue/me")
+    assert queue.status_code == 200, queue.text
+    assert all(item["id"] != repair_id for item in queue.json())
+    hidden = await t.client.get(f"/api/jobs/{repair_id}")
+    assert hidden.status_code == 404, hidden.text
+    cannot_cancel = await t.client.delete(f"/api/jobs/{repair_id}")
+    assert cannot_cancel.status_code == 404, cannot_cancel.text
+    assert t.db.get_job(repair_id)["status"] == "queued"
+
+    await login(t.client)
+    visible = await t.client.get(f"/api/jobs/{repair_id}")
+    assert visible.status_code == 200, visible.text
+    assert visible.json()["job_kind"] == "vflow_repair"

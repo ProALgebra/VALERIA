@@ -1482,7 +1482,9 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> list[dict[str, Any]]:
         return [job for job in db.list_jobs(principal["user"]["id"])
-                if not job.get("task_id") and not job.get("consultation")]
+                if not job.get("task_id")
+                and not job.get("consultation")
+                and job.get("job_kind") != "vflow_repair"]
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(
@@ -1493,7 +1495,11 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         job = db.get_job(job_id)
         if not job or (
             principal["user"]["role"] != "admin"
-            and (job["effective_user_id"] != principal["user"]["id"] or job.get("task_id"))
+            and (
+                job["effective_user_id"] != principal["user"]["id"]
+                or job.get("task_id")
+                or job.get("job_kind") == "vflow_repair"
+            )
         ):
             raise HTTPException(404, "Job not found")
         if job.get("consultation") and principal["user"]["role"] != "admin":
@@ -1512,7 +1518,14 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> None:
         owner = None if principal["user"]["role"] == "admin" else principal["user"]["id"]
         job = db.get_job(job_id)
-        if not job or (owner and (job["effective_user_id"] != owner or job.get("task_id"))):
+        if not job or (
+            owner
+            and (
+                job["effective_user_id"] != owner
+                or job.get("task_id")
+                or job.get("job_kind") == "vflow_repair"
+            )
+        ):
             raise HTTPException(404, "Job not found")
         if not db.cancel_queued_job(job_id, owner):
             raise HTTPException(409, "Only queued jobs can be cancelled")

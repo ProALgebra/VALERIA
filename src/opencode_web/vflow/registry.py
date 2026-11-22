@@ -81,6 +81,27 @@ BUILTIN_SPECS = (
                 "queue_timeout_seconds": {"type": "integer", "minimum": 1},
                 "execution_timeout_seconds": {"type": "integer", "minimum": 1},
                 "retries": {"type": "integer", "minimum": 0, "maximum": 10, "default": 0},
+                "json_schema": {
+                    "type": "object",
+                    "title": "Требуемый JSON",
+                    "description": (
+                        "JSON Schema для ответа при result_mode=strict_json. "
+                        "Поддерживаются type, required, properties, items, enum, "
+                        "minimum, maximum, minLength, maxLength, pattern и "
+                        "additionalProperties: false."
+                    ),
+                },
+                "max_json_repairs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "default": 1,
+                    "title": "Попыток исправления",
+                    "description": (
+                        "Сколько раз попросить задачу исправить невалидный JSON "
+                        "в том же чате (0–3)."
+                    ),
+                },
             },
         },
         capabilities=(

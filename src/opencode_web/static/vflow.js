@@ -1178,7 +1178,8 @@ export function vflowUI({api, shell, bindShell, state, app, esc, notify, navigat
     const configValue = (key, fallback) => selectedNode?.config?.[key] ?? fallback;
     const fieldHtml = (key, schema) => {
       const value = configValue(key, schema.default);
-      const label = `${esc(key)}${requiredKeys.has(key) ? " *" : ""}`;
+      const fieldName = schema.title || key;
+      const label = `${esc(fieldName)}${requiredKeys.has(key) ? " *" : ""}`;
       let control = "";
       if (schema.type === "boolean") {
         control = `<input type="checkbox" data-config-key="${esc(key)}" data-config-type="boolean" aria-label="${label}" ${value ? "checked" : ""}>`;
@@ -1222,7 +1223,7 @@ export function vflowUI({api, shell, bindShell, state, app, esc, notify, navigat
         <div class="vflow-tab-panel" id="vflow-tab-panel" role="tabpanel" aria-labelledby="vflow-tab-${state.vflowTab}" aria-label="${esc(activeTabLabel)}">${center}</div>
         <div class="vflow-diag" id="vflow-diag" role="region" tabindex="-1" aria-label="Диагностика">${diagnostics || `<span>Проверка ещё не запускалась</span>`}</div>
       </main>
-      <aside class="vflow-inspector" aria-label="Инспектор"><h3 class="vflow-panel-title">Инспектор</h3>${inspector}</aside>
+      <aside class="vflow-inspector" id="vflow-inspector" aria-label="Инспектор"><h3 class="vflow-panel-title">Инспектор</h3>${inspector}</aside>
     </div>`, "Редактор пайплайна");
     bindShell();
     bindToolbarNavigation();
@@ -1495,7 +1496,11 @@ export function vflowUI({api, shell, bindShell, state, app, esc, notify, navigat
             if (field.value === "") delete config[key];
             else {
               const value = Number(field.value);
-              if (!Number.isFinite(value)) {
+              const bounds = configSchema.properties?.[key] || {};
+              const invalid = !Number.isFinite(value)
+                || (bounds.minimum !== undefined && value < bounds.minimum)
+                || (bounds.maximum !== undefined && value > bounds.maximum);
+              if (invalid) {
                 field.setAttribute("aria-invalid", "true");
                 throw {field};
               }
@@ -1509,6 +1514,12 @@ export function vflowUI({api, shell, bindShell, state, app, esc, notify, navigat
               } catch (error) {
                 field.setAttribute("aria-invalid", "true");
                 throw {field, cause: error};
+              }
+              if (key === "json_schema" && (
+                !config[key] || typeof config[key] !== "object" || Array.isArray(config[key])
+              )) {
+                field.setAttribute("aria-invalid", "true");
+                throw {field};
               }
             }
           } else if (field.value === "" && !["task_id"].includes(key)) {

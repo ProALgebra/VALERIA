@@ -38,6 +38,7 @@ from .handlers import (
     PlanContext,
     PointView,
 )
+from .json_schema import build_correction_prompt, validate_output
 from .limits import (
     DEFAULT_LIMITS,
     VFlowLimitError,
@@ -106,6 +107,18 @@ class TaskGateway(Protocol):
 
     def status(self, task_run_id: str) -> dict[str, Any]: ...
 
+    def repair_output(
+        self,
+        *,
+        task_run_id: str,
+        run_id: str,
+        point_id: str,
+        repair_attempt: int,
+        prompt: str,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> str: ...
+
     def cancel(self, task_run_id: str) -> None: ...
 
 
@@ -120,6 +133,7 @@ class _Point:
     visit_seq: int
     task_run_id: str | None
     attempt: int
+    json_repair_attempt: int
     lease_token: str | None
 
 
@@ -408,7 +422,7 @@ class VFlowRuntime:
         return self.database._all(
             """SELECT id, run_id, node_id, status, data_json, fork_stack_json,
                       parent_point_id, visit_seq, task_run_id, attempt,
-                      next_check_at, created_at, updated_at
+                      json_repair_attempt, next_check_at, created_at, updated_at
                FROM vflow_points WHERE run_id = ?
                ORDER BY created_at, id""",
             (run_id,),
@@ -521,6 +535,7 @@ class VFlowRuntime:
         return claimed
 
     def tick(self, limit: int = 20) -> int:
+        self.reconcile_repair_outbox(limit)
         processed = 0
         for point_id, token in self.claim_due(limit):
             if self.process_point(point_id, token):
@@ -567,6 +582,7 @@ class VFlowRuntime:
                 visit_seq=int(row["visit_seq"]),
                 task_run_id=row["task_run_id"],
                 attempt=int(row["attempt"]),
+                json_repair_attempt=int(row["json_repair_attempt"] or 0),
                 lease_token=row["lease_token"],
             )
             try:
@@ -591,6 +607,10 @@ class VFlowRuntime:
                             connection, point, node, task_link, task_status
                         ):
                             return True
+                        if self._handle_task_json_repair(
+                            connection, point, node, task_link, task_status
+                        ):
+                            return True
                 handler = self.handlers.get(node.type)
                 if handler is None:
                     raise VFlowRuntimeError(
@@ -608,6 +628,7 @@ class VFlowRuntime:
                             visit_seq=point.visit_seq,
                             attempt=point.attempt,
                             task_run_id=point.task_run_id,
+                            json_repair_attempt=point.json_repair_attempt,
                         ),
                         graph=graph,
                         task_status=task_status,
@@ -669,8 +690,9 @@ class VFlowRuntime:
             connection.execute(
                 """UPDATE vflow_task_links
                    SET status = 'completed', finished_at = ?
-                   WHERE task_run_id = ?""",
-                (utcnow(), point.task_run_id),
+                   WHERE point_id = ? AND visit_seq = ? AND attempt = ?
+                     AND finished_at IS NULL""",
+                (utcnow(), point.id, point.visit_seq, point.attempt),
             )
         self._advance(connection, point, graph, action.data, action.port, limits)
 
@@ -695,11 +717,12 @@ class VFlowRuntime:
         if action.kind == TASK_RETRY_KIND:
             attempt = int(condition.get("attempt", point.attempt + 1))
             if point.task_run_id:
-                self._close_task_link(connection, point.task_run_id, "retried", now)
+                self._close_task_links(connection, point, "retried", now)
             connection.execute(
                 """UPDATE vflow_points
                    SET status = 'ready', attempt = ?, task_run_id = NULL,
-                       next_check_at = NULL, lease_owner = NULL, lease_token = NULL,
+                       json_repair_attempt = 0, next_check_at = NULL,
+                       lease_owner = NULL, lease_token = NULL,
                        lease_until = NULL, updated_at = ? WHERE id = ?""",
                 (attempt, now, point.id),
             )
@@ -778,8 +801,8 @@ class VFlowRuntime:
         connection.execute(
             """UPDATE vflow_points
                SET node_id = ?, status = 'ready', data_json = ?, visit_seq = ?,
-                   attempt = 1, task_run_id = NULL, lease_owner = NULL,
-                   lease_token = NULL, lease_until = NULL,
+                   attempt = 1, task_run_id = NULL, json_repair_attempt = 0,
+                   lease_owner = NULL, lease_token = NULL, lease_until = NULL,
                    next_check_at = NULL, updated_at = ?
                WHERE id = ?""",
             (edge.target, _dump(data), next_visit, utcnow(), point.id),
@@ -1194,13 +1217,12 @@ class VFlowRuntime:
                     )
                     return False
                 retries = _timeout_seconds(node.config.get("retries")) or 0
-                if point.attempt <= retries:
-                    self._close_task_link(
-                        connection, point.task_run_id, "timed_out", now
-                    )
+                if point.json_repair_attempt == 0 and point.attempt <= retries:
+                    self._close_task_links(connection, point, "timed_out", now)
                     connection.execute(
                         """UPDATE vflow_points
                            SET status = 'ready', attempt = ?, task_run_id = NULL,
+                               json_repair_attempt = 0,
                                next_check_at = NULL, lease_owner = NULL,
                                lease_token = NULL, lease_until = NULL, updated_at = ?
                            WHERE id = ? AND status = 'claimed'""",
@@ -1219,14 +1241,18 @@ class VFlowRuntime:
                         },
                     )
                     return True
-                self._close_task_link(connection, point.task_run_id, "timed_out", now)
+                self._close_task_links(connection, point, "timed_out", now)
                 self._event(
                     connection,
                     point.run_id,
                     point.id,
                     point.node_id,
                     "TASK_QUEUE_TIMEOUT",
-                    {"attempt": point.attempt, "retry": False},
+                    {
+                        "attempt": point.attempt,
+                        "repair_attempt": point.json_repair_attempt,
+                        "retry": False,
+                    },
                 )
                 self._fail(
                     connection,
@@ -1243,14 +1269,18 @@ class VFlowRuntime:
             elapsed = _elapsed_seconds(started_at, now_dt)
             if elapsed is not None and elapsed > execution_timeout:
                 self._cancel_task_run(point.task_run_id)
-                self._close_task_link(connection, point.task_run_id, "timed_out", now)
+                self._close_task_links(connection, point, "timed_out", now)
                 self._event(
                     connection,
                     point.run_id,
                     point.id,
                     point.node_id,
                     "TASK_EXECUTION_TIMEOUT",
-                    {"attempt": point.attempt, "elapsed_seconds": int(elapsed)},
+                    {
+                        "attempt": point.attempt,
+                        "repair_attempt": point.json_repair_attempt,
+                        "elapsed_seconds": int(elapsed),
+                    },
                 )
                 self._fail(
                     connection,
@@ -1260,6 +1290,312 @@ class VFlowRuntime:
                 )
                 return True
         return False
+
+    @staticmethod
+    def _repair_limit(config: dict[str, Any]) -> int:
+        value = config.get("max_json_repairs", 1)
+        if isinstance(value, bool):
+            return 1
+        try:
+            return max(0, min(int(value), 3))
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _repair_dedupe_key(point: _Point, repair_attempt: int) -> str:
+        return (
+            f"vflow-repair:{point.run_id}:{point.id}:"
+            f"{point.visit_seq}:{point.attempt}:{repair_attempt}"
+        )
+
+    def _handle_task_json_repair(
+        self,
+        connection: Any,
+        point: _Point,
+        node: Any,
+        task_link: Any,
+        task_status: dict[str, Any] | None,
+    ) -> bool:
+        """Validate completed strict_json output and request one same-chat repair.
+
+        Repair is deliberately limited to syntax/schema failures of a completed
+        run.  Timeouts, cancellation, Task changes and execution failures keep
+        their existing terminal/retry semantics and never enter this path.
+        """
+        if task_link is None or not task_status:
+            return False
+        if str(task_status.get("status") or "") != "completed":
+            return False
+        config = node.config
+        if str(config.get("result_mode", "auto")) != "strict_json":
+            return False
+        schema = config.get("json_schema")
+        _parsed, failure = validate_output(task_status.get("text"), schema)
+        if failure is None:
+            if point.json_repair_attempt:
+                self._event(
+                    connection,
+                    point.run_id,
+                    point.id,
+                    point.node_id,
+                    "TASK_JSON_REPAIR_COMPLETED",
+                    {
+                        "repair_attempt": point.json_repair_attempt,
+                        "task_run_id": point.task_run_id,
+                    },
+                )
+            return False
+        repair_attempt = point.json_repair_attempt + 1
+        repair_method = getattr(self.gateway, "repair_output", None)
+        if repair_attempt > self._repair_limit(config) or not callable(repair_method):
+            self._fail(connection, point.run_id, failure.code, failure.message)
+            return True
+        prompt = build_correction_prompt(failure, schema)
+        dedupe_key = self._repair_dedupe_key(point, repair_attempt)
+        now = utcnow()
+        payload = {
+            "task_run_id": point.task_run_id,
+            "task_id": str(task_link["task_id"]),
+            "run_id": point.run_id,
+            "point_id": point.id,
+            "node_id": point.node_id,
+            "visit_seq": point.visit_seq,
+            "attempt": point.attempt,
+            "repair_attempt": repair_attempt,
+            "prompt": prompt,
+            "error_code": failure.code,
+            "error_message": failure.message[:500],
+            "error_path": failure.path,
+        }
+        connection.execute(
+            """INSERT OR IGNORE INTO vflow_outbox
+               (id, dedupe_key, run_id, point_id, kind, payload_json, status,
+                attempts, next_attempt_at, created_at)
+               VALUES (?, ?, ?, ?, 'task_json_repair', ?, 'pending', 0, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                dedupe_key,
+                point.run_id,
+                point.id,
+                _dump(payload),
+                now,
+                now,
+            ),
+        )
+        try:
+            self._enqueue_repair_payload(connection, payload, dedupe_key, now)
+        except VFlowTaskError as exc:
+            connection.execute(
+                """UPDATE vflow_outbox
+                   SET status = 'dead', attempts = attempts + 1, last_error = ?,
+                       processed_at = ?, next_attempt_at = ?
+                   WHERE dedupe_key = ?""",
+                (str(exc)[:500], now, now, dedupe_key),
+            )
+            self._fail(connection, point.run_id, exc.code, str(exc))
+        return True
+
+    def _enqueue_repair_payload(
+        self,
+        connection: Any,
+        payload: dict[str, Any],
+        dedupe_key: str,
+        now: str,
+    ) -> str:
+        """Enqueue or reconcile one deterministic repair job and point update."""
+        if self.gateway is None:
+            raise VFlowTaskError(
+                "TASK_REPAIR_UNAVAILABLE", "Task gateway is unavailable"
+            )
+        repair_method = getattr(self.gateway, "repair_output", None)
+        if not callable(repair_method):
+            raise VFlowTaskError(
+                "TASK_REPAIR_UNAVAILABLE", "Task gateway cannot repair output"
+            )
+        old_job_id = str(payload["task_run_id"])
+        new_job_id = repair_method(
+            task_run_id=old_job_id,
+            run_id=str(payload["run_id"]),
+            point_id=str(payload["point_id"]),
+            repair_attempt=int(payload["repair_attempt"]),
+            prompt=str(payload["prompt"]),
+            error_code=payload.get("error_code"),
+            error_message=payload.get("error_message"),
+        )
+        if not new_job_id:
+            raise VFlowTaskError(
+                "TASK_REPAIR_UNAVAILABLE", "Task gateway returned no repair job"
+            )
+        connection.execute(
+            """INSERT OR IGNORE INTO vflow_task_links
+               (id, run_id, point_id, node_id, visit_seq, attempt, task_id,
+                task_run_id, enqueue_key, status, repair_attempt,
+                parent_task_run_id, repair_error_code, repair_error_message,
+                queued_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                payload["run_id"],
+                payload["point_id"],
+                payload["node_id"],
+                int(payload["visit_seq"]),
+                int(payload["attempt"]),
+                payload["task_id"],
+                new_job_id,
+                dedupe_key,
+                int(payload["repair_attempt"]),
+                old_job_id,
+                payload.get("error_code"),
+                payload.get("error_message"),
+                now,
+            ),
+        )
+        connection.execute(
+            """UPDATE vflow_task_links SET status = 'repair_requested'
+               WHERE task_run_id = ? AND finished_at IS NULL""",
+            (old_job_id,),
+        )
+        cursor = connection.execute(
+            """UPDATE vflow_points
+               SET status = 'waiting_task', task_run_id = ?,
+                   json_repair_attempt = ?, next_check_at = ?,
+                   lease_owner = NULL, lease_token = NULL, lease_until = NULL,
+                   updated_at = ?
+               WHERE id = ? AND task_run_id = ?""",
+            (
+                new_job_id,
+                int(payload["repair_attempt"]),
+                (datetime.now(UTC) + timedelta(seconds=TASK_POLL_SECONDS)).isoformat(),
+                now,
+                payload["point_id"],
+                old_job_id,
+            ),
+        )
+        if not cursor.rowcount:
+            raise VFlowTaskError(
+                "TASK_REPAIR_STALE", "Task point changed before repair was enqueued"
+            )
+        connection.execute(
+            """UPDATE vflow_outbox
+               SET status = 'sent', attempts = attempts + 1,
+                   processed_at = ?, next_attempt_at = ?
+               WHERE dedupe_key = ?""",
+            (now, now, dedupe_key),
+        )
+        self._event(
+            connection,
+            str(payload["run_id"]),
+            str(payload["point_id"]),
+            str(payload["node_id"]),
+            "TASK_JSON_REPAIR_REQUESTED",
+            {
+                "repair_attempt": int(payload["repair_attempt"]),
+                "task_run_id": new_job_id,
+                "parent_task_run_id": old_job_id,
+                "error_code": payload.get("error_code"),
+                "path": payload.get("error_path"),
+            },
+        )
+        return new_job_id
+
+    def reconcile_repair_outbox(self, limit: int = 20) -> int:
+        """Finish repair enqueues interrupted between outbox intent and job link."""
+        if self.gateway is None or not callable(
+            getattr(self.gateway, "repair_output", None)
+        ):
+            return 0
+        rows = self.database._all(
+            """SELECT * FROM vflow_outbox
+               WHERE kind = 'task_json_repair'
+                 AND status IN ('pending', 'processing')
+               ORDER BY next_attempt_at, created_at LIMIT ?""",
+            (max(1, int(limit)),),
+        )
+        applied = 0
+        for row in rows:
+            with self.database.transaction() as connection:
+                current = connection.execute(
+                    "SELECT * FROM vflow_outbox WHERE id = ?", (row["id"],)
+                ).fetchone()
+                if not current or current["status"] not in {"pending", "processing"}:
+                    continue
+                payload = _load(current["payload_json"], {})
+                now = utcnow()
+                if not isinstance(payload, dict) or not payload.get("task_run_id"):
+                    connection.execute(
+                        """UPDATE vflow_outbox
+                           SET status = 'dead', attempts = attempts + 1,
+                               last_error = 'invalid_repair_payload',
+                               processed_at = ?, next_attempt_at = ?
+                           WHERE id = ?""",
+                        (now, now, row["id"]),
+                    )
+                    continue
+                run = connection.execute(
+                    "SELECT status FROM vflow_runs WHERE id = ?",
+                    (payload.get("run_id"),),
+                ).fetchone()
+                point = connection.execute(
+                    "SELECT * FROM vflow_points WHERE id = ?",
+                    (payload.get("point_id"),),
+                ).fetchone()
+                if not run or run["status"] != "running" or not point:
+                    connection.execute(
+                        """UPDATE vflow_outbox
+                           SET status = 'dead', attempts = attempts + 1,
+                               last_error = 'repair_target_unavailable',
+                               processed_at = ?, next_attempt_at = ?
+                           WHERE id = ?""",
+                        (now, now, row["id"]),
+                    )
+                    continue
+                applied_attempt = int(point["json_repair_attempt"] or 0)
+                if applied_attempt >= int(payload["repair_attempt"]):
+                    connection.execute(
+                        """UPDATE vflow_outbox
+                           SET status = 'sent', attempts = attempts + 1,
+                               processed_at = ?, next_attempt_at = ?
+                           WHERE id = ?""",
+                        (now, now, row["id"]),
+                    )
+                    continue
+                if (
+                    point["task_run_id"] != payload["task_run_id"]
+                    or point["status"] not in ("waiting_task", "claimed")
+                    or point["node_id"] != payload["node_id"]
+                    or int(point["visit_seq"]) != int(payload["visit_seq"])
+                    or int(point["attempt"]) != int(payload["attempt"])
+                ):
+                    connection.execute(
+                        """UPDATE vflow_outbox
+                           SET status = 'dead', attempts = attempts + 1,
+                               last_error = 'repair_point_changed',
+                               processed_at = ?, next_attempt_at = ?
+                           WHERE id = ?""",
+                        (now, now, row["id"]),
+                    )
+                    continue
+                try:
+                    self._enqueue_repair_payload(
+                        connection, payload, str(current["dedupe_key"]), now
+                    )
+                    applied += 1
+                except VFlowTaskError as exc:
+                    connection.execute(
+                        """UPDATE vflow_outbox
+                           SET status = 'dead', attempts = attempts + 1,
+                               last_error = ?, processed_at = ?,
+                               next_attempt_at = ?
+                           WHERE id = ?""",
+                        (str(exc)[:500], now, now, row["id"]),
+                    )
+                    self._fail(
+                        connection,
+                        str(payload["run_id"]),
+                        exc.code,
+                        str(exc),
+                    )
+        return applied
 
     def _cancel_task_run(self, task_run_id: str | None) -> bool | None:
         """Best-effort cancellation; the gateway may reject a running job."""
@@ -1271,13 +1607,15 @@ class VFlowRuntime:
             return None
 
     @staticmethod
-    def _close_task_link(
-        connection: Any, task_run_id: str | None, status: str, now: str
+    def _close_task_links(
+        connection: Any, point: _Point, status: str, now: str
     ) -> None:
+        """Close every link in the current Task visit, including repairs."""
         connection.execute(
             """UPDATE vflow_task_links SET status = ?, finished_at = ?
-               WHERE task_run_id = ? AND finished_at IS NULL""",
-            (status, now, task_run_id),
+               WHERE point_id = ? AND visit_seq = ? AND attempt = ?
+                 AND finished_at IS NULL""",
+            (status, now, point.id, point.visit_seq, point.attempt),
         )
 
     def _task_step(
@@ -1372,6 +1710,7 @@ class VFlowRuntime:
         connection.execute(
             """UPDATE vflow_points
                SET status = 'waiting_task', task_run_id = ?, next_check_at = ?,
+                   json_repair_attempt = 0,
                    lease_owner = NULL, lease_token = NULL, lease_until = NULL,
                    updated_at = ?
                WHERE id = ?""",
@@ -1434,6 +1773,7 @@ class VFlowRuntime:
         self._event(connection, run_id, None, None, "RUN_FAILED", {"code": code})
 
     def cancel_run(self, run_id: str) -> bool:
+        cancelled_jobs: list[str] = []
         with self.database.transaction() as connection:
             run = connection.execute(
                 "SELECT status FROM vflow_runs WHERE id = ?", (run_id,)
@@ -1457,15 +1797,24 @@ class VFlowRuntime:
                 (run_id,),
             )
             connection.execute(
+                """UPDATE vflow_task_links SET status = 'cancelled', finished_at = ?
+                   WHERE run_id = ? AND finished_at IS NULL""",
+                (now, run_id),
+            )
+            cancelled_jobs = self.database.cancel_queued_vflow_jobs(run_id)
+            connection.execute(
                 """UPDATE vflow_runs SET status = 'cancelled', finished_at = ?
                    WHERE id = ?""",
                 (now, run_id),
             )
             self._event(connection, run_id, None, None, "RUN_CANCELLED", {})
+        for job_id in cancelled_jobs:
+            self._cancel_task_run(job_id)
         return True
 
     def run_until_idle(self, run_id: str, max_steps: int = 1000) -> dict[str, Any]:
         """Deterministic helper for tests and admin preview runs."""
+        self.reconcile_repair_outbox()
         for _ in range(max_steps):
             run = self.get_run(run_id)
             if not run or run["status"] in TERMINAL_RUN_STATUSES:

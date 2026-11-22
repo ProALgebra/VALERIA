@@ -129,7 +129,7 @@ Registry — code-only. Администратор не добавляет ти�
 
 | DSL-вызов | IR type | Порты | Основные параметры |
 |---|---|---|---|
-| `task.run(...)` | `valeria.task@1.0` | `out` | `task_id`, `input`/`input_path`, `result_mode`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
+| `task.run(...)` | `valeria.task@1.0` | `out` | `task_id`, `input`/`input_path`, `result_mode`, `json_schema`, `max_json_repairs`, `queue_timeout_seconds`, `execution_timeout_seconds`, `retries` |
 | `transform(...)` | `core.transform@1.0` | `out` | `operations`, `create_missing` |
 | `if(...)` | `core.if@1.0` | `true`, `false` | `path`, `operator`, `value`, `missing` |
 | `fork(...)` | `core.fork@1.0` | `branch[0..N-1]` или `all` | `count`, `join` |
@@ -140,6 +140,8 @@ Registry — code-only. Администратор не добавляет ти�
 ### 1.6. Task Gateway и очередь
 
 `ValeriaTaskGateway` — тонкий адаптер между точкой VFlow и существующей очередью VALERIA. Он создаёт обычные `queue_jobs` и `chats`; исполняет их существующий `QueueDispatcher`. VFlow не вызывает OpenCode, не управляет сессиями и не создаёт второй механизм очереди.
+
+Для `strict_json` runtime проверяет весь финальный текст: сначала синтаксис JSON, затем необязательную `json_schema`. При ошибке и остатке `max_json_repairs` Gateway создаёт follow-up `queue_jobs` в **том же** `chat_id`/`session_id` с `task_id = NULL`, `job_kind = 'vflow_repair'`, `pipeline_json = ''` и детерминированным `message_id` (`msg_vflow_repair_<sha256(run:point:attempt)>`). Это обычное продолжение чата, а не новый Task Run и не legacy-потомок pipeline. Повторный вызов идемпотентен. Ответ follow-up сохраняется в `task_run_results` и читается Gateway как финальный текст. Очередь исправлений восстанавливается из `vflow_outbox.kind = 'task_json_repair'`; отмена Run отменяет ещё не запущенные repair-jobs.
 
 Подробности — в разделе 7.
 
@@ -240,8 +242,9 @@ VFLOW_RETENTION_DAYS=30
 | `VFLOW_MAX_TRANSITIONS` | каждый переход | `LIMIT_TRANSITIONS`. |
 | `VFLOW_MAX_JSON_BYTES` | вход Run и выход узла | `LIMIT_JSON_BYTES`. |
 | `VFLOW_MAX_JSON_DEPTH` | вход Run и выход узла | `LIMIT_JSON_DEPTH`. |
-| `queue_timeout_seconds` | Task | `TASK_QUEUE_TIMEOUT` (с retry, если разрешён). |
+| `queue_timeout_seconds` | Task | `TASK_QUEUE_TIMEOUT` (с retry, если разрешён; для repair-job retry не создаётся). |
 | `execution_timeout_seconds` | Task | `TASK_EXECUTION_TIMEOUT` без автоматического retry. |
+| `max_json_repairs` | Task `strict_json` | `TASK_OUTPUT_NOT_JSON` / `TASK_SCHEMA_INVALID` после исчерпания исправлений. |
 
 Важное расхождение: компилятор принимает `fork count` от 2 до 32 (константа компилятора), а runtime применяет `VFLOW_MAX_FORK_N`. Если `VFLOW_MAX_FORK_N` меньше 32, граф с большим `count` может сохраниться и опубликоваться, но Run завершится `LIMIT_FORK_COUNT`. Держите значение env согласованным с политикой публикации.
 
@@ -634,7 +637,7 @@ workflow "review_changes" {
 - `input` — полный JSON, который был у точки до Task (не только выбранный `input_path`).
 - `task.output.text` — финальный текст ответа.
 - `task.output.json` — распарсенный JSON при `auto`/`strict_json`; `null`, если `auto` не смог распарсить или `result_mode=none`.
-- `strict_json` требует валидный JSON; иначе Run падает с `TASK_OUTPUT_NOT_JSON`.
+- `strict_json` требует валидный JSON; при заданной `json_schema` значение также проверяется по схеме. С учётом `max_json_repairs` runtime может сначала попросить исправление в том же чате; после исчерпания — `TASK_OUTPUT_NOT_JSON` или `TASK_SCHEMA_INVALID`.
 - `none` не требует JSON и не парсит его; текст всё равно остаётся в конверте.
 - Prompt-ы, reasoning и tool-сообщения в результат не входят.
 
@@ -938,15 +941,15 @@ Idempotency-Key: <uuid>
 | `vflow_definitions` | Логические определения | `id` PK, `slug` UNIQUE, `created_by -> users`, `draft_version_id`, `published_version_id`, `audience_json`, `settings_json`. |
 | `vflow_versions` | Версии графа | `id` PK, `definition_id -> vflow_definitions ON DELETE CASCADE`, `UNIQUE(definition_id, version_number)`, `status` (`draft`/`published`/`superseded`), `graph_hash`. |
 | `vflow_runs` | Запуски | `id` PK, `definition_id`, `version_id`, `started_by_user_id -> users`, `workspace_id`, `status`, `input_json`, `final_result_json`, `task_snapshots_json`, `UNIQUE(started_by_user_id, idempotency_key)`. |
-| `vflow_points` | Точки выполнения | `id` PK, `run_id -> vflow_runs ON DELETE CASCADE`, `parent_point_id -> vflow_points`, `UNIQUE(run_id, node_id, visit_seq)`, lease-поля. |
+| `vflow_points` | Точки выполнения | `id` PK, `run_id -> vflow_runs ON DELETE CASCADE`, `parent_point_id -> vflow_points`, `json_repair_attempt` (0..бюджет), `UNIQUE(run_id, node_id, visit_seq)`, lease-поля. |
 | `vflow_fork_instances` | Активации Fork | `id` PK, `run_id -> vflow_runs ON DELETE CASCADE`, `parent_point_id -> vflow_points`, `UNIQUE(run_id, parent_point_id, parent_visit_seq, fork_node_id)`. |
 | `vflow_merge_arrivals` | Прибытия ветвей | `id` PK, `fork_instance_id -> vflow_fork_instances ON DELETE CASCADE`, `point_id -> vflow_points UNIQUE`, `UNIQUE(fork_instance_id, branch_index)`. |
-| `vflow_task_links` | Связь точки с Task Run | `id` PK, `run_id -> vflow_runs ON DELETE CASCADE`, `point_id -> vflow_points`, `task_run_id` UNIQUE, `enqueue_key` UNIQUE. |
+| `vflow_task_links` | Связь точки с Task Run и историей repair | `id` PK, `run_id -> vflow_runs ON DELETE CASCADE`, `point_id -> vflow_points`, `task_run_id` UNIQUE, `enqueue_key` UNIQUE, `repair_attempt`, `parent_task_run_id`, `repair_error_code`, `repair_error_message`. |
 | `vflow_events` | Журнал событий | `id` AUTOINCREMENT, `run_id -> vflow_runs ON DELETE CASCADE`, `event_type`, `payload_json`. |
 | `vflow_audit_events` | Аудит административных мутаций | `id` AUTOINCREMENT, `actor_user_id -> users`, `action`, `object_type`, `object_id`, `metadata_json`. |
 | `vflow_outbox` | Намерения постановки задач | `id` PK, `dedupe_key` UNIQUE, `run_id -> vflow_runs ON DELETE CASCADE`, `point_id -> vflow_points`, `status` (`pending`/`processing`/`sent`/`dead`). |
 
-Схема создаётся/дополняется при инициализации `Database`; `PRAGMA foreign_keys=ON`, `journal_mode=WAL`. Для обновления `vflow_task_links` есть additive-миграция колонки `started_at`.
+Схема создаётся/дополняется при инициализации `Database`; `PRAGMA foreign_keys=ON`, `journal_mode=WAL`. Additive-миграции добавляют `vflow_task_links.started_at`, `vflow_points.json_repair_attempt`, поля repair-истории `vflow_task_links` и корреляционные поля repair в `queue_jobs`; повторная инициализация безопасна.
 
 ### 6.2. Внешние ключи и каскады
 
@@ -1089,7 +1092,7 @@ Prompt/content в снимок **не** сохраняются. Если зад�
 
 Gateway читает существующий `queue_jobs`:
 
-- `completed` → текст из `task_run_results` (если есть);
+- `completed` → текст из `task_run_results` (для Task Run и repair-job);
 - `failed`/`cancelled` → безопасная ошибка/код;
 - остальные статусы → ожидание.
 
@@ -1102,9 +1105,10 @@ Gateway читает существующий `queue_jobs`:
 
 | Событие | Когда | Поведение |
 |---|---|---|
-| `queue_timeout_seconds` | Job ещё `queued`, не начал выполняться | Отменяет job. Если `attempt <= retries`, создаёт новую попытку; иначе Run падает `TASK_QUEUE_TIMEOUT`. |
+| `queue_timeout_seconds` | Job ещё `queued`, не начал выполняться | Отменяет job. Если `attempt <= retries` и это не repair-job, создаёт новую попытку; иначе Run падает `TASK_QUEUE_TIMEOUT`. |
 | `execution_timeout_seconds` | Job уже в `dispatching/running/waiting_permission/waiting_question` | Отменяет job, закрывает link, Run падает `TASK_EXECUTION_TIMEOUT`. Автоматического retry нет. |
 | `retries` при ошибке Task | Task завершился неуспешно, код не входит в non-retryable | Новая попытка, новый Task Run. Исчерпание → `TASK_FAILED`. |
+| `max_json_repairs` | Завершённый `strict_json` вернул невалидный JSON/схему | Follow-up в тот же чат, пока есть бюджет. Ошибки исполнения/таймауты/отмена не repair-ятся. Исчерпание → `TASK_OUTPUT_NOT_JSON`/`TASK_SCHEMA_INVALID`. |
 | `TASK_CHANGED`, `TASK_UNAVAILABLE`, `TASK_CANCELLED` | Явные terminal-коды | Без retry. |
 
 Гонка queue timeout: если dispatcher успел забрать job между опросом и отменой, gateway возвращает `False`; runtime фиксирует `started_at` и не создаёт дубль, после чего действует execution deadline.
@@ -1114,11 +1118,24 @@ Gateway читает существующий `queue_jobs`:
 ### 7.6. Отмена
 
 - При queue/execution timeout runtime вызывает `gateway.cancel(task_run_id)`.
-- `POST /api/pipeline-runs/{id}/cancel` и админ-отмена переводят VFlow Run в `cancelled`, активные точки и открытые forks — в `cancelled`, пишут `RUN_CANCELLED`.
-- Текущая реализация отмены Run **не вызывает** `gateway.cancel` для уже поставленных Task и не закрывает все `vflow_task_links`. Дочерняя задача может продолжить работу в очереди. Для остановки самого агента используйте существующие средства очереди/админки VALERIA.
+- `POST /api/pipeline-runs/{id}/cancel` и админ-отмена переводят VFlow Run в `cancelled`, активные точки и открытые forks — в `cancelled`, закрывают незавершённые `vflow_task_links` как `cancelled`, отменяют ещё `queued` Task/repair-jobs этого Run и пишут `RUN_CANCELLED`. Уже выполняющаяся внешняя задача может продолжить side effects — для остановки агента используйте существующие средства очереди/админки VALERIA.
 - При fail-fast (`_fail`) runtime переводит активные точки/forks в `cancelled`, task links — в `failed`; уже выполняющаяся внешняя задача также может продолжить side effects.
 
-### 7.7. Legacy `task_successors` — предупреждение
+### 7.7. Repair невалидного JSON
+
+Для `result_mode: "strict_json"` runtime проверяет весь финальный текст: `json.loads`, затем (если задана) `json_schema`. Ошибка синтаксиса даёт `TASK_OUTPUT_NOT_JSON`, несоответствие схеме — `TASK_SCHEMA_INVALID`; сообщения содержат безопасный путь (`$.field`, `$.items[0]`), но не значения.
+
+Если repair-бюджет (`max_json_repairs`, по умолчанию 1) ещё не исчерпан, Gateway создаёт follow-up job в **том же** `chat_id`/`session_id`:
+
+- `task_id = NULL` — dispatcher исполняет его как обычное продолжение чата;
+- `job_kind = 'vflow_repair'`, `repair_attempt = N`, `parent_task_run_id = <исходный job>`;
+- `pipeline_json = ''` — legacy `task_successors` не срабатывает;
+- `message_id = msg_vflow_repair_<sha256(run_id:point_id:repair_attempt)[:40]>`;
+- сохраняются `vflow_run_id`, `vflow_point_id`, `origin_node_id`, agent/model/queue/workspace исходного job.
+
+Повторный вызов с теми же параметрами возвращает тот же job. Намерение постановки сначала пишется в `vflow_outbox` (`kind='task_json_repair'`); `VFlowRuntime.reconcile_repair_outbox()` завершает прерванную постановку идемпотентно. Ответ follow-up сохраняется в `task_run_results`, поэтому `gateway.status()` возвращает его как `text`, и runtime продолжает обычную проверку. История видна администратору в `point.json_repair_attempt`, `task_correlations`/`task_repairs` и событиях `TASK_JSON_REPAIR_REQUESTED`/`TASK_JSON_REPAIR_COMPLETED`.
+
+### 7.8. Legacy `task_successors` — предупреждение
 
 VFlow **не использует** legacy-цепочку `task_successors` и не должен использовать `queue_jobs.pipeline_json`.
 

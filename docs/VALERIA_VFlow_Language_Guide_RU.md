@@ -304,6 +304,13 @@ step review = task.run(
     task_id: "code.review",
     input_path: "$.request",
     result_mode: "strict_json",
+    json_schema: {
+        type: "object",
+        required: ["ok"],
+        properties: {ok: {type: "boolean"}},
+        additionalProperties: false
+    },
+    max_json_repairs: 1,
     queue_timeout_seconds: 300,
     execution_timeout_seconds: 1800,
     retries: 1
@@ -316,11 +323,13 @@ step review = task.run(
 | `input_path` | Нет | Ограниченный JSONPath к фрагменту входного JSON. По умолчанию `$`. |
 | `input` | Нет | Исторический alias для `input_path`. Предпочитайте `input_path`; если заданы оба, побеждает `input_path`. |
 | `result_mode` | Нет | `auto` (по умолчанию), `strict_json`, `none`. |
+| `json_schema` | Нет | Необязательная JSON-схема для `strict_json`. Поддерживаются `type`, `required`, `properties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `minItems`, `maxItems`, `additionalProperties: false`. |
+| `max_json_repairs` | Нет | Целое `0..3`, по умолчанию `1`: сколько исправлений можно попросить в том же чате Task при невалидном `strict_json`. |
 | `queue_timeout_seconds` | Нет | Неотрицательное целое: сколько ждать старта задачи. Отсутствие — без отдельного лимита. |
 | `execution_timeout_seconds` | Нет | Неотрицательное целое: сколько задача может выполняться после старта. |
 | `retries` | Нет | Неотрицательное целое: число **дополнительных** попыток. По умолчанию `0`. UI-схема рекомендует не более 10. |
 
-Неизвестные аргументы отклоняются компилятором. `task_id` должен быть непустой строкой.
+Неизвестные аргументы отклоняются компилятором. `task_id` должен быть непустой строкой. Некорректная `json_schema` и `max_json_repairs` вне `0..3` отклоняются с `COMPILE_INVALID_JSON_SCHEMA` / `COMPILE_INVALID_MAX_JSON_REPAIRS`.
 
 **Что происходит:**
 
@@ -329,7 +338,10 @@ step review = task.run(
 3. Gateway ставит **один** обычный Task Run в существующую очередь с детерминированным `enqueue_key` и снимком Task.
 4. Точка переходит в `waiting_task`; ожидание не держит HTTP-запрос или слот OpenCode.
 5. После подтверждённого завершения runtime читает только финальный текст ответа и формирует конверт.
-6. `strict_json` требует, чтобы весь финальный текст был валидным JSON; иначе Run падает с `TASK_OUTPUT_NOT_JSON`.
+6. `strict_json` требует, чтобы весь финальный текст был валидным JSON. Если задана `json_schema`, разобранное значение должно ей соответствовать. Ошибка синтаксиса даёт `TASK_OUTPUT_NOT_JSON`, несоответствие схеме — `TASK_SCHEMA_INVALID` с безопасным путём вида `$.items[0].id`.
+7. Если ответ невалиден и `max_json_repairs` разрешает ещё попытку, VFlow отправляет ограниченное исправление в **тот же чат/сессию Task**. Сообщение содержит безопасную ошибку, схему/пример и требование вернуть только валидный JSON. Точка ждёт новый финальный ответ; счётчик `repair_attempt` не смешивается с `attempt`/`retries` задачи.
+8. Исправление применяется только к ошибкам синтаксиса/схемы JSON у завершённой задачи. Таймауты, отмена, `TASK_CHANGED`, `TASK_UNAVAILABLE` и ошибки исполнения не исправляются. После исчерпания бюджета Run падает с `TASK_OUTPUT_NOT_JSON` или `TASK_SCHEMA_INVALID`.
+9. Follow-up исправления — обычное продолжение чата (`task_id = NULL`) в том же чате, а не новая задача и не legacy-потомок pipeline. Оно идемпотентно по детерминированному message id и сохраняет корреляцию VFlow Run/точки.
 
 **Конверт успешного Task (`result_mode=auto` или `strict_json`):**
 

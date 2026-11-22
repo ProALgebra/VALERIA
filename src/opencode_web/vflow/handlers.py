@@ -53,6 +53,7 @@ class PointView:
     visit_seq: int
     attempt: int
     task_run_id: str | None
+    json_repair_attempt: int = 0
 
 
 @dataclass(frozen=True)

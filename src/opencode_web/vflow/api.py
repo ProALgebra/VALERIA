@@ -295,6 +295,9 @@ def _admin_run_view(
                     "status": point["status"],
                     "visit_seq": point["visit_seq"],
                     "attempt": point["attempt"],
+                    "json_repair_attempt": int(
+                        point.get("json_repair_attempt") or 0
+                    ),
                     "task_run_id": point.get("task_run_id"),
                     "branch_index": stack[-1].get("branch_index")
                     if stack
@@ -339,8 +342,13 @@ def _admin_run_view(
                 for node_id, snapshot in snapshots.items()
                 if isinstance(snapshot, dict)
             }
-        view["task_correlations"] = [
-            {
+        correlations = []
+        for link in db._all(
+            """SELECT * FROM vflow_task_links
+               WHERE run_id = ? ORDER BY queued_at, id""",
+            (run["id"],),
+        ):
+            entry = {
                 "point_id": link["point_id"],
                 "node_id": link["node_id"],
                 "origin_node_id": link["node_id"],
@@ -353,12 +361,27 @@ def _admin_run_view(
                 "started_at": link.get("started_at"),
                 "finished_at": link.get("finished_at"),
             }
-            for link in db._all(
-                """SELECT * FROM vflow_task_links
-                   WHERE run_id = ? ORDER BY queued_at, id""",
-                (run["id"],),
-            )
+            repair_attempt = int(link.get("repair_attempt") or 0)
+            if repair_attempt:
+                entry.update(
+                    {
+                        "repair_attempt": repair_attempt,
+                        "parent_task_run_id": link.get("parent_task_run_id"),
+                        "repair_error_code": link.get("repair_error_code"),
+                        "repair_error_message": link.get("repair_error_message"),
+                    }
+                )
+            correlations.append(entry)
+        view["task_correlations"] = correlations
+        # Admin diagnostics only.  user-facing run views never include links,
+        # errors or repair jobs.
+        view["task_repairs"] = [
+            link for link in correlations if int(link.get("repair_attempt") or 0) > 0
         ]
+        view["json_repair_attempts"] = max(
+            (int(point.get("json_repair_attempt") or 0) for point in points),
+            default=0,
+        )
     return view
 
 

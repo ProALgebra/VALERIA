@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from .json_schema import SchemaDefinitionError, validate_schema
 from .models import (
     CompileError,
     Diagnostic,
@@ -171,6 +172,7 @@ def _compile_config(
         unknown = set(args) - {
             "task_id", "input", "input_path", "result_mode",
             "queue_timeout_seconds", "execution_timeout_seconds", "retries",
+            "json_schema", "max_json_repairs",
         }
         if unknown:
             error("COMPILE_UNKNOWN_ARGUMENT", f"Unknown task argument(s): {sorted(unknown)}")
@@ -195,6 +197,34 @@ def _compile_config(
                     error("COMPILE_INVALID_ARGUMENT", f"{key} must be a non-negative integer")
                     return None
                 config[key] = value
+        json_schema = args.get("json_schema")
+        if json_schema is not None:
+            if not isinstance(json_schema, dict):
+                error(
+                    "COMPILE_INVALID_JSON_SCHEMA",
+                    "json_schema must be a JSON object",
+                )
+                return None
+            try:
+                validate_schema(json_schema)
+            except SchemaDefinitionError as exc:
+                error("COMPILE_INVALID_JSON_SCHEMA", f"Invalid json_schema: {exc}")
+                return None
+            if json_schema:
+                config["json_schema"] = json_schema
+        max_json_repairs = args.get("max_json_repairs")
+        if max_json_repairs is not None:
+            if (
+                not isinstance(max_json_repairs, int)
+                or isinstance(max_json_repairs, bool)
+                or not 0 <= max_json_repairs <= 3
+            ):
+                error(
+                    "COMPILE_INVALID_MAX_JSON_REPAIRS",
+                    "max_json_repairs must be an integer between 0 and 3",
+                )
+                return None
+            config["max_json_repairs"] = max_json_repairs
         return config
 
     if type_id == TRANSFORM:
