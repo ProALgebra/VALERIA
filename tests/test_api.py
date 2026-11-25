@@ -285,17 +285,23 @@ def test_admin_manages_priority_queues_and_default_chat_route(
         headers = {"x-csrf-token": csrf}
         created = client.post(
             "/api/admin/queues", headers=headers,
-            json={"name": "Срочные", "priority": 100, "max_workers": 2},
+            json={
+                "name": "Срочные", "priority": 100, "max_workers": 2,
+                "reserved_workers": 1,
+            },
         )
         assert created.status_code == 201, created.text
         queue = created.json()
         assert queue["name"] == "Срочные"
+        assert queue["reserved_workers"] == 1
         assert client.put(
             "/api/admin/settings/default-chat-queue", headers=headers,
             json={"queue_id": queue["id"]},
         ).status_code == 200
         overview = client.get("/api/admin/queue").json()
         assert overview["default_chat_queue_id"] == queue["id"]
+        assert overview["reserved"] == 1
+        assert overview["shared_limit"] == 0
         assert {item["name"] for item in overview["queues"]} >= {"Основная", "Срочные"}
         user_workspace = workspace / "queue-user"
         user_workspace.mkdir()
@@ -322,6 +328,7 @@ def test_admin_manages_priority_queues_and_default_chat_route(
         )
         assert updated.status_code == 200
         assert updated.json()["priority"] == 200
+        assert updated.json()["reserved_workers"] == 1
         # An assigned queue cannot disappear and silently reroute new work.
         assert client.delete(f"/api/admin/queues/{queue['id']}", headers=headers).status_code == 409
         assert client.post(
@@ -330,6 +337,45 @@ def test_admin_manages_priority_queues_and_default_chat_route(
                 "name": "Too wide", "priority": 0,
                 "max_workers": settings.max_active_sessions_hard_limit + 1,
             },
+        ).status_code == 422
+        assert client.post(
+            "/api/admin/queues", headers=headers,
+            json={"name": "Too reserved", "priority": 0, "max_workers": 1,
+                  "reserved_workers": 2},
+        ).status_code == 422
+        assert client.post(
+            "/api/admin/queues", headers=headers,
+            json={"name": "Over limit", "priority": 0, "max_workers": 2,
+                  "reserved_workers": 1},
+        ).status_code == 422
+
+
+def test_admin_reserved_workers_guard_concurrency_limits(
+    settings: Settings, workspace
+) -> None:
+    app = create_app(settings, start_dispatcher=False)
+    with TestClient(app) as client:
+        csrf = login(client, "admin", "correct-horse-battery-staple")
+        headers = {"x-csrf-token": csrf}
+        assert client.patch(
+            "/api/admin/settings/concurrency", headers=headers, json={"value": 2}
+        ).status_code == 200
+        queue = client.post(
+            "/api/admin/queues", headers=headers,
+            json={"name": "Reserved", "priority": 0, "max_workers": 2,
+                  "reserved_workers": 2},
+        )
+        assert queue.status_code == 201, queue.text
+        assert client.patch(
+            "/api/admin/settings/concurrency", headers=headers, json={"value": 1}
+        ).status_code == 422
+        assert client.delete(
+            "/api/admin/settings/concurrency/override", headers=headers
+        ).status_code == 409
+        assert client.post(
+            "/api/admin/queues", headers=headers,
+            json={"name": "One more", "priority": 0, "max_workers": 1,
+                  "reserved_workers": 1},
         ).status_code == 422
 
 

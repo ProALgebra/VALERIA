@@ -181,6 +181,7 @@ class WorkQueueBody(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     priority: int = Field(ge=-1_000_000, le=1_000_000)
     max_workers: int = Field(ge=1)
+    reserved_workers: int | None = Field(default=None, ge=0)
 
 
 class QueueRoutingBody(BaseModel):
@@ -514,6 +515,13 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 artifacts=artifacts,
                 attachments=attachments,
             )
+            reserved_workers = database.reserved_workers_total()
+            if reserved_workers > dispatcher.limit:
+                logger.warning(
+                    "Reserved queue workers (%s) exceed the active session limit (%s)",
+                    reserved_workers,
+                    dispatcher.limit,
+                )
             notification_dispatcher = NotificationDispatcher(database, settings)
             json_processor_repository = JsonProcessorRepository(database)
             json_processor_service = None
@@ -1937,14 +1945,23 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
         jobs = db.list_queue_overview_jobs()
+        queues = db.list_work_queues(include_archived=True)
+        limit = request.app.state.dispatcher.limit
+        reserved = sum(
+            int(queue["reserved_workers"])
+            for queue in queues
+            if queue["status"] == "active"
+        )
         return {
-            "limit": request.app.state.dispatcher.limit,
+            "limit": limit,
             "env_limit": settings.max_active_sessions,
             "hard_limit": settings.max_active_sessions_hard_limit,
+            "reserved": reserved,
+            "shared_limit": max(0, limit - reserved),
             "active": db.active_slot_count(),
             "queued": sum(job["status"] == "queued" for job in jobs),
             "default_chat_queue_id": db.default_chat_queue_id(),
-            "queues": db.list_work_queues(include_archived=True),
+            "queues": queues,
             "jobs": [
                 {**job, "chat_title": task_run_display_title(job)} if job.get("task_id") else job
                 for job in jobs
@@ -1968,12 +1985,24 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         if body.max_workers > settings.max_active_sessions_hard_limit:
             raise HTTPException(422, "Value exceeds MAX_ACTIVE_SESSIONS_HARD_LIMIT")
         try:
-            queue = db.create_work_queue(body.name, body.priority, body.max_workers)
+            queue = db.create_work_queue(
+                body.name,
+                body.priority,
+                body.max_workers,
+                body.reserved_workers or 0,
+                default_limit=settings.max_active_sessions,
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         db.audit(
             principal["user"]["id"], "queue.create", object_type="queue",
             object_id=queue["id"],
+            metadata={
+                "name": queue["name"],
+                "priority": queue["priority"],
+                "max_workers": queue["max_workers"],
+                "reserved_workers": queue["reserved_workers"],
+            },
         )
         request.app.state.dispatcher.wake()
         return queue
@@ -1992,6 +2021,8 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             queue = db.update_work_queue(
                 queue_id, name=body.name, priority=body.priority,
                 max_workers=body.max_workers,
+                reserved_workers=body.reserved_workers,
+                default_limit=settings.max_active_sessions,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -2000,6 +2031,12 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db.audit(
             principal["user"]["id"], "queue.update", object_type="queue",
             object_id=queue_id,
+            metadata={
+                "name": queue["name"],
+                "priority": queue["priority"],
+                "max_workers": queue["max_workers"],
+                "reserved_workers": queue["reserved_workers"],
+            },
         )
         request.app.state.dispatcher.wake()
         return queue
@@ -2071,7 +2108,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> dict[str, int]:
         if body.value > settings.max_active_sessions_hard_limit:
             raise HTTPException(422, "Value exceeds MAX_ACTIVE_SESSIONS_HARD_LIMIT")
-        db.set_concurrency_override(body.value, principal["user"]["id"])
+        try:
+            db.set_concurrency_override(body.value, principal["user"]["id"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         db.audit(principal["user"]["id"], "concurrency.update", metadata={"value": body.value})
         request.app.state.dispatcher.wake()
         return {"value": body.value}
@@ -2082,7 +2122,10 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         principal: Annotated[dict[str, Any], Depends(admin_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> None:
-        db.clear_concurrency_override()
+        try:
+            db.clear_concurrency_override(minimum_limit=settings.max_active_sessions)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         db.audit(principal["user"]["id"], "concurrency.reset")
         request.app.state.dispatcher.wake()
 

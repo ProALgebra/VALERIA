@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from opencode_web.database import Database
+from opencode_web.database import DEFAULT_QUEUE_ID, Database
 from opencode_web.security import verify_password
 
 
@@ -166,7 +166,13 @@ def test_cancelling_last_queued_job_returns_chat_to_idle(tmp_path: Path, workspa
 
 
 def _job(
-    database: Database, user_id: str, session: str, content: str, workspace: str
+    database: Database,
+    user_id: str,
+    session: str,
+    content: str,
+    workspace: str,
+    *,
+    queue_id: str = DEFAULT_QUEUE_ID,
 ) -> dict:
     chat = database.create_chat(user_id, session, session, workspace)
     return database.create_job(
@@ -178,6 +184,7 @@ def _job(
         provider_id=None,
         model_id=None,
         model_variant=None,
+        queue_id=queue_id,
     )
 
 
@@ -268,6 +275,132 @@ def test_priority_queues_use_greedy_limits_and_fifo(tmp_path: Path, workspace: P
     assert database.claim_next_job(3) is None
     database.set_job_status(high_first["id"], "completed")
     assert database.claim_next_job(3)["id"] == high_second["id"]
+    database.close()
+
+
+def test_reserved_worker_is_not_taken_by_other_queues(
+    tmp_path: Path, workspace: Path
+) -> None:
+    database = Database(tmp_path / "reserved-worker.sqlite", "x" * 32)
+    database.initialize()
+    user = database.create_user("user", "long-enough-password", "user", str(workspace))
+    reserved = database.create_work_queue("Резерв", 0, 2, reserved_workers=1)
+    shared = database.create_work_queue("Общая", 100, 5)
+    shared_jobs = [
+        _job(database, user["id"], f"shared-{index}", f"shared-{index}",
+             str(workspace), queue_id=shared["id"])
+        for index in range(4)
+    ]
+    reserved_job = _job(
+        database, user["id"], "reserved", "reserved", str(workspace),
+        queue_id=reserved["id"],
+    )
+
+    claimed = []
+    while job := database.claim_next_job(4):
+        claimed.append(job["id"])
+
+    # The shared queue fills only three shared slots; the fourth global slot is
+    # reserved for the other queue even though it has just one queued job.
+    assert claimed == [
+        shared_jobs[0]["id"],
+        shared_jobs[1]["id"],
+        shared_jobs[2]["id"],
+        reserved_job["id"],
+    ]
+    database.set_job_status(reserved_job["id"], "completed")
+    # The reserved slot stays idle rather than being lent to the shared queue.
+    assert database.claim_next_job(4) is None
+    assert database.get_job(shared_jobs[3]["id"])["status"] == "queued"
+    database.close()
+
+
+def test_reserved_queue_uses_shared_pool_up_to_its_worker_limit(
+    tmp_path: Path, workspace: Path
+) -> None:
+    database = Database(tmp_path / "reserved-shared.sqlite", "x" * 32)
+    database.initialize()
+    user = database.create_user("user", "long-enough-password", "user", str(workspace))
+    reserved = database.create_work_queue("Резерв", 0, 2, reserved_workers=1)
+    shared = database.create_work_queue("Общая", 100, 4)
+    shared_jobs = [
+        _job(database, user["id"], f"shared-{index}", f"shared-{index}",
+             str(workspace), queue_id=shared["id"])
+        for index in range(4)
+    ]
+    reserved_jobs = [
+        _job(database, user["id"], f"reserved-{index}", f"reserved-{index}",
+             str(workspace), queue_id=reserved["id"])
+        for index in range(2)
+    ]
+
+    claimed = []
+    while job := database.claim_next_job(6):
+        claimed.append(job["id"])
+
+    # Six workers: four shared jobs, one guaranteed reserved slot, then the
+    # second reserved-queue job from the shared pool.
+    assert claimed == [
+        shared_jobs[0]["id"],
+        shared_jobs[1]["id"],
+        shared_jobs[2]["id"],
+        shared_jobs[3]["id"],
+        reserved_jobs[0]["id"],
+        reserved_jobs[1]["id"],
+    ]
+    assert database.claim_next_job(6) is None
+    database.close()
+
+
+def test_reserved_workers_validation_releases_on_archive(
+    tmp_path: Path, workspace: Path
+) -> None:
+    database = Database(tmp_path / "reserved-validation.sqlite", "x" * 32)
+    database.initialize()
+    with pytest.raises(ValueError, match="cannot exceed its worker limit"):
+        database.create_work_queue("Bad", 0, 1, reserved_workers=2)
+
+    first = database.create_work_queue("First", 0, 2, reserved_workers=1, limit=2)
+    # Omitting reserved_workers on update preserves the current reservation.
+    updated = database.update_work_queue(
+        first["id"], name="First", priority=0, max_workers=2, limit=1
+    )
+    assert updated and updated["reserved_workers"] == 1
+    with pytest.raises(ValueError, match="active session limit"):
+        database.create_work_queue("Second", 0, 2, reserved_workers=2, limit=2)
+    with pytest.raises(ValueError, match="active session limit"):
+        database.update_work_queue(
+            first["id"], name="First", priority=0, max_workers=2,
+            reserved_workers=2, limit=1,
+        )
+
+    assert database.archive_work_queue(first["id"])
+    assert database.reserved_workers_total() == 0
+    database.create_work_queue("Replacement", 0, 2, reserved_workers=1, limit=1)
+    database.close()
+
+
+def test_initialize_adds_reserved_workers_to_legacy_queue_table(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-queues.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE work_queues (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            priority INTEGER NOT NULL DEFAULT 0,
+            max_workers INTEGER,
+            status TEXT NOT NULL DEFAULT 'active',
+            is_system INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"""
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(path, "x" * 32)
+    database.initialize()
+    assert database.get_work_queue(DEFAULT_QUEUE_ID)["reserved_workers"] == 0
     database.close()
 
 

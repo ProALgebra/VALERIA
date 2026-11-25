@@ -149,7 +149,9 @@ async def test_task_chains_partial_updates_audience_and_deletion(admin_api):
 
 async def test_queue_routing_concurrency_limits_and_archive_guards(admin_api):
     a = admin_api
-    queue = await a.call("create_queue", name="Reports", priority=20, max_workers=2)
+    queue = await a.call(
+        "create_queue", name="Reports", priority=20, max_workers=2, reserved_workers=1
+    )
     queue_id = queue["id"]
     updated = await a.call(
         "update_queue", queue_id=queue_id, name="Reports fast", priority=30, max_workers=3,
@@ -157,6 +159,7 @@ async def test_queue_routing_concurrency_limits_and_archive_guards(admin_api):
     assert (updated["name"], updated["priority"], updated["max_workers"]) == (
         "Reports fast", 30, 3,
     )
+    assert updated["reserved_workers"] == 1
     assert queue_id in {item["id"] for item in await a.call("list_queues")}
     assert await a.call("set_default_chat_queue", queue_id=queue_id) == {"queue_id": queue_id}
     overview = await a.call("get_queue")

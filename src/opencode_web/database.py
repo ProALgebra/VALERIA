@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS work_queues (
     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
     priority INTEGER NOT NULL DEFAULT 0,
     max_workers INTEGER CHECK (max_workers IS NULL OR max_workers >= 1),
+    reserved_workers INTEGER NOT NULL DEFAULT 0 CHECK (reserved_workers >= 0),
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
     is_system INTEGER NOT NULL DEFAULT 0 CHECK (is_system IN (0, 1)),
     created_at TEXT NOT NULL,
@@ -636,6 +637,15 @@ class Database:
                    VALUES (?, 'Основная', 0, NULL, 'active', 1, ?, ?)""",
                 (DEFAULT_QUEUE_ID, now, now),
             )
+            work_queue_columns = {
+                row[1]
+                for row in self._connection.execute("PRAGMA table_info(work_queues)").fetchall()
+            }
+            if "reserved_workers" not in work_queue_columns:
+                self._connection.execute(
+                    "ALTER TABLE work_queues ADD COLUMN reserved_workers INTEGER NOT NULL "
+                    "DEFAULT 0 CHECK (reserved_workers >= 0)"
+                )
             self._connection.execute(
                 """INSERT OR IGNORE INTO json_processor_settings
                    (id, settings_json, version, updated_by, created_at, updated_at)
@@ -1386,29 +1396,79 @@ class Database:
                 ORDER BY q.priority DESC, q.created_at, q.id"""
         )
 
+    def reserved_workers_total(self) -> int:
+        row = self._one(
+            "SELECT COALESCE(SUM(reserved_workers), 0) AS total FROM work_queues "
+            "WHERE status = 'active'"
+        )
+        return int(row["total"]) if row else 0
+
     def create_work_queue(
-        self, name: str, priority: int, max_workers: int
+        self,
+        name: str,
+        priority: int,
+        max_workers: int,
+        reserved_workers: int = 0,
+        *,
+        limit: int | None = None,
+        default_limit: int | None = None,
     ) -> dict[str, Any]:
         normalized = name.strip()
         if not normalized or len(normalized) > 120:
             raise ValueError("Queue name must contain 1 to 120 characters")
         if max_workers < 1:
             raise ValueError("Queue worker limit must be positive")
+        if reserved_workers < 0:
+            raise ValueError("Queue reserved workers cannot be negative")
+        if reserved_workers > max_workers:
+            raise ValueError("Queue reserved workers cannot exceed its worker limit")
         queue_id, now = str(uuid.uuid4()), utcnow()
         try:
             with self.transaction() as connection:
+                effective_limit = limit
+                if effective_limit is None and default_limit is not None:
+                    row = connection.execute(
+                        "SELECT value FROM settings WHERE key = 'max_active_sessions'"
+                    ).fetchone()
+                    effective_limit = int(row["value"]) if row else int(default_limit)
+                if effective_limit is not None:
+                    total = connection.execute(
+                        "SELECT COALESCE(SUM(reserved_workers), 0) FROM work_queues "
+                        "WHERE status = 'active'"
+                    ).fetchone()[0]
+                    if int(total) + int(reserved_workers) > int(effective_limit):
+                        raise ValueError(
+                            "Total reserved workers cannot exceed the active session limit"
+                        )
                 connection.execute(
                     """INSERT INTO work_queues
-                       (id, name, priority, max_workers, status, is_system, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, 'active', 0, ?, ?)""",
-                    (queue_id, normalized, int(priority), int(max_workers), now, now),
+                       (id, name, priority, max_workers, reserved_workers, status,
+                        is_system, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)""",
+                    (
+                        queue_id,
+                        normalized,
+                        int(priority),
+                        int(max_workers),
+                        int(reserved_workers),
+                        now,
+                        now,
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("Queue name already exists") from exc
         return self.get_work_queue(queue_id)  # type: ignore[return-value]
 
     def update_work_queue(
-        self, queue_id: str, *, name: str, priority: int, max_workers: int
+        self,
+        queue_id: str,
+        *,
+        name: str,
+        priority: int,
+        max_workers: int,
+        reserved_workers: int | None = None,
+        limit: int | None = None,
+        default_limit: int | None = None,
     ) -> dict[str, Any] | None:
         current = self.get_work_queue(queue_id)
         if not current:
@@ -1418,12 +1478,44 @@ class Database:
             raise ValueError("Queue name must contain 1 to 120 characters")
         if max_workers < 1:
             raise ValueError("Queue worker limit must be positive")
+        target_reserved = (
+            int(current["reserved_workers"])
+            if reserved_workers is None
+            else int(reserved_workers)
+        )
+        if target_reserved < 0:
+            raise ValueError("Queue reserved workers cannot be negative")
+        if target_reserved > max_workers:
+            raise ValueError("Queue reserved workers cannot exceed its worker limit")
         try:
             with self.transaction() as connection:
+                effective_limit = limit
+                if effective_limit is None and default_limit is not None:
+                    row = connection.execute(
+                        "SELECT value FROM settings WHERE key = 'max_active_sessions'"
+                    ).fetchone()
+                    effective_limit = int(row["value"]) if row else int(default_limit)
+                if effective_limit is not None:
+                    total = connection.execute(
+                        "SELECT COALESCE(SUM(reserved_workers), 0) FROM work_queues "
+                        "WHERE status = 'active' AND id != ?",
+                        (queue_id,),
+                    ).fetchone()[0]
+                    if int(total) + target_reserved > int(effective_limit):
+                        raise ValueError(
+                            "Total reserved workers cannot exceed the active session limit"
+                        )
                 connection.execute(
                     """UPDATE work_queues SET name = ?, priority = ?, max_workers = ?,
-                       updated_at = ? WHERE id = ?""",
-                    (normalized, int(priority), int(max_workers), utcnow(), queue_id),
+                       reserved_workers = ?, updated_at = ? WHERE id = ?""",
+                    (
+                        normalized,
+                        int(priority),
+                        int(max_workers),
+                        target_reserved,
+                        utcnow(),
+                        queue_id,
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("Queue name already exists") from exc
@@ -2601,6 +2693,20 @@ class Database:
             ).fetchone()[0]
             if int(active) >= limit:
                 return None
+            capacities = connection.execute(
+                """SELECT w.reserved_workers,
+                          (SELECT COUNT(DISTINCT qa.session_id) FROM queue_jobs qa
+                           WHERE qa.queue_id = w.id AND qa.status IN
+                             ('dispatching', 'running', 'waiting_permission', 'cancelling'))
+                          AS active
+                   FROM work_queues w WHERE w.status = 'active'"""
+            ).fetchall()
+            reserved_total = sum(int(row["reserved_workers"]) for row in capacities)
+            protected = sum(
+                min(int(row["active"]), int(row["reserved_workers"])) for row in capacities
+            )
+            shared_active = max(0, int(active) - protected)
+            shared_limit = max(0, int(limit) - reserved_total)
             row = connection.execute(
                 """SELECT q.* FROM queue_jobs q
                    JOIN users u ON u.id = q.effective_user_id
@@ -2612,6 +2718,14 @@ class Database:
                          WHERE qa.queue_id = q.queue_id AND qa.status IN
                            ('dispatching', 'running', 'waiting_permission', 'cancelling')
                        ) < w.max_workers
+                     )
+                     AND (
+                       (
+                         SELECT COUNT(DISTINCT qa.session_id) FROM queue_jobs qa
+                         WHERE qa.queue_id = q.queue_id AND qa.status IN
+                           ('dispatching', 'running', 'waiting_permission', 'cancelling')
+                       ) < w.reserved_workers
+                       OR ? < ?
                      )
                      AND NOT EXISTS (
                        SELECT 1 FROM queue_jobs active
@@ -2640,7 +2754,7 @@ class Database:
                    -- newly queued work, then preserve normal queue priority/FIFO.
                    ORDER BY (q.resume_content IS NOT NULL) DESC,
                             w.priority DESC, q.sequence LIMIT 1""",
-                (per_user_default, per_user_default),
+                (shared_active, shared_limit, per_user_default, per_user_default),
             ).fetchone()
             if not row:
                 return None
@@ -3577,6 +3691,12 @@ class Database:
 
     def set_concurrency_override(self, value: int, admin_id: str) -> None:
         with self.transaction() as connection:
+            reserved_workers = connection.execute(
+                "SELECT COALESCE(SUM(reserved_workers), 0) FROM work_queues "
+                "WHERE status = 'active'"
+            ).fetchone()[0]
+            if int(value) < int(reserved_workers):
+                raise ValueError("Value is lower than total reserved queue workers")
             connection.execute(
                 """INSERT INTO settings(key, value, updated_by, updated_at)
                    VALUES ('max_active_sessions', ?, ?, ?)
@@ -3585,8 +3705,17 @@ class Database:
                 (str(value), admin_id, utcnow()),
             )
 
-    def clear_concurrency_override(self) -> None:
+    def clear_concurrency_override(self, *, minimum_limit: int | None = None) -> None:
         with self.transaction() as connection:
+            if minimum_limit is not None:
+                reserved_workers = connection.execute(
+                    "SELECT COALESCE(SUM(reserved_workers), 0) FROM work_queues "
+                    "WHERE status = 'active'"
+                ).fetchone()[0]
+                if int(minimum_limit) < int(reserved_workers):
+                    raise ValueError(
+                        "Environment limit is lower than total reserved queue workers"
+                    )
             connection.execute("DELETE FROM settings WHERE key = 'max_active_sessions'")
 
     def audit(

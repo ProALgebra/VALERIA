@@ -147,6 +147,11 @@ class WorkQueue(Arguments):
     name: Title
     priority: int = Field(strict=True, ge=-1_000_000, le=1_000_000)
     max_workers: PositiveInt = Field(description="Must not exceed Valeria's configured hard limit.")
+    reserved_workers: int | None = Field(
+        default=None,
+        ge=0,
+        description="Guaranteed subset of max_workers; omit to preserve it on update.",
+    )
 
 
 class UpdateQueue(WorkQueue, QueueId):
@@ -466,7 +471,7 @@ _OPERATION_LIST = (
     ),
     _operation(
         "create_queue",
-        "Create a work queue with priority and worker limit.",
+        "Create a work queue with priority, worker limit, and optional reserved workers.",
         "POST",
         "admin/queues",
         WorkQueue,
@@ -475,7 +480,7 @@ _OPERATION_LIST = (
     ),
     _operation(
         "update_queue",
-        "Set all queue settings: name, priority, and worker limit.",
+        "Set queue settings: name, priority, worker limit, and reserved workers.",
         "PATCH",
         "admin/queues/{queue_id}",
         UpdateQueue,

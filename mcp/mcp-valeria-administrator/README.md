@@ -146,17 +146,19 @@ valeria_admin_create_task(
 
 ```text
 valeria_admin_get_queue()
-valeria_admin_create_queue(name="CI", priority=10, max_workers=2)
+valeria_admin_create_queue(name="CI", priority=10, max_workers=2, reserved_workers=1)
 valeria_admin_set_concurrency(value=3)
 valeria_admin_reset_concurrency()
 valeria_admin_get_statistics(day="2026-11-01", timezone="Europe/Belgrade")
 valeria_admin_stop_job(job_id="<ID задания>")
 ```
 
-При изменении очереди `update_queue` требует все поля: `queue_id`, `name`, `priority`,
-`max_workers`. `archive_queue` архивирует очередь; используемые и системные очереди
-защищены проверками API. `get_queue` показывает текущий лимит, лимит из окружения,
-жёсткий предел, активные задания, очередь ожидания и маршрутизацию обычных чатов.
+При изменении очереди `update_queue` требует `queue_id`, `name`, `priority`, `max_workers`.
+Необязательный `reserved_workers` задаёт гарантированный резерв внутри лимита очереди;
+если его не передать при обновлении, текущий резерв сохраняется. `archive_queue`
+архивирует очередь; используемые и системные очереди защищены проверками API.
+`get_queue` показывает текущий лимит, лимит из окружения, жёсткий предел, активные
+задания, очередь ожидания, резерв и маршрутизацию обычных чатов.
 
 ## Частичные изменения и повторы
 

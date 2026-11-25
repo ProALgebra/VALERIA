@@ -48,13 +48,16 @@ def test_global_queue_stop_actions_and_live_updates():
         elif path == "/api/admin/queue":
             payload = {
                 "jobs": jobs, "limit": 5, "hard_limit": 10, "env_limit": 5,
+                "reserved": 0, "shared_limit": 5,
                 "default_chat_queue_id": "default",
                 "queues": [
                     {"id": "default", "name": "Основная", "priority": 0,
-                     "max_workers": 10, "status": "active", "is_system": 1,
+                     "max_workers": 10, "reserved_workers": 0,
+                     "status": "active", "is_system": 1,
                      "active": 1, "queued": 1},
                     {"id": "urgent", "name": "Срочные", "priority": 100,
-                     "max_workers": 2, "status": "active", "is_system": 0,
+                     "max_workers": 2, "reserved_workers": 0,
+                     "status": "active", "is_system": 0,
                      "active": 2, "queued": 3},
                 ],
                 "active": sum(j["status"] in {
