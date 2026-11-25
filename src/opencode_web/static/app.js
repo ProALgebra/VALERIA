@@ -112,7 +112,13 @@ async function api(path, options = {}) {
   );
   if (!queued) return apiRequest(path, options);
   const body = options.body instanceof FormData
-    ? [options.body.get("message") ?? "", ...options.body.getAll("files").map(file => [file.name, file.size, file.lastModified, file.type])]
+    ? [
+        options.body.get("message") ?? "",
+        options.body.get("agent") ?? "",
+        options.body.get("model") ?? "",
+        options.body.get("model_variant") ?? "",
+        ...options.body.getAll("files").map(file => [file.name, file.size, file.lastModified, file.type]),
+      ]
     : options.body;
   const identity = JSON.stringify([state.me?.id, path, body]);
   let pending = pendingSubmissions.get(identity);
@@ -356,6 +362,7 @@ async function renderDialogs() {
         <div class="field" style="flex:2"><label for="new-chat-model">Модель</label><select class="input" name="model" id="new-chat-model" ${modelsLoading ? "disabled" : ""}>${modelsLoading ? `<option value="">Модели OpenCode загружаются…</option>` : modelOptions(models, initialOptions.default_model)}</select><span class="hint" id="model-load-status" role="status" aria-live="polite">${modelsLoading ? "Интерфейс уже доступен; каталог загрузится отдельно." : `${models.length} моделей доступно`}</span></div></div>
         <div class="field"><label for="template">Шаблон сообщения</label><select class="input" id="template"><option value="">Без шаблона</option>${templates.map(t => `<option value="${t.id}" ${state.draftTemplate?.id === t.id ? "selected" : ""}>${esc(t.title)}</option>`).join("")}</select></div>
         <div class="field"><label for="new-chat-message">Первая задача</label><textarea class="input" id="new-chat-message" name="message" placeholder="Опишите задачу агенту...">${esc(state.draftTemplate?.content || "")}</textarea><span class="hint">Текст шаблона скопирован в черновик и доступен для изменения.</span></div>
+        <div class="field"><label>Файлы</label><label class="file-button"><input id="new-chat-files" name="files" type="file" multiple aria-label="Прикрепить файлы"> Выбрать файлы</label><span class="hint">До 10 файлов, каждый не больше 20 МБ.</span></div>
         <button class="btn btn-primary btn-block" type="submit" ${config.workspace ? "" : "disabled"}>Создать диалог</button>
       </form>
     </div></div>`;
@@ -372,9 +379,18 @@ async function renderDialogs() {
     const button = form.querySelector("button[type=submit]");
     if (button.disabled) return;
     button.disabled = true;
-    const values = Object.fromEntries(new FormData(form));
+    const formData = new FormData(form);
+    const files = formData.getAll("files").filter(file => file.size);
+    const values = Object.fromEntries(formData);
+    delete values.files;
+    let body = JSON.stringify(values);
+    if (files.length) {
+      body = new FormData();
+      for (const [name, value] of Object.entries(values)) body.append(name, value);
+      for (const file of files) body.append("files", file);
+    }
     try {
-      const result = await api("/api/chats", {method: "POST", body: JSON.stringify(values)});
+      const result = await api("/api/chats", {method: "POST", body});
       state.draftTemplate = null;
       notify(result.job ? "Диалог создан, сообщение поставлено в очередь" : "Диалог создан");
       await renderChat(result.chat.id);
@@ -483,6 +499,23 @@ function renderPart(part, role) {
   return `<details class="tool-card"><summary>${esc(part.type || "Часть сообщения")}</summary><pre>${esc(JSON.stringify(part, null, 2))}</pre></details>`;
 }
 
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value < 1024) return `${value || 0} Б`;
+  const units = ["КБ", "МБ", "ГБ"];
+  let size = value;
+  let unit = -1;
+  do { size /= 1024; unit += 1; } while (size >= 1024 && unit < units.length - 1);
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+function messageFiles(item, role) {
+  return role === "assistant" ? (item.artifacts || []) : (item.attachments || []);
+}
+
+function filesHTML(item, role) {
+  return messageFiles(item, role).map(file => `<a class="message-file" href="${esc(file.download_url)}" download><span class="message-file-name">${esc(file.name)}</span><span class="message-file-meta">${esc(formatBytes(file.size_bytes))}</span></a>`).join("");
+}
+
 function renderMessages(messages) {
   if (!messages.length) return `<div class="empty">История пока пуста</div>`;
   return messages.map(item => {
@@ -492,7 +525,8 @@ function renderMessages(messages) {
     const fallback = role === "assistant"
       ? `<div class="message-text markdown-body">${renderMarkdown(messageText(item))}</div>`
       : esc(messageText(item));
-    return `<article class="message ${role === "user" ? "user" : "assistant"}">${parts || fallback}${item.submission_status ? jobBadge(item.submission_status) : ""}${metadata}</article>`;
+    const files = filesHTML(item, role);
+    return `<article class="message ${role === "user" ? "user" : "assistant"}">${parts || fallback}${files ? `<div class="message-files">${files}</div>` : ""}${item.submission_status ? jobBadge(item.submission_status) : ""}${metadata}</article>`;
   }).join("");
 }
 
@@ -629,7 +663,7 @@ async function renderChat(chatId, adminContext = false) {
   const content = `<div class="chat-layout"><section class="chat-main">
     ${adminContext ? `<div class="card" style="margin:12px;border-color:#815f1d;background:#2a210f">Вы просматриваете диалог пользователя. Сообщение будет считаться отправленным владельцем диалога.</div>` : ""}
     <div class="message-scroll"><div class="messages" id="message-list">${renderMessages(messages)}</div><button class="scroll-to-bottom" id="scroll-to-bottom" type="button" aria-label="Прокрутить диалог до конца" title="Прокрутить до конца" hidden>↓</button></div><div id="permission-list">${renderPermissions(permissions)}</div><div id="question-list" aria-label="Вопросы OpenCode"></div>
-    <form class="composer" id="composer"><div class="selectors"><select class="input" name="agent" aria-label="Агент">${options.agents.map(a => `<option value="${esc(a)}" ${a === selectedAgent ? "selected" : ""}>${esc(a)}</option>`).join("")}</select><select class="input" name="model" aria-label="Модель">${modelOptions(models, selectedModel)}</select><span class="badge amber" id="question-waiting" hidden>Ожидает вашего ответа</span><span id="latest-job-status">${latest ? jobBadge(latest.status) : ""}</span></div><div class="composer-row"><textarea class="input" name="message" placeholder="${adminContext ? "Сообщение от имени пользователя..." : "Сообщение агенту..."}" aria-label="${adminContext ? "Сообщение от имени пользователя" : "Сообщение агенту"}" required></textarea><button class="btn btn-primary" type="submit" aria-label="Отправить сообщение">➤</button></div></form>
+    <form class="composer" id="composer"><div class="selectors"><select class="input" name="agent" aria-label="Агент">${options.agents.map(a => `<option value="${esc(a)}" ${a === selectedAgent ? "selected" : ""}>${esc(a)}</option>`).join("")}</select><select class="input" name="model" aria-label="Модель">${modelOptions(models, selectedModel)}</select><span class="badge amber" id="question-waiting" hidden>Ожидает вашего ответа</span><span id="latest-job-status">${latest ? jobBadge(latest.status) : ""}</span></div><div class="composer-row"><textarea class="input" name="message" placeholder="${adminContext ? "Сообщение от имени пользователя..." : "Сообщение агенту..."}" aria-label="${adminContext ? "Сообщение от имени пользователя" : "Сообщение агенту"}" required></textarea><label class="file-button"><input name="files" type="file" multiple aria-label="Прикрепить файлы"> Файлы</label><button class="btn btn-primary" type="submit" aria-label="Отправить сообщение">➤</button></div></form>
   </section><aside class="chat-side"><section><h3>Состояние</h3><span class="badge" id="chat-status">${esc(chatStatusText(chat.status))}</span></section><section><h3>Рабочая папка</h3><div class="mono meta">${esc(chat.workspace_snapshot)}</div></section><section><h3>Очередь этого диалога</h3><div>${jobs.length}</div></section><section><h3>Подключённые MCP</h3><div id="chat-mcp"><span class="hint">Загрузка…</span></div></section><section><h3>Поток событий OpenCode</h3><div id="event-log" class="event-log">${renderEventLog()}</div></section></aside></div>`;
   app.innerHTML = shell(content, chat.title); bindShell();
   updateChatArchive(chat);
@@ -654,9 +688,18 @@ async function renderChat(chatId, adminContext = false) {
     const button = form.querySelector("button[type=submit]");
     if (button.disabled) return;
     button.disabled = true;
-    const values = Object.fromEntries(new FormData(form));
+    const formData = new FormData(form);
+    const files = formData.getAll("files").filter(file => file.size);
+    const values = Object.fromEntries(formData);
+    delete values.files;
+    let body = JSON.stringify(values);
+    if (files.length) {
+      body = new FormData();
+      for (const [name, value] of Object.entries(values)) body.append(name, value);
+      for (const file of files) body.append("files", file);
+    }
     const endpoint = adminContext ? `/api/admin/chats/${chatId}/messages` : `/api/chats/${chatId}/messages`;
-    try { await api(endpoint, {method:"POST", body:JSON.stringify(values)}); form.reset(); notify("Сообщение поставлено в очередь"); await refreshChatLive(chatId); }
+    try { await api(endpoint, {method:"POST", body}); form.reset(); notify("Сообщение поставлено в очередь"); await refreshChatLive(chatId); }
     catch (err) { notify(err.message, "error"); }
     finally { button.disabled = false; }
   });

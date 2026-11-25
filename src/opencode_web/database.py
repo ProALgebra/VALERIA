@@ -2966,6 +2966,36 @@ class Database:
             )
             return True
 
+    def complete_chat_run(self, job_id: str) -> bool:
+        """Complete a dialog job and reveal only artifacts of this answered turn."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                """SELECT q.*, c.kind AS chat_kind
+                   FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+                   WHERE q.id = ?""",
+                (job_id,),
+            ).fetchone()
+            if (
+                not row
+                or row["chat_kind"] != "chat"
+                or row["task_id"]
+                or row["job_kind"] == "vflow_repair"
+                or row["status"] in {"completed", "failed", "cancelled", "cancelling"}
+            ):
+                return False
+            self.set_job_status(job_id, "completed")
+            current = connection.execute(
+                "SELECT status FROM queue_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if not current or current["status"] != "completed":
+                return False
+            connection.execute(
+                """UPDATE consultation_artifacts SET status = 'ready'
+                   WHERE job_id = ? AND status = 'pending'""",
+                (job_id,),
+            )
+            return True
+
     def claim_notification(self) -> dict[str, Any] | None:
         with self.transaction() as connection:
             row = connection.execute(
@@ -3236,10 +3266,23 @@ class Database:
                     )
         return cancelled
 
+    def chat_for_session(self, session_id: str) -> dict[str, Any] | None:
+        return self._one(
+            """SELECT * FROM chats
+               WHERE opencode_session_id = ? AND kind = 'chat'""",
+            (session_id,),
+        )
+
     def consultation_for_session(self, session_id: str) -> dict[str, Any] | None:
         return self._one(
             "SELECT * FROM chats WHERE opencode_session_id = ? AND consultation = 1",
             (session_id,),
+        )
+
+    def chat_jobs(self, chat_id: str) -> list[dict[str, Any]]:
+        return self._all(
+            "SELECT * FROM queue_jobs WHERE chat_id = ? ORDER BY sequence",
+            (chat_id,),
         )
 
     def consultation_jobs(self, chat_id: str) -> list[dict[str, Any]]:
@@ -3317,6 +3360,34 @@ class Database:
                ORDER BY q.sequence DESC"""
         )
 
+    def active_chat_job(self, chat_id: str) -> dict[str, Any] | None:
+        row = self._one(
+            """SELECT q.id FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+               WHERE q.chat_id = ? AND c.kind = 'chat'
+                 AND q.task_id IS NULL
+                 AND COALESCE(q.job_kind, '') != 'vflow_repair'
+                 AND q.status IN ('dispatching', 'running', 'waiting_question',
+                                  'waiting_permission')
+               ORDER BY q.sequence DESC LIMIT 1""",
+            (chat_id,),
+        )
+        return self.get_job(row["id"]) if row else None
+
+    def active_chat_jobs(self) -> list[dict[str, Any]]:
+        return self._all(
+            """SELECT q.id AS job_id, q.chat_id, q.status,
+                      q.session_id AS job_session_id,
+                      c.opencode_session_id, c.workspace_snapshot,
+                      c.title AS chat_title
+               FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
+               WHERE c.kind = 'chat'
+                 AND q.task_id IS NULL
+                 AND COALESCE(q.job_kind, '') != 'vflow_repair'
+                 AND q.status IN ('dispatching', 'running', 'waiting_question',
+                                  'waiting_permission')
+               ORDER BY q.sequence DESC"""
+        )
+
     def create_consultation_artifact(
         self,
         *,
@@ -3334,14 +3405,17 @@ class Database:
     ) -> dict[str, Any]:
         with self.transaction() as connection:
             job = connection.execute(
-                """SELECT q.id, q.status, c.consultation
+                """SELECT q.id, q.status, q.task_id, q.job_kind,
+                          c.kind AS chat_kind
                    FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
                    WHERE q.id = ? AND q.chat_id = ?""",
                 (job_id, chat_id),
             ).fetchone()
             if (
                 not job
-                or not job["consultation"]
+                or job["chat_kind"] != "chat"
+                or job["task_id"]
+                or job["job_kind"] == "vflow_repair"
                 or job["status"] not in {
                     "dispatching", "running", "waiting_question", "waiting_permission",
                 }
@@ -3453,14 +3527,17 @@ class Database:
     ) -> dict[str, Any]:
         with self.transaction() as connection:
             job = connection.execute(
-                """SELECT q.id, q.status, c.consultation
+                """SELECT q.id, q.status, q.task_id, q.job_kind,
+                          c.kind AS chat_kind
                    FROM queue_jobs q JOIN chats c ON c.id = q.chat_id
                    WHERE q.id = ? AND q.chat_id = ?""",
                 (job_id, chat_id),
             ).fetchone()
             if (
                 not job
-                or not job["consultation"]
+                or job["chat_kind"] != "chat"
+                or job["task_id"]
+                or job["job_kind"] == "vflow_repair"
                 or job["status"] not in {
                     "queued", "dispatching", "running", "waiting_question",
                     "waiting_permission",

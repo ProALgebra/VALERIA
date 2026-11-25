@@ -423,7 +423,22 @@ class QueueDispatcher:
                                     job["id"], "failed", "incomplete_response"
                                 )
                         else:
-                            self.database.set_job_status(job["id"], "completed")
+                            if self.artifacts:
+                                try:
+                                    self.artifacts.publish_outbox(
+                                        job["chat_id"], job["id"]
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Cannot publish recovered chat outbox",
+                                        extra={"job_id": job["id"]},
+                                    )
+                            self.database.complete_chat_run(job["id"])
+                            if self.artifacts:
+                                with suppress(Exception):
+                                    self.artifacts.cleanup_staging(
+                                        job["chat_id"], job["id"]
+                                    )
                     elif result == "failed":
                         self.database.set_job_status(job["id"], "failed", "assistant_error")
                         self._discard_consultation_artifacts(job)
@@ -465,7 +480,11 @@ class QueueDispatcher:
             return
 
     def _discard_consultation_artifacts(self, job: dict[str, Any]) -> None:
-        if self.artifacts and job.get("consultation"):
+        if (
+            self.artifacts
+            and not job.get("task_id")
+            and job.get("job_kind") != "vflow_repair"
+        ):
             with suppress(Exception):
                 self.artifacts.cleanup_job(job["id"])
 
@@ -705,30 +724,36 @@ class QueueDispatcher:
                         current = self.database.get_job(job_id)
                         if not current or current["status"] != "dispatching":
                             return
-                        system_prompt = CONSULTATION_SYSTEM
-                        system_prompt = CONSULTATION_SYSTEM
-                        if job.get("consultation") and self.artifacts:
+                        is_dialog = (
+                            not job.get("consultation")
+                            and not job.get("task_id")
+                            and job.get("job_kind") != "vflow_repair"
+                        )
+                        system_prompt = CONSULTATION_SYSTEM if job.get("consultation") else ""
+                        if (job.get("consultation") or is_dialog) and self.artifacts:
                             try:
                                 staging = self.artifacts.prepare_job(job["chat_id"], job_id)
                             except ArtifactError as exc:
                                 logger.warning(
-                                    "Cannot prepare consultation artifact staging",
+                                    "Cannot prepare artifact staging",
                                     extra={"job_id": job_id, "reason": exc.code},
                                 )
                                 raise TaskExecutionError("artifact_staging_unavailable") from exc
-                            system_prompt = (
-                                f"{CONSULTATION_SYSTEM}\n\n"
-                                + CONSULTATION_ARTIFACT_INSTRUCTIONS.format(
-                                    outbox=str(staging.outbox),
-                                    work=str(staging.work),
-                                )
+                            instructions = CONSULTATION_ARTIFACT_INSTRUCTIONS.format(
+                                outbox=str(staging.outbox),
+                                work=str(staging.work),
                             )
-                        if job.get("consultation") and self.attachments:
+                            system_prompt = (
+                                f"{system_prompt}\n\n{instructions}"
+                                if system_prompt
+                                else instructions
+                            )
+                        if (job.get("consultation") or is_dialog) and self.attachments:
                             try:
                                 attached = self.attachments.ensure_inbox(job_id)
                             except AttachmentError as exc:
                                 logger.warning(
-                                    "Cannot prepare consultation attachments",
+                                    "Cannot prepare attachments",
                                     extra={"job_id": job_id, "reason": exc.code},
                                 )
                                 raise TaskExecutionError("attachment_input_unavailable") from exc
@@ -739,8 +764,13 @@ class QueueDispatcher:
                                     )
                                     for item in attached
                                 )
-                                system_prompt += "\n\n" + (
-                                    CONSULTATION_ATTACHMENT_INSTRUCTIONS.format(files=files)
+                                instructions = CONSULTATION_ATTACHMENT_INSTRUCTIONS.format(
+                                    files=files
+                                )
+                                system_prompt = (
+                                    f"{system_prompt}\n\n{instructions}"
+                                    if system_prompt
+                                    else instructions
                                 )
                         try:
                             await client.send_prompt_async(
@@ -753,11 +783,7 @@ class QueueDispatcher:
                                 provider_id=job["provider_id"],
                                 model_id=job["model_id"],
                                 model_variant=job["model_variant"],
-                                **(
-                                    {"system": system_prompt}
-                                    if job.get("consultation")
-                                    else {}
-                                ),
+                                **({"system": system_prompt} if system_prompt else {}),
                             )
                         except OpenCodeSubmissionUncertain:
                             self.database.set_job_status(job_id, "running", "submission_uncertain")
@@ -853,6 +879,7 @@ class QueueDispatcher:
         is_task = bool(job.get("task_id"))
         is_repair = job.get("job_kind") == "vflow_repair"
         is_consultation = bool(job.get("consultation"))
+        is_dialog = not is_task and not is_repair and not is_consultation
         answered: set[str] = set()
         failures: dict[str, int] = {}
         previous_questions: set[str] = set()
@@ -1005,7 +1032,18 @@ class QueueDispatcher:
                     if not answer:
                         raise TaskExecutionError("incomplete_response")
                     self.database.complete_vflow_repair_run(job_id, answer)
-                elif not is_consultation:
-                    self.database.set_job_status(job_id, "completed")
+                elif is_dialog:
+                    if self.artifacts:
+                        try:
+                            self.artifacts.publish_outbox(job["chat_id"], job_id)
+                        except Exception:
+                            logger.exception(
+                                "Cannot publish chat outbox",
+                                extra={"job_id": job_id},
+                            )
+                    self.database.complete_chat_run(job_id)
+                    if self.artifacts:
+                        with suppress(Exception):
+                            self.artifacts.cleanup_staging(job["chat_id"], job_id)
                 return
             await asyncio.sleep(2)

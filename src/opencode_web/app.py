@@ -6,15 +6,17 @@ from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from .artifacts import ConsultationArtifacts
-from .attachments import AttachmentError, ConsultationAttachments
+from .artifacts import ArtifactError, ConsultationArtifacts, public_artifact
+from .attachments import AttachmentError, ConsultationAttachments, public_attachment
 from .backend_switch import database_process_lock
 from .config import ConfigError, Settings
 from .consultations import public_job as public_consultation_job
@@ -714,6 +716,138 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             raise HTTPException(404, "Chat not found")
         return chat
 
+    async def parse_chat_body(
+        request: Request, *, create: bool
+    ) -> tuple[ChatCreateBody | MessageBody, list[UploadFile]]:
+        content_type = request.headers.get("content-type", "").lower()
+        if content_type.startswith("multipart/form-data"):
+            form = await request.form()
+            allowed = {"message", "files", "agent", "model", "model_variant"}
+            if create:
+                allowed.add("template_id")
+            if set(form.keys()) - allowed:
+                raise HTTPException(422, "Недопустимые поля формы")
+            message = form.get("message", "")
+            if not isinstance(message, str):
+                raise HTTPException(422, "Некорректное сообщение")
+            fields: dict[str, Any] = {"message": message}
+            for name in ("agent", "model", "model_variant"):
+                value = form.get(name)
+                if value is not None:
+                    if not isinstance(value, str):
+                        raise HTTPException(422, "Некорректные параметры сообщения")
+                    fields[name] = value
+            if create:
+                template_id = form.get("template_id")
+                if template_id is not None:
+                    if not isinstance(template_id, str):
+                        raise HTTPException(422, "Некорректный шаблон")
+                    fields["template_id"] = template_id
+            files = [
+                item
+                for item in form.getlist("files")
+                if isinstance(item, StarletteUploadFile) and item.filename
+            ]
+            if files and not message.strip():
+                raise HTTPException(422, "Введите сообщение")
+            model = ChatCreateBody if create else MessageBody
+            try:
+                body = model.model_validate(fields)
+            except ValidationError as exc:
+                raise HTTPException(422, "Некорректное сообщение") from exc
+            return body, files
+        try:
+            payload = await request.json()
+            model = ChatCreateBody if create else MessageBody
+            body = model.model_validate(payload)
+        except (ValueError, TypeError, ValidationError) as exc:
+            raise HTTPException(422, "Некорректный запрос") from exc
+        return body, []
+
+    def attachment_http_error(
+        exc: AttachmentError | ArtifactError, *, download: bool = False
+    ) -> HTTPException:
+        if exc.code == "not_found":
+            status_code = 404
+        elif exc.code in {"missing", "not_ready"}:
+            status_code = 410 if download else 409
+        elif exc.code == "inactive_job":
+            status_code = 409
+        elif exc.code in {"file_limit", "total_limit", "too_large"}:
+            status_code = 413
+        elif exc.code in {
+            "invalid_name",
+            "empty_file",
+            "invalid_storage",
+            "unsafe_storage",
+        }:
+            status_code = 422
+        elif exc.code in {"storage_unavailable", "not_initialized"}:
+            status_code = 503
+        else:
+            status_code = 422
+        detail = "Вложение недоступно" if download else "Не удалось принять вложение"
+        return HTTPException(status_code, detail)
+
+    def artifact_http_error(
+        exc: ArtifactError, *, download: bool = False
+    ) -> HTTPException:
+        if exc.code == "not_found":
+            status_code = 404
+        elif exc.code in {"not_ready", "missing"}:
+            status_code = 410 if download else 422
+        elif exc.code == "session_not_found":
+            status_code = 404
+        elif exc.code in {"inactive_job", "inactive_consultation_job"}:
+            status_code = 409
+        elif exc.code == "too_large":
+            status_code = 413
+        elif exc.code in {"staging_unavailable", "storage_unavailable", "not_initialized"}:
+            status_code = 503
+        else:
+            status_code = 422
+        detail = "Артефакт недоступен" if download else "Не удалось опубликовать артефакт"
+        return HTTPException(status_code, detail)
+
+    def decorate_chat_messages(
+        messages: list[dict[str, Any]],
+        jobs: list[dict[str, Any]],
+        attachments_by_job: dict[str, list[dict[str, Any]]],
+        artifacts_by_job: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        by_message = {
+            job.get("message_id"): job for job in jobs if job.get("message_id")
+        }
+        for message in messages:
+            info = message.get("info", message)
+            job = by_message.get(info.get("id"))
+            if not job or info.get("role") != "user":
+                continue
+            attachments = attachments_by_job.get(job["id"])
+            if attachments:
+                message["attachments"] = attachments
+        for job in jobs:
+            artifacts = artifacts_by_job.get(job["id"])
+            if not artifacts:
+                continue
+            target = None
+            after_turn = False
+            for message in messages:
+                info = message.get("info", message)
+                if info.get("id") == job["message_id"]:
+                    after_turn = True
+                    continue
+                if not after_turn:
+                    continue
+                role = info.get("role")
+                if role == "user":
+                    break
+                if role == "assistant":
+                    target = message
+            if target is not None:
+                target["artifacts"] = artifacts
+        return messages
+
     def apply_opencode_title(
         db: Database, chat: dict[str, Any], session: dict[str, Any] | None
     ) -> dict[str, Any]:
@@ -1370,27 +1504,51 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
 
     @app.post("/api/chats", status_code=201)
     async def create_chat(
-        body: ChatCreateBody,
         request: Request,
         principal: Annotated[dict[str, Any], Depends(csrf_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
+        body, files = await parse_chat_body(request, create=True)
         user = principal["user"]
         if not user["workspace_path"]:
             raise HTTPException(422, "No workspace assigned")
         agent, provider_id, model_id = validate_agent_model(settings, body.agent, body.model)
-        with submission(db, request, user, body) as result:
-            if result:
-                return result
-            chat = db.create_chat(
-                user["id"], None, "Новый диалог", user["workspace_path"],
-                preferred_agent=agent,
-                preferred_provider_id=provider_id,
-                preferred_model_id=model_id,
-                preferred_model_variant=body.model_variant,
-            )
-            job = enqueue(db, settings, chat, user["id"], body)
-            result.update({"chat": db.get_chat(chat["id"]), "job": job})
+        service = request.app.state.attachments
+        if files and service is None:
+            raise HTTPException(503, "Загрузка вложений недоступна")
+        spooled = []
+        if files:
+            try:
+                spooled = await service.spool(files)
+            except (AttachmentError, ArtifactError) as exc:
+                raise attachment_http_error(exc) from exc
+        try:
+            with submission(
+                db, request, user, body,
+                extra=service.fingerprints(spooled) if spooled else None,
+            ) as result:
+                if result:
+                    return result
+                chat = db.create_chat(
+                    user["id"], None, "Новый диалог", user["workspace_path"],
+                    preferred_agent=agent,
+                    preferred_provider_id=provider_id,
+                    preferred_model_id=model_id,
+                    preferred_model_variant=body.model_variant,
+                )
+                job = enqueue(db, settings, chat, user["id"], body)
+                if job and spooled:
+                    try:
+                        service.attach_job(chat["id"], job["id"], spooled)
+                    except (AttachmentError, ArtifactError) as exc:
+                        db.set_job_status(job["id"], "failed", "attachment_input_unavailable")
+                        raise attachment_http_error(exc) from exc
+                result.update({"chat": db.get_chat(chat["id"]), "job": job})
+        finally:
+            if service is not None:
+                service.discard_spooled(spooled)
+        if result.get("job"):
+            request.app.state.dispatcher.wake()
         return result
 
     @app.get("/api/chats/{chat_id}")
@@ -1411,18 +1569,110 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
         db: Annotated[Database, Depends(database)],
     ) -> list[dict[str, Any]]:
         chat = owned_chat(db, principal, chat_id)
+        jobs = db.chat_jobs(chat_id)
+        attachments_by_job: dict[str, list[dict[str, Any]]] = {}
+        for attachment in db.consultation_attachments_for_chat(chat_id):
+            attachments_by_job.setdefault(attachment["job_id"], []).append(
+                public_attachment(attachment, download_base="/api/chats")
+            )
+        artifacts_by_job: dict[str, list[dict[str, Any]]] = {}
+        for artifact in db.consultation_artifacts_for_chat(chat_id):
+            artifacts_by_job.setdefault(artifact["job_id"], []).append(
+                public_artifact(artifact, download_base="/api/chats")
+            )
+
+        def decorated(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return decorate_chat_messages(
+                messages, jobs, attachments_by_job, artifacts_by_job
+            )
+
         pending = db.chat_submission_messages(chat_id)
         if not db.can_use_chat_backend(chat):
-            return db.saved_chat_history(chat_id) or pending
+            return decorated(db.saved_chat_history(chat_id) or pending)
         if chat["opencode_session_id"].startswith("pending_"):
-            return pending
+            return decorated(pending)
         try:
             client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
             messages = safe_messages(await client.messages(chat["opencode_session_id"]))
         except OpenCodeError as exc:
             raise HTTPException(503, "OpenCode is unavailable") from exc
         ids = {message.get("info", message).get("id") for message in messages}
-        return messages + [message for message in pending if message["info"]["id"] not in ids]
+        merged = messages + [
+            message for message in pending if message["info"]["id"] not in ids
+        ]
+        return decorated(merged)
+
+    @app.get("/api/chats/{chat_id}/attachments/{attachment_id}")
+    async def download_chat_attachment(
+        chat_id: str,
+        attachment_id: str,
+        request: Request,
+        principal: Annotated[dict[str, Any], Depends(current_principal)],
+        db: Annotated[Database, Depends(database)],
+    ):
+        admin = principal["user"].get("role") == "admin"
+        chat = owned_chat(db, principal, chat_id)
+        service = request.app.state.attachments
+        if service is None:
+            raise HTTPException(503, "Вложения диалогов недоступны")
+        try:
+            path, attachment = service.download_path(chat_id, attachment_id)
+        except AttachmentError as exc:
+            raise attachment_http_error(exc, download=True) from exc
+        if admin:
+            db.audit(
+                principal["user"]["id"],
+                "chat.attachment.download",
+                effective_user_id=chat["owner_user_id"],
+                object_type="chat_attachment",
+                object_id=attachment_id,
+            )
+        filename = quote(attachment["original_name"], safe="")
+        return FileResponse(
+            path,
+            media_type=attachment["content_type"],
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
+
+    @app.get("/api/chats/{chat_id}/artifacts/{artifact_id}")
+    async def download_chat_artifact(
+        chat_id: str,
+        artifact_id: str,
+        request: Request,
+        principal: Annotated[dict[str, Any], Depends(current_principal)],
+        db: Annotated[Database, Depends(database)],
+    ):
+        admin = principal["user"].get("role") == "admin"
+        chat = owned_chat(db, principal, chat_id)
+        service = request.app.state.artifacts
+        if service is None:
+            raise HTTPException(503, "Артефакты диалогов недоступны")
+        try:
+            path, artifact = service.download_path(chat_id, artifact_id)
+        except ArtifactError as exc:
+            raise artifact_http_error(exc, download=True) from exc
+        if admin:
+            db.audit(
+                principal["user"]["id"],
+                "chat.artifact.download",
+                effective_user_id=chat["owner_user_id"],
+                object_type="chat_artifact",
+                object_id=artifact_id,
+            )
+        filename = quote(artifact["original_name"], safe="")
+        return FileResponse(
+            path,
+            media_type=artifact["content_type"],
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
 
     @app.get("/api/chats/{chat_id}/questions")
     async def chat_questions(
@@ -1545,15 +1795,41 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     @app.post("/api/chats/{chat_id}/messages", status_code=202)
     async def send_message(
         chat_id: str,
-        body: MessageBody,
         request: Request,
         principal: Annotated[dict[str, Any], Depends(csrf_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
         chat = owned_chat(db, principal, chat_id)
-        with submission(db, request, principal["user"], body) as result:
-            if not result:
-                result.update(enqueue(db, settings, chat, principal["user"]["id"], body) or {})
+        body, files = await parse_chat_body(request, create=False)
+        service = request.app.state.attachments
+        if files and service is None:
+            raise HTTPException(503, "Загрузка вложений недоступна")
+        spooled = []
+        if files:
+            try:
+                spooled = await service.spool(files)
+            except (AttachmentError, ArtifactError) as exc:
+                raise attachment_http_error(exc) from exc
+        try:
+            with submission(
+                db, request, principal["user"], body,
+                extra=service.fingerprints(spooled) if spooled else None,
+            ) as result:
+                if result:
+                    return result
+                job = enqueue(db, settings, chat, principal["user"]["id"], body)
+                if job and spooled:
+                    try:
+                        service.attach_job(chat_id, job["id"], spooled)
+                    except (AttachmentError, ArtifactError) as exc:
+                        db.set_job_status(job["id"], "failed", "attachment_input_unavailable")
+                        raise attachment_http_error(exc) from exc
+                result.update(job or {})
+        finally:
+            if service is not None:
+                service.discard_spooled(spooled)
+        if result:
+            request.app.state.dispatcher.wake()
         return result
 
     @app.get("/api/queue/me")
@@ -1875,22 +2151,46 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     @app.post("/api/admin/chats/{chat_id}/messages", status_code=202)
     async def admin_impersonated_message(
         chat_id: str,
-        body: MessageBody,
         request: Request,
         principal: Annotated[dict[str, Any], Depends(admin_principal)],
         db: Annotated[Database, Depends(database)],
     ) -> dict[str, Any]:
         chat = owned_chat(db, principal, chat_id)
-        with submission(db, request, principal["user"], body) as result:
-            if result:
-                return result
-            job = enqueue(db, settings, chat, principal["user"]["id"], body)
-            db.audit(
-                principal["user"]["id"], "message.impersonated",
-                effective_user_id=chat["owner_user_id"], object_type="job",
-                object_id=job["id"] if job else None, metadata={"chat_id": chat_id},
-            )
-            result.update(job or {})
+        body, files = await parse_chat_body(request, create=False)
+        service = request.app.state.attachments
+        if files and service is None:
+            raise HTTPException(503, "Загрузка вложений недоступна")
+        spooled = []
+        if files:
+            try:
+                spooled = await service.spool(files)
+            except (AttachmentError, ArtifactError) as exc:
+                raise attachment_http_error(exc) from exc
+        try:
+            with submission(
+                db, request, principal["user"], body,
+                extra=service.fingerprints(spooled) if spooled else None,
+            ) as result:
+                if result:
+                    return result
+                job = enqueue(db, settings, chat, principal["user"]["id"], body)
+                if job and spooled:
+                    try:
+                        service.attach_job(chat_id, job["id"], spooled)
+                    except (AttachmentError, ArtifactError) as exc:
+                        db.set_job_status(job["id"], "failed", "attachment_input_unavailable")
+                        raise attachment_http_error(exc) from exc
+                db.audit(
+                    principal["user"]["id"], "message.impersonated",
+                    effective_user_id=chat["owner_user_id"], object_type="job",
+                    object_id=job["id"] if job else None, metadata={"chat_id": chat_id},
+                )
+                result.update(job or {})
+        finally:
+            if service is not None:
+                service.discard_spooled(spooled)
+        if result:
+            request.app.state.dispatcher.wake()
         return result
 
     @app.post("/api/admin/jobs/{job_id}/stop", status_code=202)

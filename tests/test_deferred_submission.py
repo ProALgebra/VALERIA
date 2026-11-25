@@ -147,7 +147,12 @@ async def test_worker_creates_session_after_claim_and_restart(accepted, kind):
         assert client.send_prompt_async.await_args.kwargs["agent"] == "build"
     else:
         assert "permission" not in client.create_session.await_args.kwargs
-        assert "system" not in client.send_prompt_async.await_args.kwargs
+        if kind == "chat":
+            # Dialogs receive artifact instructions so the agent can publish
+            # files produced during the conversation.
+            assert "outbox" in client.send_prompt_async.await_args.kwargs["system"]
+        else:
+            assert "system" not in client.send_prompt_async.await_args.kwargs
     if kind == "task":
         assert client.create_session.await_args.kwargs["title"] == "Question"
 

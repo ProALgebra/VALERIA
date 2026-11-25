@@ -42,14 +42,16 @@ class SpooledAttachment:
     sha256: str
 
 
-def public_attachment(attachment: dict[str, Any]) -> dict[str, Any]:
+def public_attachment(
+    attachment: dict[str, Any], *, download_base: str = "/api/consultations"
+) -> dict[str, Any]:
     return {
         "id": attachment["id"],
         "name": attachment["original_name"],
         "content_type": attachment["content_type"],
         "size_bytes": attachment["size_bytes"],
         "download_url": (
-            f"/api/consultations/{attachment['chat_id']}/attachments/"
+            f"{download_base}/{attachment['chat_id']}/attachments/"
             f"{attachment['id']}"
         ),
     }
@@ -269,8 +271,13 @@ class ConsultationAttachments:
 
     def ensure_inbox(self, job_id: str) -> list[dict[str, Any]]:
         job = self.database.get_job(job_id)
-        if not job or not job.get("consultation"):
-            raise AttachmentError("inactive_job", "Задание консультации не найдено")
+        chat = (
+            self.database.get_chat(job["chat_id"])
+            if job and not job.get("task_id") and job.get("job_kind") != "vflow_repair"
+            else None
+        )
+        if not job or not chat or chat.get("kind") != "chat":
+            raise AttachmentError("inactive_job", "Задание диалога не найдено")
         chat_id = job["chat_id"]
         paths = self.artifacts.prepare_job(chat_id, job_id)
         rows = self.database.consultation_attachments_for_chat(chat_id, job_id=job_id)

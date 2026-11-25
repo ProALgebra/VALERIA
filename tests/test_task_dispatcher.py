@@ -80,6 +80,10 @@ class TaskQueue:
         self.set_job_status(job_id, "completed")
         self.job["result"] = answer
 
+    def complete_chat_run(self, job_id: str) -> bool:
+        self.set_job_status(job_id, "completed")
+        return True
+
 
 class TaskClient:
     def __init__(self) -> None:

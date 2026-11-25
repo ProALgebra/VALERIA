@@ -76,7 +76,9 @@ class StagingPaths:
     inbox: Path
 
 
-def public_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+def public_artifact(
+    artifact: dict[str, Any], *, download_base: str = "/api/consultations"
+) -> dict[str, Any]:
     """Expose only browser-safe metadata; never storage paths or hashes."""
     return {
         "id": artifact["id"],
@@ -86,7 +88,7 @@ def public_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "description": artifact.get("description"),
         "status": artifact["status"],
         "download_url": (
-            f"/api/consultations/{artifact['chat_id']}/artifacts/{artifact['id']}"
+            f"{download_base}/{artifact['chat_id']}/artifacts/{artifact['id']}"
         ),
     }
 
@@ -276,10 +278,10 @@ class ConsultationArtifacts:
     ) -> dict[str, Any]:
         chat = await self._resolve_session(session_id)
         if not chat:
-            raise ArtifactError("session_not_found", "Consultation session was not found")
-        job = self.database.active_consultation_job(chat["id"])
+            raise ArtifactError("session_not_found", "Chat session was not found")
+        job = self.database.active_chat_job(chat["id"])
         if not job:
-            raise ArtifactError("inactive_job", "Consultation has no active question")
+            raise ArtifactError("inactive_job", "Chat has no active job")
         if (path is None) == (text is None):
             raise ArtifactError("invalid_source", "Provide exactly one of path or text")
         if text is not None:
@@ -301,12 +303,12 @@ class ConsultationArtifacts:
         )
 
     async def _resolve_session(self, session_id: str) -> dict[str, Any] | None:
-        direct = self.database.consultation_for_session(session_id)
+        direct = self.database.chat_for_session(session_id)
         if direct:
             return direct
         if not session_id or self.manager is None:
             return None
-        active = self.database.active_consultation_jobs()
+        active = self.database.active_chat_jobs()
         by_session = {
             row["opencode_session_id"]: row for row in active if row.get("opencode_session_id")
         }
@@ -448,13 +450,16 @@ class ConsultationArtifacts:
 
     def _active_job(self, chat_id: str, job_id: str) -> dict[str, Any]:
         job = self.database.get_job(job_id)
+        chat = self.database.get_chat(chat_id) if job and job["chat_id"] == chat_id else None
         if (
             not job
-            or job["chat_id"] != chat_id
-            or not job.get("consultation")
+            or not chat
+            or chat.get("kind") != "chat"
+            or job.get("task_id")
+            or job.get("job_kind") == "vflow_repair"
             or job["status"] not in ACTIVE_JOB_STATUSES
         ):
-            raise ArtifactError("inactive_job", "Consultation has no active question")
+            raise ArtifactError("inactive_job", "Chat has no active job")
         return job
 
     def _store(

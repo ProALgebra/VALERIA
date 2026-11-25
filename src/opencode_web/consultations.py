@@ -496,8 +496,14 @@ def register_consultations(
             )
         except ArtifactError as exc:
             raise artifact_http_error(exc) from exc
+        chat = service.database.get_chat(artifact["chat_id"])
+        download_base = (
+            "/api/consultations"
+            if chat and chat.get("consultation")
+            else "/api/chats"
+        )
         return {
-            **public_artifact(artifact),
+            **public_artifact(artifact, download_base=download_base),
             "chat_id": artifact["chat_id"],
             "job_id": artifact["job_id"],
         }
