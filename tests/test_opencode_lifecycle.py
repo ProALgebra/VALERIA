@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -32,9 +33,10 @@ async def wait_dead(pid: int) -> None:
 @pytest.fixture
 def process_manager(settings, tmp_path):
     executable = tmp_path / "fake-opencode"
-    # A real subprocess tree: the child deliberately ignores graceful shutdown.
-    executable.write_text(
-        f"#!{sys.executable}\n"
+    payload = tmp_path / "fake-opencode.py"
+    # The kernel cannot parse a shebang whose interpreter path contains spaces.
+    # A tiny POSIX wrapper keeps the fixture independent of the project path.
+    payload.write_text(
         "import json, os, signal, subprocess, sys, time\n"
         "from pathlib import Path\n"
         "child = subprocess.Popen([sys.executable, '-u', '-c', "
@@ -43,6 +45,10 @@ def process_manager(settings, tmp_path):
         "child.stdout.readline()\n"
         "Path('processes.json').write_text(json.dumps([os.getpid(), child.pid]))\n"
         "time.sleep(300)\n"
+    )
+    executable.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(payload))}\n"
     )
     executable.chmod(0o700)
     manager = OpenCodeManager(replace(settings, opencode_bin=executable))
