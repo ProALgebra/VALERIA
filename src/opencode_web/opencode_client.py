@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
 import signal
 import socket
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -48,6 +49,8 @@ class OpenCodeInstance:
 
 class WorkspaceClient(SessionCreation):
     """Resolve and lease the live client for every call, including after idle-stop."""
+
+    supports_phase = True
 
     def __init__(self, manager: OpenCodeManager, workspace: str):
         self.manager = manager
@@ -117,6 +120,7 @@ class WorkspaceClient(SessionCreation):
         model_id: str | None,
         model_variant: str | None,
         system: str | None = None,
+        phase: str | None = None,
     ) -> None:
         async with self.manager.use(self.workspace) as client:
             return await client.send_prompt_async(
@@ -128,6 +132,7 @@ class WorkspaceClient(SessionCreation):
                 model_id=model_id,
                 model_variant=model_variant,
                 system=system,
+                phase=phase,
             )
 
     async def abort(self, session_id: str) -> bool:
@@ -179,9 +184,12 @@ class OpenCodeManager:
         self,
         settings: Settings,
         event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        *,
+        state_store: Any = None,
     ):
         self.settings = settings
         self.event_sink = event_sink
+        self._state_store = state_store
         self._instances: dict[str, OpenCodeInstance] = {}
         self._lock = asyncio.Lock()
         self._closing = False
@@ -191,16 +199,24 @@ class OpenCodeManager:
 
     def _free_port(self) -> int:
         used = {instance.port for instance in self._instances.values()}
-        for port in range(self.settings.opencode_port_start, self.settings.opencode_port_end + 1):
+        if self.settings.opencode_api_version == "hermes":
+            host = self.settings.hermes_host
+            start = self.settings.hermes_port_start
+            end = self.settings.hermes_port_end
+        else:
+            host = self.settings.opencode_host
+            start = self.settings.opencode_port_start
+            end = self.settings.opencode_port_end
+        for port in range(start, end + 1):
             if port in used:
                 continue
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 try:
-                    sock.bind((self.settings.opencode_host, port))
+                    sock.bind((host, port))
                 except OSError:
                     continue
             return port
-        raise OpenCodeError("No free port in OPENCODE_PORT_RANGE")
+        raise OpenCodeError("No free backend port in the configured range")
 
     async def ensure(
         self,
@@ -253,6 +269,16 @@ class OpenCodeManager:
         instance.activity_version += 1
         instance.idle_since = None
 
+    def _start_timeout(self) -> int:
+        if self.settings.opencode_api_version == "hermes":
+            return self.settings.hermes_start_timeout
+        return self.settings.opencode_start_timeout
+
+    def _idle_timeout(self) -> int:
+        if self.settings.opencode_api_version == "hermes":
+            return self.settings.hermes_idle_timeout_seconds
+        return self.settings.opencode_idle_timeout_seconds
+
     async def _ensure_client(
         self,
         workspace_raw: str,
@@ -273,62 +299,111 @@ class OpenCodeManager:
 
             if not existing:
                 starter = True
-                if not self.settings.opencode_bin.exists():
-                    raise OpenCodeError(f"OpenCode binary not found: {self.settings.opencode_bin}")
                 port = self._free_port()
-                username = (
-                    "opencode"
-                    if self.settings.opencode_api_version == "v2"
-                    else self.settings.opencode_username
-                )
-                password = self.settings.opencode_password
-                client_host = self.settings.opencode_host
                 environment = os.environ.copy()
-                environment["OPENCODE_SERVER_USERNAME"] = username
-                if password:
-                    environment["OPENCODE_SERVER_PASSWORD"] = password
-                if self.settings.opencode_api_version == "v2":
-                    environment.pop("OPENCODE_SERVER_USERNAME", None)
-                    environment["OPENCODE_PASSWORD"] = password
-                    state = self.settings.opencode_v2_state_root.expanduser().resolve()
-                    state = state / hashlib.sha256(str(workspace).encode()).hexdigest()
-                    for variable, directory in (
-                        ("XDG_DATA_HOME", "data"),
-                        ("XDG_STATE_HOME", "state"),
-                        ("XDG_CACHE_HOME", "cache"),
-                        ("XDG_CONFIG_HOME", "config"),
-                    ):
-                        path = state / directory
-                        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        environment[variable] = str(path)
-                    # Do not inherit a V1 global config containing V1 plugins.
-                    environment.pop("OPENCODE_CONFIG", None)
-                    environment.pop("OPENCODE_CONFIG_CONTENT", None)
-                    environment.pop("OPENCODE_CONFIG_DIR", None)
-                    if self.settings.opencode_v2_config_dir:
-                        environment["OPENCODE_CONFIG"] = str(
-                            self.settings.opencode_v2_config_dir.resolve() / "opencode.jsonc"
+                if self.settings.opencode_api_version == "hermes":
+                    if not self.settings.hermes_bin.exists():
+                        raise OpenCodeError(
+                            f"Hermes binary not found: {self.settings.hermes_bin}"
                         )
-                process = await asyncio.create_subprocess_exec(
-                    str(self.settings.opencode_bin),
-                    "serve",
-                    "--hostname",
-                    self.settings.opencode_host,
-                    "--port",
-                    str(port),
-                    cwd=workspace,
-                    env=environment,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    start_new_session=os.name == "posix",
-                )
-                client = create_backend(
-                    f"http://{client_host}:{port}",
-                    username,
-                    password,
-                    api_version=self.settings.opencode_api_version,
-                    workspace=key,
-                )
+                    client_host = self.settings.hermes_host
+                    state = self.settings.hermes_state_root.expanduser().resolve()
+                    state = state / hashlib.sha256(str(workspace).encode()).hexdigest()
+                    state_existed = state.is_dir()
+                    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    if (
+                        (not state_existed or not any(state.iterdir()))
+                        and self.settings.hermes_home_template
+                    ):
+                        shutil.copytree(
+                            self.settings.hermes_home_template.expanduser().resolve(),
+                            state,
+                            dirs_exist_ok=True,
+                        )
+                    environment["HERMES_HOME"] = str(state)
+                    environment["API_SERVER_ENABLED"] = "true"
+                    environment["API_SERVER_HOST"] = client_host
+                    environment["API_SERVER_PORT"] = str(port)
+                    environment["API_SERVER_KEY"] = self.settings.hermes_api_key
+                    environment["API_SERVER_MODEL_NAME"] = self.settings.hermes_model_name
+                    process = await asyncio.create_subprocess_exec(
+                        str(self.settings.hermes_bin),
+                        "gateway",
+                        "run",
+                        cwd=workspace,
+                        env=environment,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        start_new_session=os.name == "posix",
+                    )
+                    client = create_backend(
+                        f"http://{client_host}:{port}",
+                        "",
+                        "",
+                        api_version="hermes",
+                        workspace=key,
+                        api_key=self.settings.hermes_api_key,
+                        state_store=self._state_store,
+                        source=self.settings.hermes_source,
+                        model_name=self.settings.hermes_model_name,
+                    )
+                else:
+                    if not self.settings.opencode_bin.exists():
+                        raise OpenCodeError(
+                            f"OpenCode binary not found: {self.settings.opencode_bin}"
+                        )
+                    username = (
+                        "opencode"
+                        if self.settings.opencode_api_version == "v2"
+                        else self.settings.opencode_username
+                    )
+                    password = self.settings.opencode_password
+                    client_host = self.settings.opencode_host
+                    environment["OPENCODE_SERVER_USERNAME"] = username
+                    if password:
+                        environment["OPENCODE_SERVER_PASSWORD"] = password
+                    if self.settings.opencode_api_version == "v2":
+                        environment.pop("OPENCODE_SERVER_USERNAME", None)
+                        environment["OPENCODE_PASSWORD"] = password
+                        state = self.settings.opencode_v2_state_root.expanduser().resolve()
+                        state = state / hashlib.sha256(str(workspace).encode()).hexdigest()
+                        for variable, directory in (
+                            ("XDG_DATA_HOME", "data"),
+                            ("XDG_STATE_HOME", "state"),
+                            ("XDG_CACHE_HOME", "cache"),
+                            ("XDG_CONFIG_HOME", "config"),
+                        ):
+                            path = state / directory
+                            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+                            environment[variable] = str(path)
+                        # Do not inherit a V1 global config containing V1 plugins.
+                        environment.pop("OPENCODE_CONFIG", None)
+                        environment.pop("OPENCODE_CONFIG_CONTENT", None)
+                        environment.pop("OPENCODE_CONFIG_DIR", None)
+                        if self.settings.opencode_v2_config_dir:
+                            environment["OPENCODE_CONFIG"] = str(
+                                self.settings.opencode_v2_config_dir.resolve() / "opencode.jsonc"
+                            )
+                    process = await asyncio.create_subprocess_exec(
+                        str(self.settings.opencode_bin),
+                        "serve",
+                        "--hostname",
+                        self.settings.opencode_host,
+                        "--port",
+                        str(port),
+                        cwd=workspace,
+                        env=environment,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        start_new_session=os.name == "posix",
+                    )
+                    client = create_backend(
+                        f"http://{client_host}:{port}",
+                        username,
+                        password,
+                        api_version=self.settings.opencode_api_version,
+                        workspace=key,
+                    )
                 instance = OpenCodeInstance(
                     workspace,
                     port,
@@ -340,9 +415,9 @@ class OpenCodeManager:
 
         if not starter:
             try:
-                await asyncio.wait_for(instance.ready.wait(), self.settings.opencode_start_timeout)
+                await asyncio.wait_for(instance.ready.wait(), self._start_timeout())
             except TimeoutError as exc:
-                raise OpenCodeError("Timed out while waiting for OpenCode startup") from exc
+                raise OpenCodeError("Timed out while waiting for backend startup") from exc
             if instance.startup_error:
                 raise OpenCodeError(instance.startup_error)
             if instance.process.returncode is not None:
@@ -360,10 +435,10 @@ class OpenCodeManager:
     async def _start_instance(self, instance: OpenCodeInstance) -> OpenCodeBackend:
         process, client, workspace = instance.process, instance.client, instance.workspace
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.settings.opencode_start_timeout
+        deadline = loop.time() + self._start_timeout()
         while loop.time() < deadline:
             if process.returncode is not None:
-                raise OpenCodeError(f"OpenCode exited with code {process.returncode}")
+                raise OpenCodeError(f"Backend exited with code {process.returncode}")
             try:
                 remaining = deadline - loop.time()
                 await asyncio.wait_for(client.health(), timeout=min(5.0, remaining))
@@ -424,19 +499,19 @@ class OpenCodeManager:
 
     def start_idle_reaper(self, has_pending_jobs: Callable[[str], bool]) -> None:
         self._has_pending_jobs = has_pending_jobs
-        if self.settings.opencode_idle_timeout_seconds and self._idle_task is None:
-            self._idle_task = asyncio.create_task(self._reap_loop(), name="opencode-idle-reaper")
+        if self._idle_timeout() and self._idle_task is None:
+            self._idle_task = asyncio.create_task(self._reap_loop(), name="backend-idle-reaper")
 
     async def _reap_loop(self) -> None:
         while True:
-            await asyncio.sleep(min(60, self.settings.opencode_idle_timeout_seconds))
+            await asyncio.sleep(min(60, self._idle_timeout()))
             try:
                 await self.reap_idle()
             except Exception:
                 logger.exception("OpenCode idle inspection failed; keeping processes alive")
 
     async def reap_idle(self) -> None:
-        if not self.settings.opencode_idle_timeout_seconds or self._has_pending_jobs is None:
+        if not self._idle_timeout() or self._has_pending_jobs is None:
             return
         await asyncio.gather(*(self._reap_instance(item) for item in self.instances()))
 
@@ -489,7 +564,7 @@ class OpenCodeManager:
                 now = monotonic()
                 if instance.idle_since is None:
                     instance.idle_since = now
-                elif now - instance.idle_since >= self.settings.opencode_idle_timeout_seconds:
+                elif now - instance.idle_since >= self._idle_timeout():
                     # Final check + removal share the lock used by request leases/startup.
                     self._instances.pop(key)
                     await self._stop_instance(instance)

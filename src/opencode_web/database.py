@@ -72,7 +72,7 @@ def validate_task_output_fields(
 
 
 class BackendVersionChangedError(RuntimeError):
-    """An archived session must not be submitted to another OpenCode version."""
+    """An archived session must not be submitted to another backend."""
 
 
 MATTERMOST_USER_ID_RE = re.compile(r"^[a-z0-9]{26}$")
@@ -615,6 +615,38 @@ ON json_repair_attempts(job_id, attempt_no);
 
 CREATE INDEX IF NOT EXISTS idx_json_repair_attempts_created
 ON json_repair_attempts(created_at);
+
+CREATE TABLE IF NOT EXISTS hermes_run_bindings (
+    message_id TEXT PRIMARY KEY,
+    job_id TEXT,
+    session_id TEXT NOT NULL,
+    run_id TEXT UNIQUE,
+    ordinal INTEGER NOT NULL,
+    phase TEXT,
+    status TEXT NOT NULL DEFAULT 'started',
+    content TEXT NOT NULL DEFAULT '',
+    admission_id TEXT,
+    execution_generation INTEGER,
+    output TEXT,
+    request_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hermes_bindings_session
+ON hermes_run_bindings(session_id, ordinal);
+
+CREATE INDEX IF NOT EXISTS idx_hermes_bindings_status
+ON hermes_run_bindings(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS hermes_session_meta (
+    session_id TEXT PRIMARY KEY,
+    workspace TEXT NOT NULL,
+    title TEXT,
+    permission_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -637,6 +669,16 @@ class Database:
                    VALUES (?, 'Основная', 0, NULL, 'active', 1, ?, ?)""",
                 (DEFAULT_QUEUE_ID, now, now),
             )
+            hermes_columns = {
+                row[1]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(hermes_run_bindings)"
+                ).fetchall()
+            }
+            if "request_json" not in hermes_columns:
+                self._connection.execute(
+                    "ALTER TABLE hermes_run_bindings ADD COLUMN request_json TEXT"
+                )
             work_queue_columns = {
                 row[1]
                 for row in self._connection.execute("PRAGMA table_info(work_queues)").fetchall()
@@ -2032,7 +2074,7 @@ class Database:
             if not chat:
                 raise ValueError("Диалог не найден")
             if not self.can_use_chat_backend(chat):
-                raise BackendVersionChangedError("Диалог архивирован после смены версии OpenCode")
+                raise BackendVersionChangedError("Диалог архивирован после смены движка")
             if max_queued is not None and connection.execute(
                 "SELECT COUNT(*) FROM queue_jobs WHERE status = 'queued'"
             ).fetchone()[0] >= max_queued:
@@ -3664,6 +3706,175 @@ class Database:
                 (key, queue_id, admin_id, utcnow()),
             )
 
+    def save_hermes_binding(
+        self,
+        *,
+        message_id: str,
+        job_id: str | None,
+        session_id: str,
+        content: str,
+        phase: str | None = None,
+        run_id: str | None = None,
+        status: str = "started",
+        admission_id: str | None = None,
+        execution_generation: int | None = None,
+        output: str | None = None,
+        request_json: str | None = None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT ordinal FROM hermes_run_bindings WHERE message_id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                ordinal = int(
+                    connection.execute(
+                        """SELECT COALESCE(MAX(ordinal), 0) + 1
+                           FROM hermes_run_bindings WHERE session_id = ?""",
+                        (session_id,),
+                    ).fetchone()[0]
+                )
+            else:
+                ordinal = int(row["ordinal"])
+            connection.execute(
+                """INSERT INTO hermes_run_bindings
+                   (message_id, job_id, session_id, run_id, ordinal, phase, status,
+                    content, admission_id, execution_generation, output, request_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(message_id) DO UPDATE SET
+                     job_id = COALESCE(excluded.job_id, hermes_run_bindings.job_id),
+                     session_id = excluded.session_id,
+                     run_id = COALESCE(excluded.run_id, hermes_run_bindings.run_id),
+                     phase = COALESCE(excluded.phase, hermes_run_bindings.phase),
+                     status = excluded.status,
+                     content = excluded.content,
+                     admission_id = COALESCE(
+                       excluded.admission_id, hermes_run_bindings.admission_id
+                     ),
+                     execution_generation = COALESCE(
+                       excluded.execution_generation, hermes_run_bindings.execution_generation
+                     ),
+                     output = COALESCE(excluded.output, hermes_run_bindings.output),
+                     request_json = COALESCE(
+                       excluded.request_json, hermes_run_bindings.request_json
+                     ),
+                     updated_at = excluded.updated_at""",
+                (
+                    message_id,
+                    job_id,
+                    session_id,
+                    run_id,
+                    ordinal,
+                    phase,
+                    status,
+                    content,
+                    admission_id,
+                    execution_generation,
+                    output,
+                    request_json,
+                    now,
+                    now,
+                ),
+            )
+        binding = self.get_hermes_binding(message_id)
+        if binding is None:
+            raise RuntimeError("Hermes binding was not stored")
+        return binding
+
+    def get_hermes_binding(self, message_id: str) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM hermes_run_bindings WHERE message_id = ?", (message_id,)
+        )
+
+    def get_hermes_binding_by_run(self, run_id: str) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM hermes_run_bindings WHERE run_id = ?", (run_id,))
+
+    def list_hermes_bindings(
+        self,
+        session_id: str | None = None,
+        *,
+        active_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if active_only:
+            clauses.append(
+                "status IN ('started', 'queued', 'running', 'waiting_for_approval', "
+                "'stopping', 'unknown')"
+            )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._all(
+            f"SELECT * FROM hermes_run_bindings {where} ORDER BY session_id, ordinal",
+            tuple(params),
+        )
+
+    def update_hermes_binding(self, message_id: str, **fields: Any) -> dict[str, Any] | None:
+        allowed = {
+            "job_id",
+            "session_id",
+            "run_id",
+            "phase",
+            "status",
+            "content",
+            "admission_id",
+            "execution_generation",
+            "output",
+            "request_json",
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return self.get_hermes_binding(message_id)
+        updates["updated_at"] = utcnow()
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self.transaction() as connection:
+            connection.execute(
+                f"UPDATE hermes_run_bindings SET {assignments} WHERE message_id = ?",
+                (*updates.values(), message_id),
+            )
+        return self.get_hermes_binding(message_id)
+
+    def save_hermes_session_meta(
+        self,
+        session_id: str,
+        *,
+        workspace: str,
+        title: str | None = None,
+        permission: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO hermes_session_meta
+                   (session_id, workspace, title, permission_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                     workspace = excluded.workspace,
+                     title = COALESCE(excluded.title, hermes_session_meta.title),
+                     permission_json = excluded.permission_json,
+                     updated_at = excluded.updated_at""",
+                (
+                    session_id,
+                    workspace,
+                    title,
+                    json.dumps(permission or [], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        meta = self.get_hermes_session_meta(session_id)
+        if meta is None:
+            raise RuntimeError("Hermes session metadata was not stored")
+        return meta
+
+    def get_hermes_session_meta(self, session_id: str) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM hermes_session_meta WHERE session_id = ?", (session_id,)
+        )
+
     def backend_version(self) -> str:
         row = self._one("SELECT value FROM settings WHERE key = 'opencode_api_version'")
         return row["value"] if row else "v1"
@@ -3682,8 +3893,13 @@ class Database:
         )
 
     def prepare_backend_switch(self, target: str) -> None:
-        if target not in {"v1", "v2"} or target == self.backend_version():
-            raise ValueError("Choose the other OpenCode API version")
+        current = self.backend_version()
+        if current not in {"v1", "v2"}:
+            raise ValueError("Preparing a switch from Hermes is not supported")
+        if target not in {"v1", "v2", "hermes"}:
+            raise ValueError("Unknown backend version")
+        if target == current:
+            raise ValueError("Choose a different backend: v1, v2 or hermes")
         with self.transaction():
             if self.has_unfinished_jobs():
                 raise ValueError("Finish or cancel every job before switching OpenCode versions")
@@ -3691,10 +3907,14 @@ class Database:
                 "from": self.backend_version(), "to": target,
             }))
 
+    def invalidate_backend_switch(self) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM settings WHERE key = 'opencode_prepared_switch'")
+
     def activate_backend(self, target: str) -> None:
         """Apply only a fully snapshotted, offline version transition."""
-        if target not in {"v1", "v2"}:
-            raise ValueError("Unknown OpenCode API version")
+        if target not in {"v1", "v2", "hermes"}:
+            raise ValueError("Unknown backend version")
         with self.transaction() as connection:
             previous = self.backend_version()
             if previous != target:
@@ -3707,7 +3927,7 @@ class Database:
                     not empty and (not prepared or json.loads(prepared["value"]) != expected)
                 ):
                     raise ValueError(
-                        "OpenCode API version changed. Stop the server and run "
+                        "Backend changed. Stop the server and run "
                         f"opencode-web backend-switch --to {target} "
                         "using the old configuration first"
                     )

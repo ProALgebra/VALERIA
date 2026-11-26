@@ -594,6 +594,14 @@ class QueueDispatcher:
             }:
                 return bool(pending)
             try:
+                metadata = request.get("metadata")
+                if isinstance(metadata, dict) and metadata.get("source") == "hermes":
+                    questions = request.get("questions")
+                    if not any(
+                        isinstance(question, dict) and question.get("options")
+                        for question in questions or []
+                    ):
+                        raise TaskExecutionError("question_requires_user")
                 accepted = await client.respond_question(
                     request_id, self._question_answers(request)
                 )
@@ -773,6 +781,20 @@ class QueueDispatcher:
                                     else instructions
                                 )
                         try:
+                            phase = (
+                                "plan"
+                                if not job.get("phase2_message_id")
+                                and (
+                                    job.get("plan_first")
+                                    or job.get("agent") == "plan"
+                                )
+                                else "build"
+                            )
+                            phase_kwargs = (
+                                {"phase": phase}
+                                if getattr(client, "supports_phase", False)
+                                else {}
+                            )
                             await client.send_prompt_async(
                                 job["session_id"],
                                 message_id=job.get("phase2_message_id") or job["message_id"],
@@ -784,6 +806,7 @@ class QueueDispatcher:
                                 model_id=job["model_id"],
                                 model_variant=job["model_variant"],
                                 **({"system": system_prompt} if system_prompt else {}),
+                                **phase_kwargs,
                             )
                         except OpenCodeSubmissionUncertain:
                             self.database.set_job_status(job_id, "running", "submission_uncertain")
@@ -848,6 +871,11 @@ class QueueDispatcher:
             # There is no await between the final status check/reservation and
             # submission. Cancellation aborts this same session under this lock.
             try:
+                phase_kwargs = (
+                    {"phase": "build"}
+                    if getattr(client, "supports_phase", False)
+                    else {}
+                )
                 await client.send_prompt_async(
                     current["session_id"],
                     message_id=message_id,
@@ -856,6 +884,7 @@ class QueueDispatcher:
                     provider_id=current["provider_id"],
                     model_id=current["model_id"],
                     model_variant=current["model_variant"],
+                    **phase_kwargs,
                 )
             except OpenCodeSubmissionUncertain:
                 self.database.set_job_status(job["id"], "running", "submission_uncertain")

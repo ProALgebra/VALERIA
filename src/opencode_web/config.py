@@ -103,10 +103,31 @@ class Settings:
     consultation_upload_max_files: int = 10
     consultation_upload_max_total_bytes: int = 50 * 1024 * 1024
     json_processor_allow_private_networks: bool = False
+    hermes_bin: Path = Path("/usr/bin/hermes")
+    hermes_host: str = "127.0.0.1"
+    hermes_port_start: int = 4200
+    hermes_port_end: int = 4299
+    hermes_api_key: str = ""
+    hermes_state_root: Path = Path("./data/hermes")
+    hermes_home_template: Path | None = None
+    hermes_start_timeout: int = 120
+    hermes_idle_timeout_seconds: int = 900
+    hermes_model_name: str = "hermes"
+    hermes_source: str = "valeria"
 
     def __post_init__(self) -> None:
-        if self.opencode_api_version not in {"v1", "v2"}:
-            raise ConfigError("OPENCODE_API_VERSION must be v1 or v2")
+        if self.opencode_api_version not in {"v1", "v2", "hermes"}:
+            raise ConfigError("OPENCODE_API_VERSION must be v1, v2 or hermes")
+        if self.opencode_api_version == "hermes" and not self.hermes_api_key.strip():
+            raise ConfigError("HERMES_API_KEY is required for the Hermes backend")
+        if self.hermes_port_start > self.hermes_port_end or self.hermes_port_end > 65535:
+            raise ConfigError("Invalid Hermes port range")
+        if (
+            self.opencode_api_version == "hermes"
+            and self.hermes_home_template is not None
+            and not self.hermes_home_template.is_dir()
+        ):
+            raise ConfigError("HERMES_HOME_TEMPLATE must be an existing directory")
         for name, value in (
             ("CONSULTATION_ARTIFACT_MAX_BYTES", self.consultation_artifact_max_bytes),
             ("CONSULTATION_ARTIFACT_MAX_FILES", self.consultation_artifact_max_files),
@@ -130,6 +151,9 @@ class Settings:
         v2_config = os.getenv("OPENCODE_V2_CONFIG_DIR", "").strip()
         if api_version == "v2" and v2_config and not (Path(v2_config) / "opencode.jsonc").is_file():
             raise ConfigError("OPENCODE_V2_CONFIG_DIR must contain opencode.jsonc")
+        hermes_key = os.getenv("HERMES_API_KEY", "").strip()
+        if api_version == "hermes" and not hermes_key:
+            raise ConfigError("HERMES_API_KEY is required for the Hermes backend")
         host = os.getenv("APP_HOST", "127.0.0.1").strip()
         try:
             ipaddress.ip_address(host)
@@ -264,6 +288,23 @@ class Settings:
             json_processor_allow_private_networks=_bool(
                 "JSON_PROCESSOR_ALLOW_PRIVATE_NETWORKS", False
             ),
+            hermes_bin=Path(os.getenv("HERMES_BIN", "/usr/bin/hermes")),
+            hermes_host=os.getenv("HERMES_HOST", "127.0.0.1"),
+            hermes_port_start=_int("HERMES_PORT_RANGE_START", 4200),
+            hermes_port_end=_int("HERMES_PORT_RANGE_END", 4299),
+            hermes_api_key=hermes_key,
+            hermes_state_root=Path(os.getenv("HERMES_STATE_ROOT", "./data/hermes")),
+            hermes_home_template=(
+                Path(os.getenv("HERMES_HOME_TEMPLATE", "").strip())
+                if os.getenv("HERMES_HOME_TEMPLATE", "").strip()
+                else None
+            ),
+            hermes_start_timeout=_int("HERMES_START_TIMEOUT_SECONDS", 120),
+            hermes_idle_timeout_seconds=_int(
+                "HERMES_IDLE_TIMEOUT_SECONDS", 900, minimum=0
+            ),
+            hermes_model_name=os.getenv("HERMES_MODEL_NAME", "hermes").strip() or "hermes",
+            hermes_source=os.getenv("HERMES_SESSION_SOURCE", "valeria").strip() or "valeria",
         )
 
     def resolve_workspace_path(self, raw_path: str | Path) -> Path:

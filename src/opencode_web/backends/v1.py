@@ -99,7 +99,9 @@ class OpenCodeV1Backend(HttpBackend):
         model_id: str | None,
         model_variant: str | None,
         system: str | None = None,
+        phase: str | None = None,
     ) -> None:
+        del phase
         body: dict[str, Any] = {
             "messageID": message_id,
             "agent": agent,

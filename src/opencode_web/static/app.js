@@ -604,7 +604,7 @@ function updateChatArchive(chat) {
       const hint = document.createElement("p");
       hint.id = "chat-backend-hint";
       hint.className = "hint";
-      hint.textContent = "Диалог сохранён в истории после обновления OpenCode. Создайте новый диалог для продолжения работы.";
+      hint.textContent = "Диалог сохранён в истории после смены движка. Создайте новый диалог для продолжения работы.";
       composer.prepend(hint);
     }
     composer.querySelectorAll("input, textarea, select, button").forEach(control => { control.disabled = true; });

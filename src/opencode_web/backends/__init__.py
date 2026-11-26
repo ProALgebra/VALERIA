@@ -2,5 +2,12 @@
 
 from .contracts import OpenCodeBackend, OpenCodeError, OpenCodeReadTimeout
 from .factory import create_backend
+from .hermes import HermesBackend
 
-__all__ = ["OpenCodeBackend", "OpenCodeError", "OpenCodeReadTimeout", "create_backend"]
+__all__ = [
+    "HermesBackend",
+    "OpenCodeBackend",
+    "OpenCodeError",
+    "OpenCodeReadTimeout",
+    "create_backend",
+]

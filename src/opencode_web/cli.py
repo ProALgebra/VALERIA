@@ -17,9 +17,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, help="Override APP_PORT")
     commands = parser.add_subparsers(dest="command")
     switch = commands.add_parser(
-        "backend-switch", help="Snapshot histories before changing API version"
+        "backend-switch", help="Snapshot histories before changing the backend"
     )
-    switch.add_argument("--to", choices=("v1", "v2"), required=True)
+    switch.add_argument("--to", choices=("v1", "v2", "hermes"), required=True)
     args = parser.parse_args()
     if args.host:
         os.environ["APP_HOST"] = args.host

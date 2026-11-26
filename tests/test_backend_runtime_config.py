@@ -1,4 +1,5 @@
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -64,6 +65,51 @@ def test_legacy_environment_keeps_v1_credentials_and_ignores_inactive_v2_config(
 def test_unknown_backend_is_rejected(settings):
     with pytest.raises(ConfigError, match="OPENCODE_API_VERSION"):
         replace(settings, opencode_api_version="invalid")
+
+
+def test_hermes_environment_requires_a_key(monkeypatch, workspace):
+    monkeypatch.setenv("SESSION_SECRET", "x" * 32)
+    monkeypatch.setenv("ALLOWED_WORKSPACE_ROOTS", str(workspace))
+    monkeypatch.setenv("OPENCODE_API_VERSION", "hermes")
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    with pytest.raises(ConfigError, match="HERMES_API_KEY"):
+        Settings.from_env()
+    monkeypatch.setenv("HERMES_API_KEY", "test-hermes-key")
+    monkeypatch.setenv("HERMES_PORT_RANGE_START", "4300")
+    monkeypatch.setenv("HERMES_PORT_RANGE_END", "4309")
+    settings = Settings.from_env()
+    assert settings.opencode_api_version == "hermes"
+    assert settings.hermes_api_key == "test-hermes-key"
+    assert settings.hermes_port_start == 4300
+    assert settings.hermes_port_end == 4309
+
+
+async def test_hermes_launch_uses_isolated_home_and_api_server(
+    runtime, monkeypatch, tmp_path
+):
+    manager = runtime.manager
+    binary = tmp_path / "hermes"
+    binary.touch()
+    template = tmp_path / "hermes-template"
+    template.mkdir()
+    (template / "config.yaml").write_text("provider: test\n", encoding="utf-8")
+    manager.settings = replace(
+        manager.settings,
+        opencode_api_version="hermes",
+        hermes_bin=binary,
+        hermes_api_key="secret-key",
+        hermes_state_root=tmp_path / "hermes-state",
+        hermes_home_template=template,
+    )
+    monkeypatch.setenv("HERMES_HOME", "/legacy/hermes")
+    await manager.ensure(str(runtime.workspace))
+    assert runtime.spawn.await_args.args == (str(binary), "gateway", "run")
+    env = runtime.spawn.await_args.kwargs["env"]
+    assert env["API_SERVER_ENABLED"] == "true"
+    assert env["API_SERVER_KEY"] == "secret-key"
+    assert env["API_SERVER_PORT"] == "45100"
+    assert env["HERMES_HOME"] != "/legacy/hermes"
+    assert (Path(env["HERMES_HOME"]) / "config.yaml").is_file()
 
 
 async def test_v1_launch_preserves_binary_configuration_and_state_paths(runtime, monkeypatch):

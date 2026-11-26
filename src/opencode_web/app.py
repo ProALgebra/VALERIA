@@ -499,7 +499,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
                 else:
                     await events.publish(safe_opencode_event(event))
 
-            manager = OpenCodeManager(settings, publish_opencode)
+            manager = OpenCodeManager(settings, publish_opencode, state_store=database)
             artifacts = ConsultationArtifacts(settings, database, manager)
             attachments = ConsultationAttachments(settings, database, artifacts)
             try:
@@ -1708,7 +1708,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
     ) -> dict[str, bool]:
         chat = owned_chat(db, principal, chat_id)
         if not db.can_use_chat_backend(chat):
-            raise HTTPException(409, "Диалог архивирован после смены версии OpenCode")
+            raise HTTPException(409, "Диалог архивирован после смены движка")
         try:
             # Recheck pending state under the same lock as sending.
             # A retry/second tab must never send a second answer to a resolved request.
@@ -1914,7 +1914,7 @@ def create_app(settings: Settings | None = None, *, start_dispatcher: bool = Tru
             raise HTTPException(422, "Invalid permission response")
         chat = owned_chat(db, principal, chat_id)
         if not db.can_use_chat_backend(chat):
-            raise HTTPException(409, "Диалог архивирован после смены версии OpenCode")
+            raise HTTPException(409, "Диалог архивирован после смены движка")
         try:
             client = await request.app.state.manager.ensure(chat["workspace_snapshot"])
             accepted = await client.respond_permission(

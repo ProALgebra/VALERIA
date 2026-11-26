@@ -96,6 +96,11 @@ v2, выполните `backend-switch --to v1` с текущими настро
 настройки и бинарник v1. Архивные диалоги остаются доступны для чтения; для новой
 работы создавайте новый диалог.
 
+Переход с OpenCode v1/v2 на Hermes с сохранением этой же базы описан
+в [руководстве Hermes](hermes-backend.md#переход-существующей-valeria-с-opencode-на-hermes).
+Для него используется `opencode-web backend-switch --to hermes` со старой
+конфигурацией OpenCode; обратная миграция с Hermes пока не поддерживается.
+
 ## Docker
 
 Dockerfile принимает `OPENCODE_API_VERSION=v1|v2`, `OPENCODE_VERSION=1.18.25`

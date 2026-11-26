@@ -5,6 +5,7 @@
 [English](#english) | [Русский](#русский)
 
 OpenCode v1/v2: [integration and migration guide](docs/opencode-v2.md) (Russian).
+Hermes Agent: [backend adapter guide](docs/hermes-backend.md) (Russian).
 
 ## English
 

@@ -241,7 +241,9 @@ class OpenCodeV2Backend(HttpBackend):
         model_id: str | None,
         model_variant: str | None,
         system: str | None = None,
+        phase: str | None = None,
     ) -> None:
+        del phase
         path = self._session_path(session_id)
         await self._request("POST", f"{path}/agent", json={"agent": agent})
         if provider_id and model_id:

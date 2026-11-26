@@ -99,6 +99,7 @@ class OpenCodeBackend(Protocol):
         model_id: str | None,
         model_variant: str | None,
         system: str | None = None,
+        phase: str | None = None,
     ) -> None: ...
     async def abort(self, session_id: str) -> bool: ...
     async def respond_permission(

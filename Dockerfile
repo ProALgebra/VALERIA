@@ -4,7 +4,7 @@ ARG OPENCODE_API_VERSION=v1
 ARG OPENCODE_VERSION=1.18.25
 ARG OPENCODE_V2_VERSION=2.3.0
 RUN case "${OPENCODE_API_VERSION}" in \
-        v1) npm install --global --omit=dev "opencode-ai@${OPENCODE_VERSION}" ;; \
+        v1|hermes) npm install --global --omit=dev "opencode-ai@${OPENCODE_VERSION}" ;; \
         v2) npm install --global --omit=dev "@opencode/cli@${OPENCODE_V2_VERSION}" ;; \
         *) exit 1 ;; \
     esac \

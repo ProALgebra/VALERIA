@@ -38,8 +38,12 @@ async def prepare_backend_switch(settings: Settings, target: str) -> int:
         try:
             if database.backend_version() != settings.opencode_api_version:
                 raise ConfigError("Use the current backend configuration to prepare the switch")
-            if target == database.backend_version() or target not in {"v1", "v2"}:
-                raise ConfigError("Choose the other OpenCode API version")
+            if target == database.backend_version() or target not in {"v1", "v2", "hermes"}:
+                raise ConfigError("Choose a different backend: v1, v2 or hermes")
+            if database.backend_version() not in {"v1", "v2"}:
+                raise ConfigError("Preparing a switch from Hermes is not supported")
+            # A failed retry must not leave an older snapshot authorized for use.
+            database.invalidate_backend_switch()
             if database.has_unfinished_jobs():
                 raise ConfigError("Finish or cancel every job before switching OpenCode versions")
             # The service lock does not cover children surviving a crashed
@@ -77,9 +81,14 @@ async def prepare_backend_switch(settings: Settings, target: str) -> int:
                                 "Resolve pending OpenCode questions and permissions first"
                             )
                         for chat in chats:
-                            snapshots[chat["id"]] = await client.messages(
-                                chat["opencode_session_id"]
-                            )
+                            messages = await client.messages(chat["opencode_session_id"])
+                            ids = {message.get("info", message).get("id") for message in messages}
+                            # Preserve locally recorded submissions too, including prompts
+                            # that failed before they reached the source backend.
+                            snapshots[chat["id"]] = messages + [
+                                message for message in database.chat_submission_messages(chat["id"])
+                                if message["info"]["id"] not in ids
+                            ]
                 finally:
                     await manager.close(strict=True)
             with database.transaction():
